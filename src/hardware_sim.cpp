@@ -2,8 +2,50 @@
 #include "hardware_sim.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <everest/logging.hpp>
 #include <ocpp/v16/ocpp_enums.hpp>
+
+namespace {
+
+std::string bundle_logs(const std::string& prefix) {
+    const auto ts = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    const std::string dir = "logs";
+    std::filesystem::create_directories(dir);
+    const std::string fname = dir + "/" + prefix + "_" + std::to_string(ts) + ".log";
+    std::ofstream out(fname, std::ios::out | std::ios::trunc);
+    out << "Log bundle generated at " << ts << "\n";
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().string() == fname) continue;
+        out << "\n==== " << entry.path().filename().string() << " ====\n";
+        std::ifstream in(entry.path());
+        out << in.rdbuf();
+    }
+    return fname;
+}
+
+bool upload_file_to_target(const std::string& source, const std::string& target) {
+    if (target.empty()) return false;
+    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
+        const std::string cmd = "curl -sSf -T \"" + source + "\" \"" + target + "\"";
+        return std::system(cmd.c_str()) == 0;
+    }
+    std::string path = target;
+    const std::string prefix = "file://";
+    if (path.rfind(prefix, 0) == 0) {
+        path = path.substr(prefix.size());
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing, ec);
+    return !ec;
+}
+
+} // namespace
 
 namespace charger {
 
@@ -43,6 +85,9 @@ void SimulatedHardware::update_energy(ConnectorState& state) {
 bool SimulatedHardware::enable(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = get_state(connector);
+    if (!state.lock_engaged && state.config.require_lock) {
+        return false;
+    }
     state.enabled = true;
     return true;
 }
@@ -52,6 +97,7 @@ bool SimulatedHardware::disable(std::int32_t connector) {
     auto& state = get_state(connector);
     state.enabled = false;
     state.charging = false;
+    state.lock_engaged = true;
     return true;
 }
 
@@ -83,7 +129,8 @@ bool SimulatedHardware::stop_transaction(std::int32_t connector, ocpp::v16::Reas
 
 ocpp::v16::UnlockStatus SimulatedHardware::unlock(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mutex_);
-    (void)get_state(connector);
+    auto& state = get_state(connector);
+    state.lock_engaged = false;
     return ocpp::v16::UnlockStatus::Unlocked;
 }
 
@@ -115,14 +162,44 @@ bool SimulatedHardware::cancel_reservation(std::int32_t reservation_id) {
 ocpp::v16::GetLogResponse SimulatedHardware::upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) {
     ocpp::v16::GetLogResponse response;
     response.status = ocpp::v16::LogStatusEnumType::Accepted;
-    response.filename.emplace(request.location);
+    const std::string fname = bundle_logs("diagnostics");
+    {
+        std::ofstream out(fname, std::ios::app);
+        out << "Diagnostics request location: " << request.location << "\n";
+    }
+    bool upload_ok = true;
+    if (!request.location.empty()) {
+        upload_ok = upload_file_to_target(fname, request.location);
+        if (!upload_ok) {
+            EVLOG_warning << "Diagnostics upload to " << request.location << " failed";
+        }
+    }
+    if (!upload_ok) {
+        response.status = ocpp::v16::LogStatusEnumType::Rejected;
+    }
+    response.filename.emplace(fname);
     return response;
 }
 
 ocpp::v16::GetLogResponse SimulatedHardware::upload_logs(const ocpp::v16::GetLogRequest& request) {
     ocpp::v16::GetLogResponse response;
     response.status = ocpp::v16::LogStatusEnumType::Accepted;
-    response.filename.emplace(request.log.remoteLocation);
+    const std::string fname = bundle_logs("logs");
+    {
+        std::ofstream out(fname, std::ios::app);
+        out << "Log upload target: " << request.log.remoteLocation << "\n";
+    }
+    bool upload_ok = true;
+    if (!request.log.remoteLocation.empty()) {
+        upload_ok = upload_file_to_target(fname, request.log.remoteLocation);
+        if (!upload_ok) {
+            EVLOG_warning << "Log upload to " << request.log.remoteLocation << " failed";
+        }
+    }
+    if (!upload_ok) {
+        response.status = ocpp::v16::LogStatusEnumType::Rejected;
+    }
+    response.filename.emplace(fname);
     return response;
 }
 
@@ -163,11 +240,16 @@ ocpp::Measurement SimulatedHardware::sample_meter(std::int32_t connector) {
 
     ocpp::Measurement measurement{};
     measurement.power_meter.timestamp = ocpp::DateTime().to_rfc3339();
-    measurement.power_meter.energy_Wh_import.total = state.energy_Wh;
+    const double scale = state.config.meter_scale;
+    measurement.power_meter.energy_Wh_import.total =
+        state.energy_Wh * scale + state.config.meter_offset_wh;
     measurement.power_meter.power_W.emplace();
-    measurement.power_meter.power_W->total = static_cast<float>(state.charging ? state.target_power_w : 0.0);
+    measurement.power_meter.power_W->total =
+        static_cast<float>((state.charging ? state.target_power_w : 0.0) * scale);
     measurement.power_meter.current_A.emplace();
-    measurement.power_meter.current_A->DC = state.charging ? std::optional<float>(static_cast<float>(state.target_power_w / 400.0)) : std::nullopt;
+    measurement.power_meter.current_A->DC =
+        state.charging ? std::optional<float>(static_cast<float>((state.target_power_w / 400.0) * scale))
+                       : std::nullopt;
     measurement.power_meter.voltage_V.emplace();
     measurement.power_meter.voltage_V->DC = 400.0F;
     return measurement;
@@ -185,7 +267,43 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.cp_fault = false;
     st.cp_state = ev_connected ? 'C' : 'U';
     st.pilot_duty_pct = ev_connected ? 100.0 : 0.0;
+    st.hlc_stage = st.relay_closed ? 5 : (ev_connected ? 4 : 0);
+    st.hlc_cable_check_ok = ev_connected;
+    st.hlc_precharge_active = false;
+    st.hlc_charge_complete = false;
+    st.hlc_power_ready = st.relay_closed || ev_connected;
+    st.lock_engaged = state.lock_engaged || !state.config.require_lock;
+    st.module_temp_c[0] = 40.0;
+    st.module_temp_c[1] = 40.0;
     return st;
+}
+
+void SimulatedHardware::apply_power_command(const PowerCommand& cmd) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = get_state(cmd.connector);
+    update_energy(state);
+    const bool enable = cmd.module_count > 0 && cmd.gc_closed && cmd.mc_closed;
+    state.enabled = enable;
+    state.charging = enable;
+    double target_power_w = cmd.power_kw * 1000.0;
+    if (cmd.current_limit_a > 0.0 && cmd.voltage_set_v > 0.0) {
+        const double current_limited = cmd.current_limit_a * cmd.voltage_set_v;
+        if (target_power_w <= 0.0) {
+            target_power_w = current_limited;
+        } else {
+            target_power_w = std::min(target_power_w, current_limited);
+        }
+    }
+    if (target_power_w <= 0.0 && enable) {
+        target_power_w = state.target_power_w > 0.0 ? state.target_power_w : state.config.max_power_w;
+    }
+    if (state.config.max_power_w > 0.0 && target_power_w > 0.0) {
+        target_power_w = std::min(target_power_w, state.config.max_power_w);
+    }
+    if (!enable) {
+        target_power_w = 0.0;
+    }
+    state.target_power_w = std::max(0.0, target_power_w);
 }
 
 void SimulatedHardware::apply_power_allocation(std::int32_t connector, int modules) {

@@ -6,7 +6,10 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <cstdlib>
 #include <cerrno>
+#include <filesystem>
+#include <fstream>
 
 #ifdef __linux__
 #include <linux/can.h>
@@ -33,11 +36,15 @@ constexpr uint32_t EVAC_CTRL_BASE = 0x250;
 constexpr uint32_t EVDC_MAX_LIMITS_BASE = 0x200;
 constexpr uint32_t EVDC_TARGETS_BASE = 0x210;
 constexpr uint32_t EVDC_ENERGY_LIMITS_BASE = 0x230;
+constexpr uint32_t EV_STATUS_DISPLAY_BASE = 0x220;
+constexpr uint32_t CHARGE_INFO_BASE = 0x100;
 constexpr uint32_t PLC_TX_MASK = 0xFFFFFFF0;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
+constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
+constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
 
 uint8_t crc8(const uint8_t* data, size_t len) {
     uint8_t crc = 0x00;
@@ -72,6 +79,43 @@ bool cp_state_plugged(char state_char) {
         return false;
     }
 }
+
+std::string bundle_logs(const std::string& prefix) {
+    const auto ts = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    const std::string dir = "logs";
+    std::filesystem::create_directories(dir);
+    const std::string fname = dir + "/" + prefix + "_" + std::to_string(ts) + ".log";
+    std::ofstream out(fname, std::ios::out | std::ios::trunc);
+    out << "Log bundle generated at " << ts << "\n";
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().string() == fname) continue;
+        out << "\n==== " << entry.path().filename().string() << " ====\n";
+        std::ifstream in(entry.path());
+        out << in.rdbuf();
+    }
+    return fname;
+}
+
+bool upload_file_to_target(const std::string& source, const std::string& target) {
+    if (target.empty()) {
+        return false;
+    }
+    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
+        std::string cmd = "curl -sSf -T \"" + source + "\" \"" + target + "\"";
+        const int rc = std::system(cmd.c_str());
+        return rc == 0;
+    }
+    std::string path = target;
+    const std::string prefix = "file://";
+    if (path.rfind(prefix, 0) == 0) {
+        path = path.substr(prefix.size());
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing, ec);
+    return !ec;
+}
 } // namespace
 
 PlcHardware::PlcHardware(const ChargerConfig& cfg) {
@@ -80,7 +124,11 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) {
         if (plc_to_connector_.count(c.plc_id)) {
             throw std::runtime_error("Duplicate plc_id " + std::to_string(c.plc_id) + " in PLC driver init");
         }
-        nodes_.emplace(c.id, Node{c, PlcStatus{}, 0});
+        Node node{};
+        node.cfg = c;
+        node.lock_engaged = !c.require_lock;
+        node.lock_feedback_engaged = !c.require_lock;
+        nodes_.emplace(c.id, node);
         plc_to_connector_[c.plc_id] = c.id;
     }
 
@@ -136,6 +184,10 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) {
         filters.push_back(f);
         f.can_id = (EVDC_ENERGY_LIMITS_BASE & PLC_TX_MASK) | plc_id;
         filters.push_back(f);
+        f.can_id = (EV_STATUS_DISPLAY_BASE & PLC_TX_MASK) | plc_id;
+        filters.push_back(f);
+        f.can_id = (CHARGE_INFO_BASE & PLC_TX_MASK) | plc_id;
+        filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -185,6 +237,9 @@ bool PlcHardware::enable(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto* node = find_node(connector);
     if (!node) return false;
+    if (node->cfg.require_lock && !node->lock_engaged) {
+        return false;
+    }
     return send_relay_command(*node, true, false);
 }
 
@@ -192,6 +247,7 @@ bool PlcHardware::disable(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto* node = find_node(connector);
     if (!node) return false;
+    node->lock_engaged = true; // auto-lock when disabling
     return send_relay_command(*node, false, true);
 }
 
@@ -250,6 +306,11 @@ void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
 }
 
 ocpp::v16::UnlockStatus PlcHardware::unlock(std::int32_t /*connector*/) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    // For hardware integration, drive lock actuator open here. Default to unlocked state.
+    for (auto& kv : nodes_) {
+        kv.second.lock_engaged = false;
+    }
     return ocpp::v16::UnlockStatus::Unlocked;
 }
 
@@ -266,14 +327,36 @@ bool PlcHardware::cancel_reservation(std::int32_t /*reservation_id*/) {
 ocpp::v16::GetLogResponse PlcHardware::upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) {
     ocpp::v16::GetLogResponse resp;
     resp.status = ocpp::v16::LogStatusEnumType::Accepted;
-    resp.filename.emplace(request.location);
+    const std::string fname = bundle_logs("diagnostics");
+    bool upload_ok = true;
+    if (!request.location.empty()) {
+        upload_ok = upload_file_to_target(fname, request.location);
+        if (!upload_ok) {
+            EVLOG_warning << "Diagnostics upload to " << request.location << " failed";
+        }
+    }
+    if (!upload_ok) {
+        resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+    }
+    resp.filename.emplace(fname);
     return resp;
 }
 
 ocpp::v16::GetLogResponse PlcHardware::upload_logs(const ocpp::v16::GetLogRequest& request) {
     ocpp::v16::GetLogResponse resp;
     resp.status = ocpp::v16::LogStatusEnumType::Accepted;
-    resp.filename.emplace(request.log.remoteLocation);
+    const std::string fname = bundle_logs("logs");
+    bool upload_ok = true;
+    if (!request.log.remoteLocation.empty()) {
+        upload_ok = upload_file_to_target(fname, request.log.remoteLocation);
+        if (!upload_ok) {
+            EVLOG_warning << "Log upload to " << request.log.remoteLocation << " failed";
+        }
+    }
+    if (!upload_ok) {
+        resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+    }
+    resp.filename.emplace(fname);
     return resp;
 }
 
@@ -315,14 +398,65 @@ ocpp::Measurement PlcHardware::sample_meter(std::int32_t connector) {
     meter.stale = has_rx &&
         (std::chrono::duration_cast<std::chrono::milliseconds>(now - node->status.last_meter_rx) > METER_TIMEOUT_MS);
 
+    const bool prefer_shunt = (node->cfg.meter_source == "shunt");
+    // Prefer PLC-provided voltage if present; otherwise reuse last known DC voltage.
+    if (meter.voltage_v <= 0.0 && node->status.present_voltage_v > 0.0) {
+        meter.voltage_v = node->status.present_voltage_v;
+    }
+    if (prefer_shunt) {
+        // For shunt-mode, rely on present V/I from EVDC telemetry rather than PLC meter counters.
+        const double v = node->status.present_voltage_v > 0.0 ? node->status.present_voltage_v : meter.voltage_v;
+        const double i = node->status.present_current_a;
+        meter.voltage_v = v;
+        meter.current_a = i;
+        meter.power_w = v * i;
+        meter.stale = false;
+    }
+
+    const bool meter_ok = !prefer_shunt && meter.ok && !meter.stale;
+    double energy_wh = node->energy_fallback_Wh;
+    const double power_for_energy_raw = meter_ok ? meter.power_w
+        : (prefer_shunt ? meter.power_w : node->status.present_power_w);
+    if (meter_ok) {
+        node->meter_fallback_active = false;
+        energy_wh = meter.energy_Wh;
+        node->energy_fallback_Wh = energy_wh;
+        node->last_energy_update = now;
+    } else {
+        node->meter_fallback_active = true;
+        if (node->last_energy_update.time_since_epoch().count() == 0) {
+            node->last_energy_update = now;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - node->last_energy_update).count() /
+            1000.0;
+        const double power_w = power_for_energy_raw * node->cfg.meter_scale;
+        if (elapsed > 0) {
+            const double delta = (power_w * elapsed) / 3600.0;
+            node->energy_fallback_Wh = std::max(0.0, node->energy_fallback_Wh + delta);
+        }
+        node->last_energy_update = now;
+        energy_wh = node->energy_fallback_Wh;
+    }
+
+    // Apply calibration scaling
+    double power_raw = power_for_energy_raw;
+    if (!meter_ok && !prefer_shunt && node->status.present_power_w > 0.0) {
+        power_raw = node->status.present_power_w;
+    }
+    const double power_scaled = power_raw * node->cfg.meter_scale;
+    const double current_scaled = meter.current_a * node->cfg.meter_scale;
+    const double energy_scaled = energy_wh * node->cfg.meter_scale + node->cfg.meter_offset_wh;
+    node->status.present_power_w = power_scaled;
+    node->status.present_current_a = current_scaled;
+
     m.power_meter.timestamp = ocpp::DateTime().to_rfc3339();
-    m.power_meter.energy_Wh_import.total = meter.energy_Wh;
+    m.power_meter.energy_Wh_import.total = energy_scaled;
     m.power_meter.voltage_V.emplace();
     m.power_meter.voltage_V->DC = static_cast<float>(meter.voltage_v);
     m.power_meter.current_A.emplace();
-    m.power_meter.current_A->DC = static_cast<float>(meter.current_a);
+    m.power_meter.current_A->DC = static_cast<float>(current_scaled);
     m.power_meter.power_W.emplace();
-    m.power_meter.power_W->total = static_cast<float>(meter.power_w);
+    m.power_meter.power_W->total = static_cast<float>(power_scaled);
     return m;
 }
 
@@ -354,6 +488,12 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
         }
     }
 
+    if (node->status.last_any_rx.time_since_epoch().count() &&
+        (now - node->status.last_any_rx) > BUS_IDLE_TIMEOUT_MS) {
+        node->status.safety.comm_fault = true;
+        node->status.safety.safety_ok = false;
+    }
+
     if (node->status.pending_safety_since.time_since_epoch().count()) {
         if ((now - node->status.pending_safety_since) >= SAFETY_DEBOUNCE_MS) {
             node->status.safety = node->status.pending_safety;
@@ -371,10 +511,15 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.earth_fault = node->status.safety.earth_fault;
     st.comm_fault = node->status.safety.comm_fault;
     st.relay_closed = node->status.relay_closed;
-    st.meter_stale = node->status.meter.stale;
+    st.meter_stale = node->status.meter.stale && !node->meter_fallback_active;
     st.plugged_in = plugged;
     st.cp_fault = cp_stale;
     st.cp_state = node->status.cp.state_char;
+    st.hlc_stage = node->status.hlc_stage;
+    st.hlc_cable_check_ok = node->status.hlc_cable_check_ok;
+    st.hlc_precharge_active = node->status.hlc_precharge_active;
+    st.hlc_charge_complete = node->status.hlc_charge_complete;
+    st.hlc_power_ready = node->status.hlc_power_ready;
     st.pilot_duty_pct = node->status.cp.duty_pct;
     st.present_voltage_v = node->status.present_voltage_v > 0.0 ? std::optional<double>(node->status.present_voltage_v) : std::nullopt;
     st.present_current_a = std::optional<double>(node->status.present_current_a);
@@ -384,16 +529,40 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.evse_max_voltage_v = node->status.max_voltage_v > 0.0 ? std::optional<double>(node->status.max_voltage_v) : std::nullopt;
     st.evse_max_current_a = node->status.max_current_a > 0.0 ? std::optional<double>(node->status.max_current_a) : std::nullopt;
     st.evse_max_power_kw = node->status.max_power_kw > 0.0 ? std::optional<double>(node->status.max_power_kw) : std::nullopt;
+    st.lock_engaged = !node->cfg.require_lock || (node->lock_engaged && node->lock_feedback_engaged);
+    if (st.comm_fault && node->cfg.require_lock) {
+        st.lock_engaged = false;
+    }
+    // If PLC did not publish capabilities, fall back to configured hardware limits.
+    if (!st.evse_max_voltage_v && node->cfg.max_voltage_v > 0.0) {
+        st.evse_max_voltage_v = node->cfg.max_voltage_v;
+    }
+    if (!st.evse_max_current_a && node->cfg.max_current_a > 0.0) {
+        st.evse_max_current_a = node->cfg.max_current_a;
+    }
+    if (!st.evse_max_power_kw && node->cfg.max_power_w > 0.0) {
+        st.evse_max_power_kw = node->cfg.max_power_w / 1000.0;
+    }
     uint8_t healthy_mask = 0x03; // two modules default healthy
     uint8_t fault_mask = 0x00;
     const uint8_t commanded_mask = node->module_mask & 0x06;
     const uint8_t actual_mask = node->status.relay_state_mask & 0x06;
+    const bool gun_cmd = (node->module_mask & 0x01) != 0;
+    const bool gun_actual = (node->status.relay_state_mask & 0x01) != 0;
+    st.gc_welded = (!gun_cmd && gun_actual);
+    st.mc_welded = false;
     if (st.comm_fault || !st.safety_ok || node->status.safety.remote_force_off) {
         healthy_mask = 0x00;
     } else {
         for (int idx = 0; idx < 2; ++idx) {
             const uint8_t bit = static_cast<uint8_t>(1U << (idx + 1));
-            if ((commanded_mask & bit) && !(actual_mask & bit)) {
+            const bool commanded_on = (commanded_mask & bit) != 0;
+            const bool actual_on = (actual_mask & bit) != 0;
+            if (commanded_on && !actual_on) {
+                healthy_mask &= static_cast<uint8_t>(~(1U << idx));
+                fault_mask |= static_cast<uint8_t>(1U << idx);
+            } else if (!commanded_on && actual_on) {
+                st.mc_welded = true;
                 healthy_mask &= static_cast<uint8_t>(~(1U << idx));
                 fault_mask |= static_cast<uint8_t>(1U << idx);
             }
@@ -516,6 +685,10 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
     } else if ((can_id & PLC_TX_MASK) == (EVDC_MAX_LIMITS_BASE & PLC_TX_MASK) ||
                (can_id & PLC_TX_MASK) == (EVDC_ENERGY_LIMITS_BASE & PLC_TX_MASK)) {
         handle_evdc_limits(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (EV_STATUS_DISPLAY_BASE & PLC_TX_MASK)) {
+        handle_ev_status_display(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (CHARGE_INFO_BASE & PLC_TX_MASK)) {
+        handle_charge_info(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CONFIG_ACK_BASE & PLC_TX_MASK)) {
         if (len >= 6) {
             const uint8_t param_id = data[0];
@@ -552,6 +725,9 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
             s.earth_fault = true;
         }
     }
+    const bool lock_input = derive_lock_input(node, data[2], true);
+    node.lock_feedback_engaged = lock_input;
+    node.lock_engaged = node.cfg.require_lock ? lock_input : true;
     // Update pending safety to debounce
     node.status.pending_safety = s;
     node.status.pending_safety_since = std::chrono::steady_clock::now();
@@ -569,6 +745,9 @@ void PlcHardware::handle_safety_status(Node& node, const uint8_t* data, size_t l
     s.earth_fault = (data[0] & 0x20) != 0;
     s.estop = (data[0] & 0x08) != 0;
     s.comm_fault = false; // explicit status frame indicates comm alive
+    const bool lock_input = derive_lock_input(node, data[0], false);
+    node.lock_feedback_engaged = lock_input;
+    node.lock_engaged = node.cfg.require_lock ? lock_input : true;
     node.status.pending_safety = s;
     node.status.pending_safety_since = std::chrono::steady_clock::now();
     node.status.last_safety_status = std::chrono::steady_clock::now();
@@ -603,6 +782,9 @@ void PlcHardware::handle_meter(Node& node, const uint8_t* data, size_t len) {
     meter.stale = data_stale;
     node.status.safety.comm_fault = comm_error;
     node.status.last_meter_rx = std::chrono::steady_clock::now();
+    if (comm_error) {
+        node.status.safety.safety_ok = false;
+    }
 }
 
 void PlcHardware::handle_cp_levels(Node& node, const uint8_t* data, size_t len) {
@@ -619,6 +801,15 @@ void PlcHardware::handle_charging_session(Node& node, const uint8_t* data, size_
     const char cp_state_char = static_cast<char>(data[4]);
     const uint8_t duty = data[5];
     update_cp_status(node, cp_state_char, duty, 0, 0, false);
+    uint8_t stage = node.status.hlc_stage;
+    if (len >= 7) {
+        stage = data[6];
+    }
+    uint8_t flags = 0;
+    if (node.status.hlc_charge_complete) flags |= 0x01;
+    if (node.status.hlc_precharge_active) flags |= 0x02;
+    if (node.status.hlc_cable_check_ok) flags |= 0x04;
+    update_hlc_state(node, stage, flags);
 }
 
 void PlcHardware::handle_evac_control(Node& node, const uint8_t* data, size_t len) {
@@ -662,6 +853,57 @@ void PlcHardware::handle_evdc_limits(Node& node, const uint8_t* data, size_t len
     node.status.max_voltage_v = max_v * 0.1;
     node.status.max_current_a = max_i * 0.1;
     node.status.max_power_kw = max_p * 0.1;
+}
+
+void PlcHardware::handle_ev_status_display(Node& node, const uint8_t* data, size_t len) {
+    if (len < 6) return;
+    const uint16_t pres_v = le_u16(&data[0]);
+    const uint16_t pres_i = le_u16(&data[2]);
+    const uint8_t stage = data[4];
+    const uint8_t duty = data[5];
+    const char cp_state_char = (len >= 7) ? static_cast<char>(data[6]) : node.status.cp.state_char;
+    node.status.present_voltage_v = pres_v * 0.1;
+    node.status.present_current_a = pres_i * 0.1;
+    node.status.present_power_w = node.status.present_voltage_v * node.status.present_current_a;
+    update_cp_status(node, cp_state_char, duty, 0, 0, false);
+    uint8_t flags = 0;
+    if (node.status.hlc_charge_complete) flags |= 0x01;
+    if (node.status.hlc_precharge_active) flags |= 0x02;
+    if (node.status.hlc_cable_check_ok) flags |= 0x04;
+    update_hlc_state(node, stage, flags);
+}
+
+void PlcHardware::handle_charge_info(Node& node, const uint8_t* data, size_t len) {
+    if (len < 2) return;
+    const uint8_t stage = data[0];
+    const uint8_t flags = data[1];
+    update_hlc_state(node, stage, flags);
+}
+
+bool PlcHardware::derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool relay_status_frame) const {
+    const int idx = node.cfg.lock_input_switch;
+    if (idx < 1 || idx > 4) return true;
+    (void)relay_status_frame;
+    const int bit = (idx == 4) ? 6 : (idx - 1);
+    return (sw_mask_byte & (1 << bit)) != 0;
+}
+
+bool PlcHardware::derive_hlc_power_ready(const PlcStatus& status) const {
+    if (status.hlc_charge_complete) {
+        return false;
+    }
+    if (status.hlc_stage >= HLC_POWER_DELIVERY_STAGE && (status.hlc_cable_check_ok || !status.hlc_precharge_active)) {
+        return true;
+    }
+    return false;
+}
+
+void PlcHardware::update_hlc_state(Node& node, uint8_t stage, uint8_t flags) {
+    node.status.hlc_stage = stage;
+    node.status.hlc_charge_complete = (flags & 0x01) != 0;
+    node.status.hlc_precharge_active = (flags & 0x02) != 0;
+    node.status.hlc_cable_check_ok = (flags & 0x04) != 0;
+    node.status.hlc_power_ready = derive_hlc_power_ready(node.status);
 }
 
 void PlcHardware::update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak,

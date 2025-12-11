@@ -4,6 +4,9 @@
 #include <fstream>
 #include <stdexcept>
 #include <set>
+#include <algorithm>
+#include <cctype>
+#include <limits>
 
 #include <nlohmann/json.hpp>
 
@@ -32,8 +35,41 @@ ConnectorConfig parse_connector(const nlohmann::json& connector_json, int defaul
     connector.can_interface = connector_json.value("canInterface", "");
     connector.max_current_a = connector_json.value("maxCurrentA", 0.0);
     connector.max_power_w = connector_json.value("maxPowerW", 0.0);
+    connector.max_voltage_v = connector_json.value("maxVoltageV", 0.0);
+    connector.min_voltage_v = connector_json.value("minVoltageV", 0.0);
     connector.meter_sample_interval_s = connector_json.value("meterSampleIntervalSeconds", default_interval);
+    connector.require_lock = connector_json.value("requireLock", true);
+    connector.lock_input_switch = connector_json.value("lockInputSwitch", 3);
+    connector.meter_source = connector_json.value("meterSource", "plc");
+    std::transform(connector.meter_source.begin(), connector.meter_source.end(), connector.meter_source.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    connector.meter_scale = connector_json.value("meterScale", 1.0);
+    connector.meter_offset_wh = connector_json.value("meterOffsetWh", 0.0);
     return connector;
+}
+
+SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback) {
+    SlotMapping slot;
+    slot.id = slot_json.value("id", idx_fallback);
+    slot.gun_id = slot_json.value("gunId", slot.id);
+    slot.gc_id = slot_json.value("gc", "GC_" + std::to_string(slot.id));
+    slot.mc_id = slot_json.value("mc", "MC_" + std::to_string(slot.id));
+    slot.cw_id = slot_json.value("cw", slot.id % 12 + 1);
+    slot.ccw_id = slot_json.value("ccw", slot.id == 1 ? 12 : slot.id - 1);
+    if (slot_json.contains("modules") && slot_json["modules"].is_array()) {
+        for (const auto& m : slot_json["modules"]) {
+            ModuleConfig mc;
+            mc.id = m.value("id", "");
+            mc.mn_id = m.value("mn", "");
+            slot.modules.push_back(mc);
+        }
+    }
+    if (slot.modules.empty()) {
+        ModuleConfig m0{"M" + std::to_string(slot.id) + "_0", "MN_" + std::to_string(slot.id) + "_0"};
+        ModuleConfig m1{"M" + std::to_string(slot.id) + "_1", "MN_" + std::to_string(slot.id) + "_1"};
+        slot.modules = {m0, m1};
+    }
+    return slot;
 }
 } // namespace
 
@@ -55,6 +91,19 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.central_system_uri = cp.value("centralSystemURI", "");
     cfg.use_plc = cp.value("usePLC", false);
     cfg.can_interface = cp.value("canInterface", "can0");
+    const auto site_limits = json.value("siteLimits", nlohmann::json::object());
+    cfg.module_power_kw = json.value("modulePowerKW", 30.0);
+    cfg.grid_limit_kw = json.value("gridLimitKW", site_limits.value("gridPowerLimitKW", 1000.0));
+    cfg.default_voltage_v = json.value("defaultVoltageV", site_limits.value("defaultVoltageV", 800.0));
+    if (cfg.module_power_kw <= 0.0) {
+        cfg.module_power_kw = 30.0;
+    }
+    if (cfg.grid_limit_kw <= 0.0) {
+        cfg.grid_limit_kw = std::numeric_limits<double>::max();
+    }
+    if (cfg.default_voltage_v <= 0.0) {
+        cfg.default_voltage_v = 800.0;
+    }
 
     cfg.ocpp_config = make_absolute(base_dir, json.value("ocppConfig", "configs/ocpp16-config.json"));
     cfg.share_path = make_absolute(base_dir, json.value("sharePath", "libocpp/config/v16"));
@@ -80,16 +129,54 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             cfg.connectors.push_back(parse_connector(connector_json, cfg.meter_sample_interval_s));
         }
     }
+    if (json.contains("slots") && json["slots"].is_array()) {
+        int idx = 1;
+        for (const auto& slot_json : json["slots"]) {
+            cfg.slots.push_back(parse_slot_mapping(slot_json, idx++));
+        }
+    }
 
     for (auto& c : cfg.connectors) {
         if (c.can_interface.empty()) {
             c.can_interface = cfg.can_interface;
+        }
+        if (c.lock_input_switch < 1 || c.lock_input_switch > 4) {
+            c.lock_input_switch = 3;
+        }
+        if (c.meter_scale <= 0.0) {
+            c.meter_scale = 1.0;
+        }
+        if (c.meter_source != "plc" && c.meter_source != "shunt") {
+            c.meter_source = "plc";
+        }
+        if (c.min_voltage_v < 0.0) {
+            c.min_voltage_v = 0.0;
+        }
+        if (c.max_voltage_v > 0.0 && c.min_voltage_v > c.max_voltage_v) {
+            c.min_voltage_v = c.max_voltage_v * 0.5;
         }
     }
 
     if (cfg.connectors.empty()) {
         // Provide at least connector 1 to keep libocpp happy
         cfg.connectors.push_back(ConnectorConfig{});
+    }
+
+    if (cfg.slots.empty()) {
+        for (std::size_t i = 0; i < cfg.connectors.size(); ++i) {
+            const auto& conn = cfg.connectors[i];
+            SlotMapping sm;
+            sm.id = conn.id;
+            sm.gun_id = conn.id;
+            sm.gc_id = "GC_" + std::to_string(conn.id);
+            sm.mc_id = "MC_" + std::to_string(conn.id);
+            sm.cw_id = cfg.connectors[(i + 1) % cfg.connectors.size()].id;
+            sm.ccw_id = cfg.connectors[(i + cfg.connectors.size() - 1) % cfg.connectors.size()].id;
+            ModuleConfig m0{"M" + std::to_string(conn.id) + "_0", "MN_" + std::to_string(conn.id) + "_0"};
+            ModuleConfig m1{"M" + std::to_string(conn.id) + "_1", "MN_" + std::to_string(conn.id) + "_1"};
+            sm.modules = {m0, m1};
+            cfg.slots.push_back(sm);
+        }
     }
 
     // PLC validation: unique PLC IDs and single CAN interface (current driver uses one socket)

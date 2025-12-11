@@ -31,6 +31,7 @@ struct ModuleState {
     std::string mn_id;
     bool healthy{true};
     bool enabled{false};
+    double temperature_c{0.0};
 };
 
 struct GunState {
@@ -39,8 +40,13 @@ struct GunState {
     std::string gc_id;
     GunFsmState fsm_state{GunFsmState::Idle};
     bool ev_session_active{false};
+    bool safety_ok{true};
+    bool gc_welded{false};
+    bool mc_welded{false};
     double ev_req_power_kw{0.0};
     double ev_req_voltage_v{0.0};
+    double min_voltage_v{0.0};
+    double max_voltage_v{0.0};
     double gun_power_limit_kw{0.0};
     double gun_current_limit_a{0.0};
     int priority{0};
@@ -63,6 +69,14 @@ struct PlannerConfig {
     double grid_limit_kw{1000.0};
     double ov_current_factor{1.1};
     double ramp_step_a{10.0};
+    double min_voltage_v_for_div{5.0};
+    double ideal_low_factor{0.8};
+    double ideal_high_factor{1.6};
+    double default_voltage_v{800.0};
+    double connector_derate_start_c{80.0};
+    double connector_derate_trip_c{90.0};
+    double module_derate_start_c{75.0};
+    double module_derate_trip_c{85.0};
 };
 
 struct GunDispatch {
@@ -97,8 +111,18 @@ private:
     std::map<std::string, ModuleState> modules_;
     std::map<int, GunState> guns_;
     int next_island_id_{1};
+    std::map<int, Slot> slot_lookup_;
 
     std::vector<int> active_guns() const;
+    Plan blank_plan() const;
+    const Slot* find_slot(int slot_id) const;
+    int count_healthy_modules_in_slot(int slot_id) const;
+    int ideal_modules_for_gun(const GunState& g, double p_budget) const;
+    std::vector<std::string> select_modules_for_slot(const Slot& slot, int n_needed, Plan& plan) const;
+    std::vector<int> build_island_slots_for_gun(const GunState& g, int n_needed,
+                                                const std::set<int>& active_home_slots,
+                                                std::set<int>& claimed_slots) const;
+    std::vector<std::string> assign_modules_for_island(const std::vector<int>& slot_ids, int n_needed, Plan& plan) const;
     std::map<int, double> compute_power_budgets(const std::vector<int>& active,
                                                 const std::map<int, double>& req_limited,
                                                 int healthy_modules) const;

@@ -38,6 +38,12 @@ cmake --build build -j
 
 The root CMake script fetches `everest-cmake` automatically. If your dependencies are installed in non‑standard locations, append them to `CMAKE_PREFIX_PATH`.
 
+Optional unit tests for the planner:
+```bash
+cmake --build build -j --target power_manager_tests
+./build/power_manager_tests
+```
+
 Run
 ---
 ```bash
@@ -98,22 +104,50 @@ OCPP adapter behavior (current)
   - Available → Charging when a session exists and relay closed.
   - Available/Suspended → Suspended when a session exists but relay open.
   - Any → Faulted on safety/estop/earth/comm/meter-stale; clears to Available when healthy.
+- Transaction start is aligned with ISO 15118 HLC `PowerDelivery` readiness: HLC stage/flags from PLC are gated with CP
+  state and lock feedback to prevent premature energy delivery or OCPP transaction start.
 - Transactions gated by safety_ok/comm_ok before start; faults auto-stop transactions and disable connector.
+- Connector lock feedback is enforced (configurable), with MC/GC weld detection propagated as precise OCPP faults.
 - Firmware/diagnostics/log uploads: now emit progress notifications (Downloading/Installing/Installed, Uploading/Uploaded) via libocpp status callbacks.
-- Meter loop pushes measurements each interval; faults reported as OCPP errors (power meter, comm, safety).
+- Meter loop pushes calibrated measurements each interval (plc/shunt selectable), enforces monotonic energy counters, and faults reported as OCPP errors (power meter, comm, safety). Diagnostics/log upload now bundles real log sets and can push to HTTP/file targets.
 
 Configuration notes
 -------------------
 - `configs/charger.json` fields:
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
-  - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, optional `canInterface`, `meterSampleIntervalSeconds`.
+  - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
+    `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
+    `meterSource` (`plc` or `shunt`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
+  - `slots[]` (optional explicit ring topology): `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`, and `modules[]` each with
+    `id` and `mn` contactor id. If omitted, slots/modules are auto-generated per connector.
+  - `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
+    allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
   - `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
 - PLC constraints: unique `plcId` per connector; a single CAN interface is enforced by the host driver.
 
+Planner/allocator overview
+--------------------------
+- Fast planner thread (100 ms) computes power budgets, discrete module picks, and island MC/MN/GC commands.
+- Supports cross-slot borrowing to build multi-slot islands when a gun’s home slot lacks healthy modules (non-overlapping,
+  contiguous expansion).
+- Thermal-aware derating on connector temperature and module over-temp trip, with weld/isolation/safety gating before
+  energizing.
+- Logging emits per-cycle dispatch summaries for observability; unit tests for the planner live in `tests/`.
+
+Operational playbooks
+---------------------
+- TLS/PKI provisioning: `docs/security_pki.md`
+- Soak testing and resilience: `docs/soak_test_plan.md`
+
 Known gaps / TODO for production
 --------------------------------
-- Smart charging: enforce charging profiles/station and per-connector limits against PLC setpoints.
-- Availability/state transitions tied to CP states (plug/unplug) are not yet implemented; only relay/safety driven.
-- Offline buffering/resume, auth list/cache, TLS/cert provisioning and renewal are not yet wired.
-- Firmware/diagnostics uploads are mocked for progress only; no real file transfer.
+- Availability/state transitions tied to CP states (plug/unplug) are still limited; PLC HLC state is now honored but CP-only transitions remain.
+- Offline buffering/resume, auth list/cache, and automated TLS/cert provisioning/renewal are not yet wired (see docs/security_pki.md for manual provisioning).
 - PLC: broader seq/ack beyond relay, finer debounce tuning, loss/reorder protection, richer telemetry usage remain open.
+- V2G/PnC flows are not supported in this release; roadmap and backend expectations are documented below.
+- Run the soak test plan (docs/soak_test_plan.md) before production rollout to validate long-haul stability.
+
+Security and TLS
+----------------
+- Certificate bundles and key directories are created automatically on boot if missing.
+- See `docs/security_pki.md` for provisioning TLS/PKI material for both OCPP and ISO 15118 (CSMS CA, MO/V2G CA, client certs/keys).

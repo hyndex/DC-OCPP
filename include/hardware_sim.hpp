@@ -38,6 +38,7 @@ public:
                                bool prevalidated) override;
     ocpp::Measurement sample_meter(std::int32_t connector) override;
     GunStatus get_status(std::int32_t connector) override;
+    void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
 
 private:
@@ -49,6 +50,7 @@ private:
         std::optional<std::int32_t> reservation_id;
         double target_power_w{0.0};
         double energy_Wh{0.0};
+        bool lock_engaged{true};
         std::chrono::steady_clock::time_point last_update;
     };
 

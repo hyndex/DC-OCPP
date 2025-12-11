@@ -12,7 +12,7 @@
     "AuthorizeRemoteTxRequests": true,
     "ClockAlignedDataInterval": 900,
     "ConnectionTimeOut": 10,
-    "ConnectorPhaseRotation": "0.RST,1.RST",
+    "ConnectorPhaseRotation": "0.RST,1.RST,2.RST,3.RST,4.RST,5.RST,6.RST,7.RST,8.RST,9.RST,10.RST,11.RST,12.RST",
     "GetConfigurationMaxKeys": 100,
     "HeartbeatInterval": 300,
     "LocalAuthorizeOffline": false,
@@ -20,7 +20,7 @@
     "MeterValuesAlignedData": "Energy.Active.Import.Register",
     "MeterValuesSampledData": "Energy.Active.Import.Register",
     "MeterValueSampleInterval": 0,
-    "NumberOfConnectors": 2,
+    "NumberOfConnectors": 12,
     "ResetRetries": 1,
     "StopTransactionOnEVSideDisconnect": true,
     "StopTransactionOnInvalidId": true,
@@ -49,9 +49,9 @@
     "SecurityProfile": 0
   },
   "PnC": {
-    "ISO15118CertificateManagementEnabled": true,
-    "ISO15118PnCEnabled": true,
-    "ContractValidationOffline": true
+    "ISO15118CertificateManagementEnabled": false,
+    "ISO15118PnCEnabled": false,
+    "ContractValidationOffline": false
   },
   "CostAndPrice": {
     "CustomDisplayCostAndPrice": false

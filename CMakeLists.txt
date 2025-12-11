@@ -44,3 +44,9 @@ add_executable(dc_ocpp
 
 target_include_directories(dc_ocpp PRIVATE include)
 target_link_libraries(dc_ocpp PRIVATE everest::ocpp date::date-tz)
+
+add_executable(power_manager_tests
+  tests/power_manager_tests.cpp
+  src/power_manager.cpp
+)
+target_include_directories(power_manager_tests PRIVATE include)

@@ -51,6 +51,11 @@ struct PlcStatus {
     uint8_t last_cmd_seq{0};
     uint8_t relay_state_mask{0};
     uint8_t last_fault_reason{0};
+    uint8_t hlc_stage{0};
+    bool hlc_charge_complete{false};
+    bool hlc_precharge_active{false};
+    bool hlc_cable_check_ok{false};
+    bool hlc_power_ready{false};
     PlcSafetyStatus safety;
     PlcSafetyStatus pending_safety;
     std::chrono::steady_clock::time_point pending_safety_since{};
@@ -117,6 +122,11 @@ private:
         bool last_cmd_close{false};
         bool last_force_all_off{false};
         uint8_t module_mask{0x01}; // bit0: gun, bit1: module1, bit2: module2
+        double energy_fallback_Wh{0.0};
+        std::chrono::steady_clock::time_point last_energy_update{};
+        bool meter_fallback_active{false};
+        bool lock_engaged{true};
+        bool lock_feedback_engaged{true};
     };
 
     std::map<std::int32_t, Node> nodes_; // keyed by connector id; one node per CAN iface (enforced in config)
@@ -137,6 +147,8 @@ private:
     void handle_evac_control(Node& node, const uint8_t* data, size_t len);
     void handle_evdc_targets(Node& node, const uint8_t* data, size_t len);
     void handle_evdc_limits(Node& node, const uint8_t* data, size_t len);
+    void handle_ev_status_display(Node& node, const uint8_t* data, size_t len);
+    void handle_charge_info(Node& node, const uint8_t* data, size_t len);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);
 #endif
@@ -147,6 +159,9 @@ private:
     Node* find_node_by_plc(int plc_id);
     void update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak = 0,
                           uint16_t mv_min = 0, bool has_mv = false);
+    void update_hlc_state(Node& node, uint8_t stage, uint8_t flags);
+    bool derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool relay_status_frame) const;
+    bool derive_hlc_power_ready(const PlcStatus& status) const;
 };
 
 } // namespace charger

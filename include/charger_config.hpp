@@ -15,8 +15,30 @@ struct ConnectorConfig {
     std::string can_interface;     // Optional CAN iface override per connector (e.g. "can0")
     double max_current_a{0};
     double max_power_w{0};
+    double max_voltage_v{0};
+    double min_voltage_v{0};
     int meter_sample_interval_s{0};
     std::string label;
+    bool require_lock{true};
+    int lock_input_switch{3};       // Which PLC switch input indicates lock engaged (1-4)
+    std::string meter_source{"plc"}; // "plc" (default) or "shunt"
+    double meter_scale{1.0};        // Calibration multiplier for meter/shunt readings
+    double meter_offset_wh{0.0};    // Calibration offset applied to imported energy
+};
+
+struct ModuleConfig {
+    std::string id;
+    std::string mn_id;
+};
+
+struct SlotMapping {
+    int id{0};
+    int gun_id{0};
+    std::string gc_id;
+    std::string mc_id;
+    int cw_id{0};
+    int ccw_id{0};
+    std::vector<ModuleConfig> modules;
 };
 
 struct SecurityConfig {
@@ -37,6 +59,9 @@ struct ChargerConfig {
     std::string central_system_uri;
     std::string can_interface; // Default CAN interface for PLC nodes (e.g. "can0")
     bool use_plc{false};
+    double module_power_kw{30.0};
+    double grid_limit_kw{1000.0};
+    double default_voltage_v{800.0};
 
     fs::path ocpp_config;
     fs::path share_path;
@@ -49,6 +74,7 @@ struct ChargerConfig {
     SecurityConfig security;
     int meter_sample_interval_s{30};
     std::vector<ConnectorConfig> connectors;
+    std::vector<SlotMapping> slots; // optional explicit topology map for ring/modules
 };
 
 /// \brief Load charger.json and populate a ChargerConfig with absolute paths.

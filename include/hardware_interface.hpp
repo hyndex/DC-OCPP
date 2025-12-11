@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,13 @@ struct GunStatus {
     bool meter_stale{false};
     bool plugged_in{false};
     bool cp_fault{false};
+    bool lock_engaged{true};
     char cp_state{'U'};
+    uint8_t hlc_stage{0};
+    bool hlc_cable_check_ok{false};
+    bool hlc_precharge_active{false};
+    bool hlc_charge_complete{false};
+    bool hlc_power_ready{false};
     double pilot_duty_pct{0.0};
     std::optional<double> target_voltage_v;
     std::optional<double> target_current_a;
@@ -41,6 +48,7 @@ struct GunStatus {
     bool gc_welded{false};
     bool mc_welded{false};
     double connector_temp_c{0.0};
+    std::array<double, 2> module_temp_c{{0.0, 0.0}};
 };
 
 /// \brief Planner dispatch toward hardware (per connector).
