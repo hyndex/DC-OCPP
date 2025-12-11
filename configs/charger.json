@@ -1,0 +1,32 @@
+{
+  "chargePoint": {
+    "id": "jp-dc-01",
+    "vendor": "JoulePoint",
+    "model": "Joulepoint-DC",
+    "firmwareVersion": "0.0.1",
+    "centralSystemURI": "ws://127.0.0.1:8180/steve/websocket/CentralSystemService/",
+    "usePLC": true,
+    "canInterface": "can0"
+  },
+  "ocppConfig": "configs/ocpp16-config.json",
+  "sharePath": "libocpp/config/v16",
+  "userConfig": "data/user_config.json",
+  "databaseDir": "data/db",
+  "sqlMigrationsPath": "libocpp/config/v16/core_migrations",
+  "messageLogPath": "logs",
+  "loggingConfig": "libocpp/config/logging.ini",
+  "meterSampleIntervalSeconds": 30,
+  "connectors": [
+    { "id": 1, "plcId": 0, "label": "Gun A", "maxCurrentA": 200, "maxPowerW": 100000 },
+    { "id": 2, "plcId": 1, "label": "Gun B", "maxCurrentA": 200, "maxPowerW": 100000 }
+  ],
+  "security": {
+    "csmsCaBundle": "data/certs/ca/csms/CSMS_ROOT_CA.pem",
+    "moCaBundle": "data/certs/ca/mo/MO_ROOT_CA.pem",
+    "v2gCaBundle": "data/certs/ca/v2g/V2G_ROOT_CA.pem",
+    "clientCertDir": "data/certs/client/csms",
+    "clientKeyDir": "data/certs/client/csms",
+    "seccCertDir": "data/certs/client/cso",
+    "seccKeyDir": "data/certs/client/cso"
+  }
+}

@@ -1,0 +1,3 @@
+[submodule "libocpp"]
+	path = libocpp
+	url = https://github.com/EVerest/libocpp.git

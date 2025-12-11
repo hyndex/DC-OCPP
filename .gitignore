@@ -1,0 +1,31 @@
+# Build artifacts
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+*.ninja
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+
+# Logs and runtime output
+/logs/
+*.log
+
+# IDE/tooling
+.DS_Store
+*.swp
+*.swo
+*.user
+.vscode/
+.idea/
+
+# Vendor and examples not to commit
+/Ref/
+
+# Certificates or generated data
+/data/certs/*
