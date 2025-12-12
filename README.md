@@ -115,6 +115,8 @@ Configuration notes
 -------------------
 - `configs/charger.json` fields:
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
+  - `plc` block: `useCRC8` (enable host-side CRC8 generation/verification on all PLC frames) and
+    `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles).
   - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
     `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
     `meterSource` (`plc` or `shunt`), `meterScale`, `meterOffsetWh`, `minVoltageV`.

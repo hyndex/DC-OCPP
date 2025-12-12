@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
+#include <mutex>
+#include <curl/curl.h>
 #include <everest/logging.hpp>
 #include <ocpp/v16/ocpp_enums.hpp>
 
@@ -28,39 +31,181 @@ std::string bundle_logs(const std::string& prefix) {
     return fname;
 }
 
-bool upload_file_to_target(const std::string& source, const std::string& target) {
+bool is_http_url(const std::string& target) {
+    return target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0;
+}
+
+bool upload_via_curl(const std::string& source, const std::string& url, bool require_https,
+                     int connect_timeout_s, int transfer_timeout_s) {
+    if (url.empty()) return false;
+    if (require_https && url.rfind("https://", 0) != 0) {
+        EVLOG_warning << "Rejecting non-HTTPS upload target " << url;
+        return false;
+    }
+    static std::once_flag curl_once;
+    std::call_once(curl_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::FILE* file = std::fopen(source.c_str(), "rb");
+    if (!file) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    const auto size = std::filesystem::file_size(source);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_READDATA, file);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s > 0 ? connect_timeout_s : 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, transfer_timeout_s > 0 ? transfer_timeout_s : 60);
+
+    const CURLcode res = curl_easy_perform(curl);
+    std::fclose(file);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+bool upload_file_to_target(const std::string& source,
+                           const std::string& target,
+                           bool require_https,
+                           std::size_t max_bytes,
+                           int connect_timeout_s,
+                           int transfer_timeout_s,
+                           bool allow_file_targets) {
     if (target.empty()) return false;
-    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
-        const std::string cmd = "curl -sSf -T \"" + source + "\" \"" + target + "\"";
-        return std::system(cmd.c_str()) == 0;
+
+    std::error_code ec;
+    const auto source_size = std::filesystem::file_size(source, ec);
+    if (ec || source_size > max_bytes) {
+        EVLOG_warning << "Rejecting upload: size exceeds limit or unreadable (" << source << ")";
+        return false;
+    }
+
+    if (is_http_url(target)) {
+        return upload_via_curl(source, target, require_https, connect_timeout_s, transfer_timeout_s);
+    }
+    if (!allow_file_targets) {
+        EVLOG_warning << "File uploads disabled; rejecting target " << target;
+        return false;
     }
     std::string path = target;
     const std::string prefix = "file://";
     if (path.rfind(prefix, 0) == 0) {
         path = path.substr(prefix.size());
     }
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing, ec);
+    const auto canonical_parent = std::filesystem::weakly_canonical(std::filesystem::path(path).parent_path(), ec);
+    if (ec) {
+        EVLOG_warning << "Rejecting upload: invalid path " << path;
+        return false;
+    }
+    std::filesystem::create_directories(canonical_parent, ec);
+    const auto dest_path = std::filesystem::weakly_canonical(path, ec);
+    if (ec) {
+        EVLOG_warning << "Rejecting upload: invalid destination " << path;
+        return false;
+    }
+    std::filesystem::copy_file(source, dest_path, std::filesystem::copy_options::overwrite_existing, ec);
     return !ec;
+}
+
+bool download_via_curl(const std::string& url, const std::string& destination, bool require_https,
+                       int connect_timeout_s, int transfer_timeout_s) {
+    if (url.empty()) return false;
+    if (require_https && url.rfind("https://", 0) != 0) {
+        EVLOG_warning << "Rejecting non-HTTPS firmware URL " << url;
+        return false;
+    }
+    static std::once_flag curl_once;
+    std::call_once(curl_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::FILE* file = std::fopen(destination.c_str(), "wb");
+    if (!file) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nullptr);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s > 0 ? connect_timeout_s : 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, transfer_timeout_s > 0 ? transfer_timeout_s : 60);
+
+    const CURLcode res = curl_easy_perform(curl);
+    std::fclose(file);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+bool fetch_firmware(const std::string& location,
+                    std::size_t max_bytes,
+                    bool require_https,
+                    int connect_timeout_s,
+                    int transfer_timeout_s,
+                    bool allow_file_targets) {
+    if (location.empty()) return false;
+    std::error_code ec;
+    const std::string dest = "data/firmware/download.bin";
+    std::filesystem::create_directories(std::filesystem::path(dest).parent_path(), ec);
+    if (is_http_url(location)) {
+        if (!download_via_curl(location, dest, require_https, connect_timeout_s, transfer_timeout_s)) {
+            return false;
+        }
+    } else {
+        if (!allow_file_targets) return false;
+        std::string src = location;
+        const std::string prefix = "file://";
+        if (src.rfind(prefix, 0) == 0) {
+            src = src.substr(prefix.size());
+        }
+        std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    const auto size = std::filesystem::file_size(dest, ec);
+    if (ec || size > max_bytes) {
+        EVLOG_warning << "Firmware download failed size check";
+        std::filesystem::remove(dest, ec);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
 
 namespace charger {
 
-SimulatedHardware::SimulatedHardware(const std::vector<ConnectorConfig>& connectors) {
+SimulatedHardware::SimulatedHardware(const ChargerConfig& cfg) {
+    require_https_uploads_ = cfg.require_https_uploads;
+    upload_max_bytes_ = cfg.upload_max_bytes;
+    upload_connect_timeout_s_ = cfg.upload_connect_timeout_s;
+    upload_transfer_timeout_s_ = cfg.upload_transfer_timeout_s;
+    upload_allow_file_targets_ = cfg.upload_allow_file_targets;
     const auto now = std::chrono::steady_clock::now();
-    for (const auto& cfg : connectors) {
+    for (const auto& conn_cfg : cfg.connectors) {
         ConnectorState state{};
-        state.config = cfg;
+        state.config = conn_cfg;
         state.enabled = true;
         state.charging = false;
         state.reserved = false;
-        state.target_power_w = cfg.max_power_w;
+        state.target_power_w = conn_cfg.max_power_w;
         state.energy_Wh = 0.0;
         state.last_update = now;
-        connectors_.emplace(cfg.id, state);
+        connectors_.emplace(conn_cfg.id, state);
     }
 }
 
@@ -169,7 +314,9 @@ ocpp::v16::GetLogResponse SimulatedHardware::upload_diagnostics(const ocpp::v16:
     }
     bool upload_ok = true;
     if (!request.location.empty()) {
-        upload_ok = upload_file_to_target(fname, request.location);
+        upload_ok = upload_file_to_target(fname, request.location, require_https_uploads_,
+                                          upload_max_bytes_, upload_connect_timeout_s_,
+                                          upload_transfer_timeout_s_, upload_allow_file_targets_);
         if (!upload_ok) {
             EVLOG_warning << "Diagnostics upload to " << request.location << " failed";
         }
@@ -190,8 +337,10 @@ ocpp::v16::GetLogResponse SimulatedHardware::upload_logs(const ocpp::v16::GetLog
         out << "Log upload target: " << request.log.remoteLocation << "\n";
     }
     bool upload_ok = true;
-    if (!request.log.remoteLocation.empty()) {
-        upload_ok = upload_file_to_target(fname, request.log.remoteLocation);
+    if (!request.log.remoteLocation.get().empty()) {
+        upload_ok = upload_file_to_target(fname, request.log.remoteLocation, require_https_uploads_,
+                                          upload_max_bytes_, upload_connect_timeout_s_,
+                                          upload_transfer_timeout_s_, upload_allow_file_targets_);
         if (!upload_ok) {
             EVLOG_warning << "Log upload to " << request.log.remoteLocation << " failed";
         }
@@ -204,14 +353,22 @@ ocpp::v16::GetLogResponse SimulatedHardware::upload_logs(const ocpp::v16::GetLog
 }
 
 void SimulatedHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
-    EVLOG_info << "Simulated firmware update from " << request.location << " scheduled at "
-               << request.retrieveDate.to_rfc3339();
+    const bool ok = fetch_firmware(request.location, upload_max_bytes_, require_https_uploads_,
+                                   upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
+    if (!ok) {
+        EVLOG_warning << "Simulated firmware download failed for " << request.location;
+    } else {
+        EVLOG_info << "Simulated firmware downloaded from " << request.location << " scheduled at "
+                   << request.retrieveDate.to_rfc3339();
+    }
 }
 
 ocpp::v16::UpdateFirmwareStatusEnumType
 SimulatedHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) {
-    EVLOG_info << "Simulated signed firmware update from " << request.firmware.location;
-    return ocpp::v16::UpdateFirmwareStatusEnumType::Accepted;
+    const bool ok = fetch_firmware(request.firmware.location, upload_max_bytes_, require_https_uploads_,
+                                   upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
+    return ok ? ocpp::v16::UpdateFirmwareStatusEnumType::Accepted
+              : ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
 }
 
 void SimulatedHardware::set_connection_timeout(std::int32_t seconds) {
@@ -258,11 +415,13 @@ ocpp::Measurement SimulatedHardware::sample_meter(std::int32_t connector) {
 GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = get_state(connector);
+    const auto fault_it = fault_overrides_.find(connector);
+    const FaultOverride* fault = fault_it != fault_overrides_.end() ? &fault_it->second : nullptr;
     GunStatus st{};
     st.safety_ok = true;
     st.relay_closed = state.enabled && state.charging;
     st.meter_stale = false;
-    const bool ev_connected = state.charging;
+    const bool ev_connected = state.charging || (fault && fault->paused);
     st.plugged_in = ev_connected;
     st.cp_fault = false;
     st.cp_state = ev_connected ? 'C' : 'U';
@@ -273,18 +432,56 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.hlc_charge_complete = false;
     st.hlc_power_ready = st.relay_closed || ev_connected;
     st.lock_engaged = state.lock_engaged || !state.config.require_lock;
-    st.module_temp_c[0] = 40.0;
-    st.module_temp_c[1] = 40.0;
+    st.module_healthy_mask = fault && fault->healthy_mask ? *fault->healthy_mask : 0x03;
+    st.module_fault_mask = fault && fault->fault_mask ? *fault->fault_mask : 0x00;
+    st.gc_welded = fault ? fault->gc_welded : false;
+    st.mc_welded = fault ? fault->mc_welded : false;
+    const double present_voltage = 400.0;
+    const double present_current = state.charging ? state.target_power_w / present_voltage : 0.0;
+    const double present_power_w = state.charging ? state.target_power_w : 0.0;
+    st.present_voltage_v = present_voltage;
+    st.present_current_a = present_current;
+    st.present_power_w = present_power_w;
+    st.target_voltage_v = present_voltage;
+    st.target_current_a = present_current;
+    if (state.config.max_power_w > 0.0) {
+        st.evse_max_power_kw = state.config.max_power_w / 1000.0;
+    }
+    if (state.config.max_voltage_v > 0.0) {
+        st.evse_max_voltage_v = state.config.max_voltage_v;
+    }
+    if (state.config.max_current_a > 0.0) {
+        st.evse_max_current_a = state.config.max_current_a;
+    }
+    st.module_temp_c = fault ? fault->module_temp_c : std::array<double, 2>{{40.0, 40.0}};
+    st.connector_temp_c = fault && fault->connector_temp_c ? *fault->connector_temp_c : 40.0;
+    st.estop = fault ? fault->estop : false;
+    st.earth_fault = fault ? fault->earth_fault : false;
+    st.isolation_fault = fault ? fault->isolation_fault : false;
+    st.overtemp_fault = fault ? fault->overtemp_fault : false;
+    st.overcurrent_fault = fault ? fault->overcurrent_fault : false;
+    st.comm_fault = fault ? fault->comm_fault : false;
+    if (fault && fault->disabled) {
+        st.safety_ok = false;
+    }
+    if (st.estop || st.earth_fault || st.isolation_fault || st.overtemp_fault || st.overcurrent_fault ||
+        st.comm_fault) {
+        st.safety_ok = false;
+    }
     return st;
 }
 
 void SimulatedHardware::apply_power_command(const PowerCommand& cmd) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = get_state(cmd.connector);
+    const auto fault_it = fault_overrides_.find(cmd.connector);
+    const FaultOverride* fault = fault_it != fault_overrides_.end() ? &fault_it->second : nullptr;
     update_energy(state);
-    const bool enable = cmd.module_count > 0 && cmd.gc_closed && cmd.mc_closed;
+    const bool disabled = fault && fault->disabled;
+    const bool paused = fault && fault->paused;
+    const bool enable = cmd.module_count > 0 && cmd.gc_closed && !disabled;
     state.enabled = enable;
-    state.charging = enable;
+    state.charging = enable && !paused;
     double target_power_w = cmd.power_kw * 1000.0;
     if (cmd.current_limit_a > 0.0 && cmd.voltage_set_v > 0.0) {
         const double current_limited = cmd.current_limit_a * cmd.voltage_set_v;
@@ -300,7 +497,7 @@ void SimulatedHardware::apply_power_command(const PowerCommand& cmd) {
     if (state.config.max_power_w > 0.0 && target_power_w > 0.0) {
         target_power_w = std::min(target_power_w, state.config.max_power_w);
     }
-    if (!enable) {
+    if (!enable || paused) {
         target_power_w = 0.0;
     }
     state.target_power_w = std::max(0.0, target_power_w);
@@ -313,6 +510,28 @@ void SimulatedHardware::apply_power_allocation(std::int32_t connector, int modul
     if (!state.enabled) {
         state.charging = false;
     }
+}
+
+void SimulatedHardware::set_fault_override(std::int32_t connector, const FaultOverride& fault) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fault_overrides_[connector] = fault;
+}
+
+void SimulatedHardware::clear_fault_override(std::int32_t connector) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fault_overrides_.erase(connector);
+}
+
+void SimulatedHardware::set_paused(std::int32_t connector, bool paused) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& fo = fault_overrides_[connector];
+    fo.paused = paused;
+}
+
+void SimulatedHardware::set_disabled(std::int32_t connector, bool disabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& fo = fault_overrides_[connector];
+    fo.disabled = disabled;
 }
 
 } // namespace charger

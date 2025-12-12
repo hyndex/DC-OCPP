@@ -49,8 +49,8 @@ private:
     ChargerConfig cfg_;
     std::shared_ptr<HardwareInterface> hardware_;
     std::unique_ptr<ocpp::v16::ChargePoint> charge_point_;
-    PowerManager power_manager_;
     PlannerConfig planner_cfg_{};
+    PowerManager power_manager_;
     std::vector<Slot> slots_;
 
     std::atomic<bool> running_{false};
@@ -60,6 +60,10 @@ private:
     std::vector<std::thread> meter_threads_;
     std::thread planner_thread_;
     std::atomic<bool> planner_thread_running_{false};
+    std::map<int, bool> evse_disabled_;
+    std::map<int, bool> reserved_connectors_;
+    std::map<int, int> reservation_lookup_;
+    std::map<int, bool> power_constrained_;
     std::mutex session_mutex_;
     std::mutex state_mutex_;
     std::mutex plan_mutex_;
@@ -74,6 +78,11 @@ private:
     std::map<std::string, ContactorState> last_gc_state_;
     std::map<std::string, ContactorState> last_mc_state_;
     std::map<int, bool> mc_open_pending_;
+    std::map<int, std::chrono::steady_clock::time_point> mc_open_request_time_;
+    std::map<int, bool> gc_open_pending_;
+    std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
+    std::map<std::string, std::chrono::steady_clock::time_point> mc_command_change_time_;
+    std::map<std::string, std::chrono::steady_clock::time_point> gc_command_change_time_;
     std::map<int, bool> paused_evse_;
     std::map<int, uint8_t> last_module_mask_cmd_;
     std::map<int, double> profile_current_limit_a_;
@@ -81,12 +90,14 @@ private:
     std::map<int, double> last_energy_wh_;
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
 
     void register_callbacks();
     void start_metering_threads();
     void metering_loop(std::int32_t connector, int interval_s);
     std::string make_session_id() const;
     void prepare_security_files() const;
+    const Slot* find_slot_for_gun(int gun_id) const;
     void update_connector_state(std::int32_t connector, const GunStatus& status, bool has_session, bool fault_active);
     bool has_active_session(std::int32_t connector);
     void initialize_slots();

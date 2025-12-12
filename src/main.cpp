@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "PLC hardware init failed (" << e.what() << "), falling back to simulation." << std::endl;
     }
     if (!hardware) {
-        hardware = std::make_shared<charger::SimulatedHardware>(cfg.connectors);
+        hardware = std::make_shared<charger::SimulatedHardware>(cfg);
     }
     charger::OcppAdapter adapter(cfg, hardware);
 

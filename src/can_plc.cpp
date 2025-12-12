@@ -10,6 +10,8 @@
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <cstdio>
 
 #ifdef __linux__
 #include <linux/can.h>
@@ -21,6 +23,7 @@
 #include <unistd.h>
 #endif
 
+#include <curl/curl.h>
 #include <everest/logging.hpp>
 
 namespace charger {
@@ -38,24 +41,12 @@ constexpr uint32_t EVDC_TARGETS_BASE = 0x210;
 constexpr uint32_t EVDC_ENERGY_LIMITS_BASE = 0x230;
 constexpr uint32_t EV_STATUS_DISPLAY_BASE = 0x220;
 constexpr uint32_t CHARGE_INFO_BASE = 0x100;
-constexpr uint32_t PLC_TX_MASK = 0xFFFFFFF0;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
 constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
-
-uint8_t crc8(const uint8_t* data, size_t len) {
-    uint8_t crc = 0x00;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b) {
-            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
-        }
-    }
-    return crc;
-}
 
 uint16_t le_u16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -97,28 +88,165 @@ std::string bundle_logs(const std::string& prefix) {
     return fname;
 }
 
-bool upload_file_to_target(const std::string& source, const std::string& target) {
+bool is_http_url(const std::string& target) {
+    return target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0;
+}
+
+bool upload_via_curl(const std::string& source, const std::string& url, bool require_https,
+                     int connect_timeout_s, int transfer_timeout_s) {
+    if (url.empty()) return false;
+    if (require_https && url.rfind("https://", 0) != 0) {
+        EVLOG_warning << "Rejecting non-HTTPS upload target " << url;
+        return false;
+    }
+    static std::once_flag curl_once;
+    std::call_once(curl_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::FILE* file = std::fopen(source.c_str(), "rb");
+    if (!file) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    const auto size = std::filesystem::file_size(source);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_READDATA, file);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s > 0 ? connect_timeout_s : 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, transfer_timeout_s > 0 ? transfer_timeout_s : 60);
+
+    const CURLcode res = curl_easy_perform(curl);
+    std::fclose(file);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+bool upload_file_to_target(const std::string& source,
+                           const std::string& target,
+                           bool require_https,
+                           std::size_t max_bytes,
+                           int connect_timeout_s,
+                           int transfer_timeout_s,
+                           bool allow_file_targets) {
     if (target.empty()) {
         return false;
     }
-    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
-        std::string cmd = "curl -sSf -T \"" + source + "\" \"" + target + "\"";
-        const int rc = std::system(cmd.c_str());
-        return rc == 0;
+    std::error_code ec;
+    const auto source_size = std::filesystem::file_size(source, ec);
+    if (ec || source_size > max_bytes) {
+        EVLOG_warning << "Rejecting upload: size exceeds limit or unreadable (" << source << ")";
+        return false;
+    }
+    if (is_http_url(target)) {
+        return upload_via_curl(source, target, require_https, connect_timeout_s, transfer_timeout_s);
+    }
+    if (!allow_file_targets) {
+        EVLOG_warning << "File uploads disabled; rejecting target " << target;
+        return false;
     }
     std::string path = target;
     const std::string prefix = "file://";
     if (path.rfind(prefix, 0) == 0) {
         path = path.substr(prefix.size());
     }
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing, ec);
+    const auto canonical_parent = std::filesystem::weakly_canonical(std::filesystem::path(path).parent_path(), ec);
+    if (ec) {
+        EVLOG_warning << "Rejecting upload: invalid path " << path;
+        return false;
+    }
+    std::filesystem::create_directories(canonical_parent, ec);
+    const auto dest_path = std::filesystem::weakly_canonical(path, ec);
+    if (ec) {
+        EVLOG_warning << "Rejecting upload: invalid destination " << path;
+        return false;
+    }
+    std::filesystem::copy_file(source, dest_path, std::filesystem::copy_options::overwrite_existing, ec);
     return !ec;
+}
+
+bool download_via_curl(const std::string& url, const std::string& destination, bool require_https,
+                       int connect_timeout_s, int transfer_timeout_s) {
+    if (url.empty()) return false;
+    if (require_https && url.rfind("https://", 0) != 0) {
+        EVLOG_warning << "Rejecting non-HTTPS firmware URL " << url;
+        return false;
+    }
+    static std::once_flag curl_once;
+    std::call_once(curl_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    std::FILE* file = std::fopen(destination.c_str(), "wb");
+    if (!file) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nullptr);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout_s > 0 ? connect_timeout_s : 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, transfer_timeout_s > 0 ? transfer_timeout_s : 60);
+    const CURLcode res = curl_easy_perform(curl);
+    std::fclose(file);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+bool fetch_firmware(const std::string& location,
+                    std::size_t max_bytes,
+                    bool require_https,
+                    int connect_timeout_s,
+                    int transfer_timeout_s,
+                    bool allow_file_targets) {
+    if (location.empty()) return false;
+    std::error_code ec;
+    const std::string dest = "data/firmware/download.bin";
+    std::filesystem::create_directories(std::filesystem::path(dest).parent_path(), ec);
+    if (is_http_url(location)) {
+        if (!download_via_curl(location, dest, require_https, connect_timeout_s, transfer_timeout_s)) {
+            return false;
+        }
+    } else {
+        if (!allow_file_targets) return false;
+        std::string src = location;
+        const std::string prefix = "file://";
+        if (src.rfind(prefix, 0) == 0) {
+            src = src.substr(prefix.size());
+        }
+        std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    const auto size = std::filesystem::file_size(dest, ec);
+    if (ec || size > max_bytes) {
+        EVLOG_warning << "Firmware download failed size check";
+        std::filesystem::remove(dest, ec);
+        return false;
+    }
+    return true;
 }
 } // namespace
 
-PlcHardware::PlcHardware(const ChargerConfig& cfg) {
+PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8),
+                                                     require_https_uploads_(cfg.require_https_uploads),
+                                                     upload_max_bytes_(cfg.upload_max_bytes),
+                                                     upload_connect_timeout_s_(cfg.upload_connect_timeout_s),
+                                                     upload_transfer_timeout_s_(cfg.upload_transfer_timeout_s),
+                                                     upload_allow_file_targets_(cfg.upload_allow_file_targets) {
     iface_ = cfg.can_interface.empty() ? "can0" : cfg.can_interface;
     for (const auto& c : cfg.connectors) {
         if (plc_to_connector_.count(c.plc_id)) {
@@ -158,36 +286,37 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) {
         throw std::runtime_error("Failed to set CAN error filter");
     }
 
-    // Install RX filters for each PLC TX base with specific plc_id nibble
+    // Install RX filters for each PLC TX base with specific plc_id nibble (extended frames only)
     std::vector<can_filter> filters;
     for (const auto& kv : plc_to_connector_) {
         const int plc_id = kv.first & 0x0F;
+        const PlcFilterSpec relay = make_plc_rx_filter(RELAY_STATUS_BASE, plc_id);
         can_filter f{};
-        f.can_id = (RELAY_STATUS_BASE & PLC_TX_MASK) | plc_id;
-        f.can_mask = PLC_TX_MASK | 0x0F; // match base and low nibble
+        f.can_id = relay.id;
+        f.can_mask = relay.mask;
         filters.push_back(f);
-        f.can_id = (SAFETY_STATUS_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (ENERGY_METER_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (CONFIG_ACK_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (CP_LEVELS_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (CHARGING_SESSION_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (EVAC_CTRL_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (EVDC_MAX_LIMITS_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (EVDC_TARGETS_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (EVDC_ENERGY_LIMITS_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (EV_STATUS_DISPLAY_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
-        f.can_id = (CHARGE_INFO_BASE & PLC_TX_MASK) | plc_id;
-        filters.push_back(f);
+        const PlcFilterSpec safety = make_plc_rx_filter(SAFETY_STATUS_BASE, plc_id);
+        f.can_id = safety.id; f.can_mask = safety.mask; filters.push_back(f);
+        const PlcFilterSpec energy = make_plc_rx_filter(ENERGY_METER_BASE, plc_id);
+        f.can_id = energy.id; f.can_mask = energy.mask; filters.push_back(f);
+        const PlcFilterSpec cfgack = make_plc_rx_filter(CONFIG_ACK_BASE, plc_id);
+        f.can_id = cfgack.id; f.can_mask = cfgack.mask; filters.push_back(f);
+        const PlcFilterSpec cp = make_plc_rx_filter(CP_LEVELS_BASE, plc_id);
+        f.can_id = cp.id; f.can_mask = cp.mask; filters.push_back(f);
+        const PlcFilterSpec session = make_plc_rx_filter(CHARGING_SESSION_BASE, plc_id);
+        f.can_id = session.id; f.can_mask = session.mask; filters.push_back(f);
+        const PlcFilterSpec evac = make_plc_rx_filter(EVAC_CTRL_BASE, plc_id);
+        f.can_id = evac.id; f.can_mask = evac.mask; filters.push_back(f);
+        const PlcFilterSpec max_limits = make_plc_rx_filter(EVDC_MAX_LIMITS_BASE, plc_id);
+        f.can_id = max_limits.id; f.can_mask = max_limits.mask; filters.push_back(f);
+        const PlcFilterSpec targets = make_plc_rx_filter(EVDC_TARGETS_BASE, plc_id);
+        f.can_id = targets.id; f.can_mask = targets.mask; filters.push_back(f);
+        const PlcFilterSpec energy_limits = make_plc_rx_filter(EVDC_ENERGY_LIMITS_BASE, plc_id);
+        f.can_id = energy_limits.id; f.can_mask = energy_limits.mask; filters.push_back(f);
+        const PlcFilterSpec ev_status = make_plc_rx_filter(EV_STATUS_DISPLAY_BASE, plc_id);
+        f.can_id = ev_status.id; f.can_mask = ev_status.mask; filters.push_back(f);
+        const PlcFilterSpec charge_info = make_plc_rx_filter(CHARGE_INFO_BASE, plc_id);
+        f.can_id = charge_info.id; f.can_mask = charge_info.mask; filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -269,6 +398,8 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     if (!node) return;
     node->status.target_voltage_v = cmd.voltage_set_v;
     node->status.target_current_a = cmd.current_limit_a;
+    node->mc_closed_cmd = cmd.mc_closed;
+    node->gc_closed_cmd = cmd.gc_closed;
     uint8_t mask = 0x00;
     // module_mask bit0 -> module0, map to RLY2 (bit1)
     if (cmd.module_mask & 0x01) {
@@ -277,7 +408,7 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     if (cmd.module_mask & 0x02) {
         mask |= 0x04;
     }
-    if (cmd.module_count > 0 && cmd.gc_closed && cmd.mc_closed) {
+    if (cmd.module_count > 0 && cmd.gc_closed) {
         mask |= 0x01;
     }
     node->module_mask = mask;
@@ -330,7 +461,9 @@ ocpp::v16::GetLogResponse PlcHardware::upload_diagnostics(const ocpp::v16::GetDi
     const std::string fname = bundle_logs("diagnostics");
     bool upload_ok = true;
     if (!request.location.empty()) {
-        upload_ok = upload_file_to_target(fname, request.location);
+        upload_ok = upload_file_to_target(fname, request.location, require_https_uploads_,
+                                          upload_max_bytes_, upload_connect_timeout_s_,
+                                          upload_transfer_timeout_s_, upload_allow_file_targets_);
         if (!upload_ok) {
             EVLOG_warning << "Diagnostics upload to " << request.location << " failed";
         }
@@ -347,8 +480,10 @@ ocpp::v16::GetLogResponse PlcHardware::upload_logs(const ocpp::v16::GetLogReques
     resp.status = ocpp::v16::LogStatusEnumType::Accepted;
     const std::string fname = bundle_logs("logs");
     bool upload_ok = true;
-    if (!request.log.remoteLocation.empty()) {
-        upload_ok = upload_file_to_target(fname, request.log.remoteLocation);
+    if (!request.log.remoteLocation.get().empty()) {
+        upload_ok = upload_file_to_target(fname, request.log.remoteLocation, require_https_uploads_,
+                                          upload_max_bytes_, upload_connect_timeout_s_,
+                                          upload_transfer_timeout_s_, upload_allow_file_targets_);
         if (!upload_ok) {
             EVLOG_warning << "Log upload to " << request.log.remoteLocation << " failed";
         }
@@ -360,13 +495,23 @@ ocpp::v16::GetLogResponse PlcHardware::upload_logs(const ocpp::v16::GetLogReques
     return resp;
 }
 
-void PlcHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& /*request*/) {
-    // Firmware update for PLC would be handled externally.
+void PlcHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
+    const bool ok = fetch_firmware(request.location, upload_max_bytes_, require_https_uploads_,
+                                   upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
+    if (!ok) {
+        EVLOG_warning << "PLC firmware download failed for " << request.location;
+    } else {
+        EVLOG_info << "PLC firmware downloaded from " << request.location << " scheduled at "
+                   << request.retrieveDate.to_rfc3339();
+    }
 }
 
 ocpp::v16::UpdateFirmwareStatusEnumType
-PlcHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& /*request*/) {
-    return ocpp::v16::UpdateFirmwareStatusEnumType::Accepted;
+PlcHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) {
+    const bool ok = fetch_firmware(request.firmware.location, upload_max_bytes_, require_https_uploads_,
+                                   upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
+    return ok ? ocpp::v16::UpdateFirmwareStatusEnumType::Accepted
+              : ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
 }
 
 void PlcHardware::set_connection_timeout(std::int32_t /*seconds*/) {
@@ -533,6 +678,10 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     if (st.comm_fault && node->cfg.require_lock) {
         st.lock_engaged = false;
     }
+    if (node->crc_mode_mismatch) {
+        st.safety_ok = false;
+        st.comm_fault = true;
+    }
     // If PLC did not publish capabilities, fall back to configured hardware limits.
     if (!st.evse_max_voltage_v && node->cfg.max_voltage_v > 0.0) {
         st.evse_max_voltage_v = node->cfg.max_voltage_v;
@@ -543,31 +692,34 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     if (!st.evse_max_power_kw && node->cfg.max_power_w > 0.0) {
         st.evse_max_power_kw = node->cfg.max_power_w / 1000.0;
     }
-    uint8_t healthy_mask = 0x03; // two modules default healthy
-    uint8_t fault_mask = 0x00;
-    const uint8_t commanded_mask = node->module_mask & 0x06;
-    const uint8_t actual_mask = node->status.relay_state_mask & 0x06;
-    const bool gun_cmd = (node->module_mask & 0x01) != 0;
-    const bool gun_actual = (node->status.relay_state_mask & 0x01) != 0;
-    st.gc_welded = (!gun_cmd && gun_actual);
-    st.mc_welded = false;
-    if (st.comm_fault || !st.safety_ok || node->status.safety.remote_force_off) {
-        healthy_mask = 0x00;
-    } else {
-        for (int idx = 0; idx < 2; ++idx) {
-            const uint8_t bit = static_cast<uint8_t>(1U << (idx + 1));
-            const bool commanded_on = (commanded_mask & bit) != 0;
-            const bool actual_on = (actual_mask & bit) != 0;
-            if (commanded_on && !actual_on) {
-                healthy_mask &= static_cast<uint8_t>(~(1U << idx));
-                fault_mask |= static_cast<uint8_t>(1U << idx);
-            } else if (!commanded_on && actual_on) {
-                st.mc_welded = true;
-                healthy_mask &= static_cast<uint8_t>(~(1U << idx));
-                fault_mask |= static_cast<uint8_t>(1U << idx);
+    uint8_t healthy_mask = node->crc_mode_mismatch ? 0x00 : 0x03; // two modules default healthy
+    uint8_t fault_mask = node->crc_mode_mismatch ? 0xFF : 0x00;
+    if (!node->crc_mode_mismatch) {
+        const uint8_t commanded_mask = node->module_mask & 0x06;
+        const uint8_t actual_mask = node->status.relay_state_mask & 0x06;
+        const bool gun_cmd = (node->module_mask & 0x01) != 0;
+        const bool gun_actual = (node->status.relay_state_mask & 0x01) != 0;
+        st.gc_welded = (!gun_cmd && gun_actual);
+        st.mc_welded = false;
+        if (st.comm_fault || !st.safety_ok || node->status.safety.remote_force_off) {
+            healthy_mask = 0x00;
+        } else {
+            for (int idx = 0; idx < 2; ++idx) {
+                const uint8_t bit = static_cast<uint8_t>(1U << (idx + 1));
+                const bool commanded_on = (commanded_mask & bit) != 0;
+                const bool actual_on = (actual_mask & bit) != 0;
+                if (commanded_on && !actual_on) {
+                    healthy_mask &= static_cast<uint8_t>(~(1U << idx));
+                    fault_mask |= static_cast<uint8_t>(1U << idx);
+                } else if (!commanded_on && actual_on) {
+                    st.mc_welded = true;
+                    healthy_mask &= static_cast<uint8_t>(~(1U << idx));
+                    fault_mask |= static_cast<uint8_t>(1U << idx);
+                }
             }
         }
     }
+    st.relay_closed = st.relay_closed && !node->crc_mode_mismatch;
     st.module_healthy_mask = healthy_mask;
     st.module_fault_mask = fault_mask;
     return st;
@@ -582,10 +734,19 @@ bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off)
     }
     data[0] |= (1 << 3);                 // SYS_ENABLE
     if (force_all_off) data[0] |= (1 << 4);
+    const bool clear_faults = node.status.last_fault_reason != 0;
+    if (clear_faults) data[0] |= (1 << 5); // CLEAR_FAULTS
     data[1] = node.cmd_seq++;
     // Enable mask for relays present
     data[2] = node.module_mask & 0x07; // RLY1/2/3_ENABLE
     // CMD_MODE (steady)
+    data[3] = 0x00;
+    // PULSE_MS (steady)
+    data[4] = 0x00;
+    data[5] = 0x00;
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
     uint32_t can_id = 0x0300 | ((0x4 << 4) | (node.cfg.plc_id & 0x0F));
     const auto ok = send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
     if (ok) {
@@ -646,6 +807,9 @@ void PlcHardware::rx_loop() {
             handle_error_frame(frame);
             continue;
         }
+        if ((frame.can_id & CAN_EFF_FLAG) == 0) {
+            continue;
+        }
         handle_frame(frame.can_id & CAN_EFF_MASK, frame.data, frame.can_dlc);
     }
 #endif
@@ -658,15 +822,46 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
     const int plc_id = static_cast<int>(can_id & 0x0F);
     auto* node = find_node_by_plc(plc_id);
     if (!node) return;
-    node->status.last_any_rx = std::chrono::steady_clock::now();
+    const auto rx_time = std::chrono::steady_clock::now();
+    auto mark_crc_mismatch = [&](const char* reason) {
+        node->status.safety.comm_fault = true;
+        node->status.safety.safety_ok = false;
+        node->crc_mode_mismatch = true;
+        node->status.pending_safety = node->status.safety;
+        node->status.pending_safety_since = rx_time;
+        if (!node->crc_mode_mismatch_logged) {
+            EVLOG_error << "CRC mode mismatch on PLC " << node->cfg.plc_id << ": " << reason;
+            node->crc_mode_mismatch_logged = true;
+        }
+    };
+    auto mark_crc_fault = [&](const char* reason) {
+        node->status.safety.comm_fault = true;
+        node->status.safety.safety_ok = false;
+        node->status.pending_safety = node->status.safety;
+        node->status.pending_safety_since = rx_time;
+        if (!node->crc_fault_logged) {
+            EVLOG_error << "CRC fault on PLC " << node->cfg.plc_id << ": " << reason;
+            node->crc_fault_logged = true;
+        }
+    };
 
-    // CRC check when DLC==8 and CRC byte non-zero
-    if (len == 8 && data[7] != 0) {
-        if (crc8(data, 7) != data[7]) {
-            node->status.safety.comm_fault = true;
+    // CRC check based on configuration (always validate when enabled, even if CRC byte is 0).
+    if (use_crc8_) {
+        if (len < 8) {
+            mark_crc_mismatch("expected CRC8 byte but frame shorter than 8 bytes");
             return;
         }
+        const uint8_t expected = plc_crc8(data, 7);
+        if (expected != data[7]) {
+            mark_crc_fault("CRC8 verification failed");
+            return;
+        }
+    } else if (len == 8 && data[7] != 0) {
+        mark_crc_mismatch("PLC is sending CRC8 while host configuration disabled CRC");
+        return;
     }
+    node->crc_fault_logged = false;
+    node->status.last_any_rx = rx_time;
 
     if ((can_id & PLC_TX_MASK) == (RELAY_STATUS_BASE & PLC_TX_MASK)) {
         handle_relay_status(*node, data, len);

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <type_traits>
+#include <cstddef>
 
 #include <nlohmann/json.hpp>
 
@@ -91,10 +93,37 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.central_system_uri = cp.value("centralSystemURI", "");
     cfg.use_plc = cp.value("usePLC", false);
     cfg.can_interface = cp.value("canInterface", "can0");
+    const auto plc_cfg = json.value("plc", nlohmann::json::object());
+    cfg.plc_use_crc8 = plc_cfg.value("useCRC8", false);
+    cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
+    const auto uploads = json.value("uploads", nlohmann::json::object());
+    cfg.upload_max_bytes = uploads.value("maxBytes", cfg.upload_max_bytes);
+    cfg.upload_connect_timeout_s = uploads.value("connectTimeoutSeconds", cfg.upload_connect_timeout_s);
+    cfg.upload_transfer_timeout_s = uploads.value("transferTimeoutSeconds", cfg.upload_transfer_timeout_s);
+    cfg.upload_allow_file_targets = uploads.value("allowFileTargets", cfg.upload_allow_file_targets);
     const auto site_limits = json.value("siteLimits", nlohmann::json::object());
     cfg.module_power_kw = json.value("modulePowerKW", 30.0);
     cfg.grid_limit_kw = json.value("gridLimitKW", site_limits.value("gridPowerLimitKW", 1000.0));
     cfg.default_voltage_v = json.value("defaultVoltageV", site_limits.value("defaultVoltageV", 800.0));
+    const auto planner = json.value("planner", nlohmann::json::object());
+    auto planner_value = [&](const char* key, auto default_value) {
+        using T = std::decay_t<decltype(default_value)>;
+        if (planner.contains(key)) {
+            return planner.value(key, default_value);
+        }
+        return json.value<T>(key, default_value);
+    };
+    cfg.allow_cross_slot_islands = planner_value("allowCrossSlotIslands", cfg.allow_cross_slot_islands);
+    cfg.max_modules_per_gun = planner_value("maxModulesPerGun", cfg.max_modules_per_gun);
+    cfg.min_modules_per_active_gun = planner_value("minModulesPerActiveGun", cfg.min_modules_per_active_gun);
+    cfg.max_island_radius = planner_value("maxIslandRadius", cfg.max_island_radius);
+    cfg.min_module_hold_ms = planner_value("minModuleHoldMs", cfg.min_module_hold_ms);
+    cfg.min_mc_hold_ms = planner_value("minMcHoldMs", cfg.min_mc_hold_ms);
+    cfg.min_gc_hold_ms = planner_value("minGcHoldMs", cfg.min_gc_hold_ms);
+    cfg.mc_open_current_a = planner_value("mcOpenCurrentA", cfg.mc_open_current_a);
+    cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
+    cfg.precharge_voltage_tolerance_v = planner_value("prechargeVoltageToleranceV", cfg.precharge_voltage_tolerance_v);
+    cfg.precharge_timeout_ms = planner_value("prechargeTimeoutMs", cfg.precharge_timeout_ms);
     if (cfg.module_power_kw <= 0.0) {
         cfg.module_power_kw = 30.0;
     }

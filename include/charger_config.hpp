@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -59,9 +60,26 @@ struct ChargerConfig {
     std::string central_system_uri;
     std::string can_interface; // Default CAN interface for PLC nodes (e.g. "can0")
     bool use_plc{false};
+    bool plc_use_crc8{false};
+    bool require_https_uploads{true};
     double module_power_kw{30.0};
     double grid_limit_kw{1000.0};
     double default_voltage_v{800.0};
+    bool allow_cross_slot_islands{false};
+    int max_modules_per_gun{2};
+    int min_modules_per_active_gun{1};
+    int max_island_radius{6};
+    int min_module_hold_ms{1000};
+    int min_mc_hold_ms{1000};
+    int min_gc_hold_ms{500};
+    double mc_open_current_a{1.0};
+    double gc_open_current_a{1.0};
+    std::size_t upload_max_bytes{100 * 1024 * 1024}; // 100 MB safety cap
+    int upload_connect_timeout_s{10};
+    int upload_transfer_timeout_s{60};
+    bool upload_allow_file_targets{true};
+    double precharge_voltage_tolerance_v{50.0};
+    int precharge_timeout_ms{2000};
 
     fs::path ocpp_config;
     fs::path share_path;

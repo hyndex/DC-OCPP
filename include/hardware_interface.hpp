@@ -43,7 +43,7 @@ struct GunStatus {
     std::optional<double> evse_max_voltage_v;
     std::optional<double> evse_max_current_a;
     std::optional<double> evse_max_power_kw;
-    uint8_t module_healthy_mask{0xFF}; // bit0=module0, bit1=module1, etc. Slot-local ordering.
+    uint8_t module_healthy_mask{0x00}; // bit0=module0, bit1=module1, etc. Slot-local ordering.
     uint8_t module_fault_mask{0x00};   // bitmask mirroring module_healthy_mask for detected faults/welds
     bool gc_welded{false};
     bool mc_welded{false};
@@ -101,7 +101,7 @@ public:
     /// \brief Apply computed power allocation (modules, contactors, setpoints) for the connector.
     /// Default fallbacks map to the older apply_power_allocation + enable/disable calls.
     virtual void apply_power_command(const PowerCommand& cmd) {
-        if (cmd.module_count <= 0 || !cmd.gc_closed || !cmd.mc_closed) {
+        if (cmd.module_count <= 0 || !cmd.gc_closed) {
             apply_power_allocation(cmd.connector, 0);
             disable(cmd.connector);
             return;

@@ -2,7 +2,9 @@
 #include "power_manager.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 using namespace charger;
 
@@ -53,6 +55,7 @@ int main() {
     cfg.grid_limit_kw = 90.0;
     cfg.ramp_step_a = 0.0;
     cfg.default_voltage_v = 800.0;
+    cfg.allow_cross_slot_islands = true;
     PowerManager pm(cfg);
 
     std::vector<Slot> slots;
@@ -113,6 +116,35 @@ int main() {
     }
     assert(has_slot2);
     assert(plan.guns.front().modules_assigned == 2 || plan.guns.front().modules_assigned == 1);
+
+    // Hysteresis/min-dwell: avoid flapping between 2->1 modules within hold window
+    cfg.min_module_hold_ms = 200;
+    cfg.grid_limit_kw = 120.0;
+    pm = PowerManager(cfg);
+    pm.set_slots(slots);
+    modules.clear();
+    modules.push_back(make_module("M1_0", 1, true));
+    modules.push_back(make_module("M1_1", 1, true));
+    pm.update_modules(modules);
+    guns.clear();
+    guns.push_back(make_gun(1, 60.0, 60.0, true)); // wants 2 modules
+    pm.update_guns(guns);
+    plan = pm.compute_plan();
+    assert(!plan.guns.empty());
+    const int initial_modules = plan.guns.front().modules_assigned;
+    assert(initial_modules == 2);
+
+    // Drop request to one module but within hold window => still keep 2
+    guns.clear();
+    guns.push_back(make_gun(1, 20.0, 60.0, true));
+    pm.update_guns(guns);
+    plan = pm.compute_plan();
+    assert(plan.guns.front().modules_assigned == 2);
+
+    // After hold window expires, allow drop to one module
+    std::this_thread::sleep_for(std::chrono::milliseconds(cfg.min_module_hold_ms + 50));
+    plan = pm.compute_plan();
+    assert(plan.guns.front().modules_assigned == 1);
 
     std::cout << "power_manager_tests passed\n";
     return 0;

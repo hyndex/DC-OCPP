@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <chrono>
+#include <cstddef>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -14,9 +15,38 @@
 
 #ifdef __linux__
 #include <linux/can.h>
+#else
+constexpr uint32_t CAN_EFF_FLAG = 0x80000000U;
+constexpr uint32_t CAN_EFF_MASK = 0x1FFFFFFFU;
 #endif
 
 namespace charger {
+
+constexpr uint32_t PLC_TX_MASK = 0xFFFFFFF0;
+
+struct PlcFilterSpec {
+    uint32_t id{0};
+    uint32_t mask{0};
+};
+
+inline uint8_t plc_crc8(const uint8_t* data, size_t len) {
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0x07) : static_cast<uint8_t>(crc << 1);
+        }
+    }
+    return crc;
+}
+
+inline PlcFilterSpec make_plc_rx_filter(uint32_t base, int plc_id) {
+    PlcFilterSpec spec{};
+    const uint32_t base_mask = (PLC_TX_MASK | 0x0F | CAN_EFF_FLAG) & (CAN_EFF_MASK | CAN_EFF_FLAG);
+    spec.mask = base_mask;
+    spec.id = (base & PLC_TX_MASK) | static_cast<uint32_t>(plc_id & 0x0F) | CAN_EFF_FLAG;
+    return spec;
+}
 
 struct PlcSafetyStatus {
     bool safety_ok{false};
@@ -121,17 +151,28 @@ private:
         int retry_count{0};
         bool last_cmd_close{false};
         bool last_force_all_off{false};
+        bool mc_closed_cmd{true};
+        bool gc_closed_cmd{false};
         uint8_t module_mask{0x01}; // bit0: gun, bit1: module1, bit2: module2
         double energy_fallback_Wh{0.0};
         std::chrono::steady_clock::time_point last_energy_update{};
         bool meter_fallback_active{false};
         bool lock_engaged{true};
         bool lock_feedback_engaged{true};
+        bool crc_mode_mismatch{false};
+        bool crc_mode_mismatch_logged{false};
+        bool crc_fault_logged{false};
     };
 
     std::map<std::int32_t, Node> nodes_; // keyed by connector id; one node per CAN iface (enforced in config)
     std::map<int, std::int32_t> plc_to_connector_;
     std::string iface_;
+    bool use_crc8_{false};
+    bool require_https_uploads_{true};
+    std::size_t upload_max_bytes_{100 * 1024 * 1024};
+    int upload_connect_timeout_s_{10};
+    int upload_transfer_timeout_s_{60};
+    bool upload_allow_file_targets_{true};
     int sock_{-1};
     std::atomic<bool> running_{false};
     std::thread rx_thread_;

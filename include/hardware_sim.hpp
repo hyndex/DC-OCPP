@@ -7,13 +7,15 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <array>
 
 namespace charger {
 
 /// \brief Simple in-process hardware stub so OCPP flows can be exercised without real EVSE hardware.
 class SimulatedHardware : public HardwareInterface {
 public:
-    explicit SimulatedHardware(const std::vector<ConnectorConfig>& connectors);
+    explicit SimulatedHardware(const ChargerConfig& cfg);
     ~SimulatedHardware() override = default;
 
     bool enable(std::int32_t connector) override;
@@ -41,6 +43,12 @@ public:
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
 
+    // Simulation controls for tests/harnesses
+    void set_fault_override(std::int32_t connector, const FaultOverride& fault);
+    void clear_fault_override(std::int32_t connector);
+    void set_paused(std::int32_t connector, bool paused);
+    void set_disabled(std::int32_t connector, bool disabled);
+
 private:
     struct ConnectorState {
         ConnectorConfig config;
@@ -53,9 +61,31 @@ private:
         bool lock_engaged{true};
         std::chrono::steady_clock::time_point last_update;
     };
+    struct FaultOverride {
+        bool estop{false};
+        bool earth_fault{false};
+        bool isolation_fault{false};
+        bool overtemp_fault{false};
+        bool overcurrent_fault{false};
+        bool comm_fault{false};
+        bool gc_welded{false};
+        bool mc_welded{false};
+        bool paused{false};
+        bool disabled{false};
+        std::optional<uint8_t> healthy_mask;
+        std::optional<uint8_t> fault_mask;
+        std::optional<double> connector_temp_c;
+        std::array<double, 2> module_temp_c{{0.0, 0.0}};
+    };
 
     std::mutex mutex_;
     std::map<std::int32_t, ConnectorState> connectors_;
+    bool require_https_uploads_{true};
+    std::size_t upload_max_bytes_{100 * 1024 * 1024};
+    int upload_connect_timeout_s_{10};
+    int upload_transfer_timeout_s_{60};
+    bool upload_allow_file_targets_{true};
+    std::map<std::int32_t, FaultOverride> fault_overrides_;
 
     ConnectorState& get_state(std::int32_t connector);
     void update_energy(ConnectorState& state);

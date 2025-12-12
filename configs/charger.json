@@ -8,6 +8,20 @@
     "usePLC": true,
     "canInterface": "can0"
   },
+  "plc": {
+    "useCRC8": true,
+    "requireHttpsUploads": true
+  },
+  "uploads": {
+    "maxBytes": 104857600,
+    "connectTimeoutSeconds": 10,
+    "transferTimeoutSeconds": 60,
+    "allowFileTargets": true
+  },
+  "planner": {
+    "prechargeVoltageToleranceV": 50,
+    "prechargeTimeoutMs": 2000
+  },
   "modulePowerKW": 30,
   "gridLimitKW": 720,
   "defaultVoltageV": 800,

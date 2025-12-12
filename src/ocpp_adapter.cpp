@@ -11,6 +11,7 @@
 #include <thread>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include <everest/logging.hpp>
 #include <ocpp/common/evse_security_impl.hpp>
@@ -22,10 +23,20 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr uint8_t HLC_MIN_POWER_STAGE = 4;
+constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
+constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 
 const Slot* find_slot(const std::vector<Slot>& slots, int id) {
     auto it = std::find_if(slots.begin(), slots.end(), [&](const Slot& s) { return s.id == id; });
     return it == slots.end() ? nullptr : &(*it);
+}
+
+const Slot* find_slot_for_gun(const std::vector<Slot>& slots, int gun_id) {
+    auto it = std::find_if(slots.begin(), slots.end(), [&](const Slot& s) { return s.gun_id == gun_id; });
+    if (it != slots.end()) {
+        return &(*it);
+    }
+    return find_slot(slots, gun_id);
 }
 
 uint8_t compute_module_mask_for_gun(const Plan& plan, const Slot& slot, int gun_id) {
@@ -73,6 +84,55 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
     return cp_ready && (hlc_ready || targets_present || measured_present);
 }
 
+int popcount(uint8_t mask) {
+    int count = 0;
+    while (mask) {
+        count += (mask & 0x1);
+        mask >>= 1U;
+    }
+    return count;
+}
+
+template <typename T> struct is_optional : std::false_type {};
+template <typename U> struct is_optional<std::optional<U>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_total : std::false_type {};
+template <typename T>
+struct has_total<T, std::void_t<decltype(std::declval<T>().total)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_dc : std::false_type {};
+template <typename T>
+struct has_dc<T, std::void_t<decltype(std::declval<T>().DC)>> : std::true_type {};
+
+template <typename T>
+double extract_total_value(const T& v) {
+    if constexpr (is_optional<T>::value) {
+        return v ? extract_total_value(*v) : 0.0;
+    } else if constexpr (has_total<T>::value) {
+        return static_cast<double>(v.total);
+    } else {
+        return static_cast<double>(v);
+    }
+}
+
+template <typename T>
+std::optional<double> extract_dc_value(const T& v) {
+    if constexpr (is_optional<T>::value) {
+        if (!v) return std::nullopt;
+        return extract_dc_value(*v);
+    } else if constexpr (has_dc<T>::value) {
+        if constexpr (is_optional<decltype(v.DC)>::value) {
+            return v.DC ? std::optional<double>(*v.DC) : std::nullopt;
+        } else {
+            return std::optional<double>(v.DC);
+        }
+    } else {
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> hardware) :
@@ -83,6 +143,10 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
     for (const auto& c : cfg_.connectors) {
         connector_faulted_[c.id] = false;
         connector_state_[c.id] = ConnectorState::Available;
+        evse_disabled_[c.id] = false;
+        reserved_connectors_[c.id] = false;
+        power_constrained_[c.id] = false;
+        paused_evse_[c.id] = false;
     }
     initialize_slots();
 }
@@ -104,6 +168,10 @@ void OcppAdapter::prepare_security_files() const {
     touch(cfg_.security.v2g_ca_bundle);
 }
 
+const Slot* OcppAdapter::find_slot_for_gun(int gun_id) const {
+    return charger::find_slot_for_gun(slots_, gun_id);
+}
+
 void OcppAdapter::initialize_slots() {
     if (slots_initialized_) return;
 
@@ -111,6 +179,15 @@ void OcppAdapter::initialize_slots() {
     pcfg.module_power_kw = cfg_.module_power_kw > 0.0 ? cfg_.module_power_kw : 30.0;
     pcfg.grid_limit_kw = cfg_.grid_limit_kw > 0.0 ? cfg_.grid_limit_kw : 1000.0;
     pcfg.default_voltage_v = cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v : 800.0;
+    pcfg.allow_cross_slot_islands = cfg_.allow_cross_slot_islands;
+    pcfg.max_modules_per_gun = std::max(1, cfg_.max_modules_per_gun);
+    pcfg.min_modules_per_active_gun = std::max(0, cfg_.min_modules_per_active_gun);
+    pcfg.max_island_radius = std::max(1, cfg_.max_island_radius);
+    pcfg.min_module_hold_ms = std::max(0, cfg_.min_module_hold_ms);
+    pcfg.min_mc_hold_ms = std::max(0, cfg_.min_mc_hold_ms);
+    pcfg.min_gc_hold_ms = std::max(0, cfg_.min_gc_hold_ms);
+    pcfg.mc_open_current_a = cfg_.mc_open_current_a;
+    pcfg.gc_open_current_a = cfg_.gc_open_current_a;
     planner_cfg_ = pcfg;
     power_manager_ = PowerManager(planner_cfg_);
 
@@ -240,14 +317,33 @@ void OcppAdapter::stop() {
 
 void OcppAdapter::register_callbacks() {
     charge_point_->register_enable_evse_callback([this](std::int32_t connector) {
+        {
+            std::lock_guard<std::mutex> lock(plan_mutex_);
+            evse_disabled_[connector] = false;
+        }
         const bool ok = hardware_->enable(connector);
         if (ok) {
             charge_point_->on_enabled(connector);
+        } else {
+            std::lock_guard<std::mutex> lock(plan_mutex_);
+            evse_disabled_[connector] = true;
         }
         return ok;
     });
 
     charge_point_->register_disable_evse_callback([this](std::int32_t connector) {
+        {
+            std::lock_guard<std::mutex> lock(plan_mutex_);
+            evse_disabled_[connector] = true;
+        }
+        bool had_session = false;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            had_session = sessions_.count(connector) > 0;
+        }
+        if (had_session) {
+            finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
+        }
         const bool ok = hardware_->disable(connector);
         if (ok) {
             charge_point_->on_disabled(connector);
@@ -296,12 +392,24 @@ void OcppAdapter::register_callbacks() {
                                                    parent_id ? std::optional<std::string>(parent_id->get()) : std::nullopt);
             if (status == ocpp::v16::ReservationStatus::Accepted) {
                 charge_point_->on_reservation_start(connector);
+                std::lock_guard<std::mutex> lock(plan_mutex_);
+                reserved_connectors_[connector] = true;
+                reservation_lookup_[reservation_id] = connector;
             }
             return status;
         });
 
     charge_point_->register_cancel_reservation_callback([this](std::int32_t reservation_id) {
-        return hardware_->cancel_reservation(reservation_id);
+        const bool ok = hardware_->cancel_reservation(reservation_id);
+        if (ok) {
+            std::lock_guard<std::mutex> lock(plan_mutex_);
+            auto it = reservation_lookup_.find(reservation_id);
+            if (it != reservation_lookup_.end()) {
+                reserved_connectors_[it->second] = false;
+                reservation_lookup_.erase(it);
+            }
+        }
+        return ok;
     });
 
     charge_point_->register_unlock_connector_callback(
@@ -309,48 +417,38 @@ void OcppAdapter::register_callbacks() {
 
     charge_point_->register_upload_diagnostics_callback(
         [this](const ocpp::v16::GetDiagnosticsRequest& request) {
-            auto resp = hardware_->upload_diagnostics(request);
             charge_point_->on_log_status_notification(-1, "Uploading");
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_log_status_notification(-1, "Uploaded");
-            }).detach();
+            auto resp = hardware_->upload_diagnostics(request);
+            charge_point_->on_log_status_notification(-1, resp.status == ocpp::v16::LogStatusEnumType::Accepted
+                                                                ? "Uploaded"
+                                                                : "UploadFailed");
             return resp;
         });
 
     charge_point_->register_upload_logs_callback(
         [this](const ocpp::v16::GetLogRequest& request) {
-            auto resp = hardware_->upload_logs(request);
             const int req_id = request.requestId;
             charge_point_->on_log_status_notification(req_id, "Uploading");
-            std::thread([this, req_id]() {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_log_status_notification(req_id, "Uploaded");
-            }).detach();
+            auto resp = hardware_->upload_logs(request);
+            charge_point_->on_log_status_notification(req_id, resp.status == ocpp::v16::LogStatusEnumType::Accepted
+                                                                  ? "Uploaded"
+                                                                  : "UploadFailed");
             return resp;
         });
 
     charge_point_->register_update_firmware_callback(
         [this](const ocpp::v16::UpdateFirmwareRequest msg) {
             charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
-            }).detach();
             hardware_->update_firmware(msg);
+            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
+            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
         });
 
     charge_point_->register_signed_update_firmware_callback(
         [this](const ocpp::v16::SignedUpdateFirmwareRequest msg) {
             charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
-            }).detach();
+            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
+            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
             return hardware_->update_firmware_signed(msg);
         });
 
@@ -400,6 +498,13 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                     id_tag_copy = it->second.id_token;
                     meter_start_copy = it->second.meter_start_wh;
                 }
+            }
+            bool constrained = false;
+            bool paused = false;
+            {
+                std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                constrained = power_constrained_[connector];
+                paused = paused_evse_[connector];
             }
             bool fault = false;
             if (status.cp_fault) {
@@ -458,7 +563,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             }
             if (!fault && status.overtemp_fault) {
                 ocpp::v16::ErrorInfo err("overtemp",
-                                         ocpp::v16::ChargePointErrorCode::OverTemperature, true);
+                                         ocpp::v16::ChargePointErrorCode::HighTemperature, true);
                 report_fault(connector, err);
                 finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
                 hardware_->disable(connector);
@@ -492,7 +597,10 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 had_session = false;
                 fault = true;
             }
-            if (!fault && status.module_fault_mask != 0) {
+            const uint8_t usable_modules =
+                static_cast<uint8_t>(status.module_healthy_mask &
+                                     static_cast<uint8_t>(~status.module_fault_mask));
+            if (!fault && usable_modules == 0) {
                 ocpp::v16::ErrorInfo err("module_fault",
                                          ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
                 report_fault(connector, err);
@@ -500,6 +608,10 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 hardware_->disable(connector);
                 had_session = false;
                 fault = true;
+            } else if (!fault && status.module_fault_mask != 0) {
+                ocpp::v16::ErrorInfo err("module_degraded",
+                                         ocpp::v16::ChargePointErrorCode::OtherError, false);
+                report_fault(connector, err);
             }
             // Lock fault: if lock disengaged while plug-in/session active, treat as fault
             const auto cfg_it = std::find_if(cfg_.connectors.begin(), cfg_.connectors.end(),
@@ -528,16 +640,18 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             push_meter_values(connector, measurement);
             {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
-                if (measurement.power_meter.voltage_V && measurement.power_meter.voltage_V->DC.has_value()) {
-                    last_voltage_v_[connector] = measurement.power_meter.voltage_V->DC.value();
+                const auto v_dc = extract_dc_value(measurement.power_meter.voltage_V);
+                if (v_dc) {
+                    last_voltage_v_[connector] = *v_dc;
                 }
-                if (measurement.power_meter.power_W && measurement.power_meter.power_W->total.has_value()) {
-                    last_power_w_[connector] = measurement.power_meter.power_W->total.value();
-                } else if (measurement.power_meter.current_A && measurement.power_meter.current_A->DC.has_value() &&
-                           measurement.power_meter.voltage_V && measurement.power_meter.voltage_V->DC.has_value()) {
-                    const double v = measurement.power_meter.voltage_V->DC.value();
-                    const double i = measurement.power_meter.current_A->DC.value();
-                    last_power_w_[connector] = v * i;
+                const double p_total = extract_total_value(measurement.power_meter.power_W);
+                if (p_total > 0.0) {
+                    last_power_w_[connector] = p_total;
+                } else {
+                    const auto i_dc = extract_dc_value(measurement.power_meter.current_A);
+                    if (v_dc && i_dc) {
+                        last_power_w_[connector] = (*v_dc) * (*i_dc);
+                    }
                 }
             }
             if (status.meter_stale) {
@@ -558,7 +672,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             } else if (had_session && !power_ready && session_start.time_since_epoch().count()) {
                 const auto now = std::chrono::steady_clock::now();
                 const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - session_start).count();
-                if (age > 60) {
+                if (!constrained && !paused && age > 60) {
                     EVLOG_warning << "Session on connector " << connector
                                   << " timed out waiting for EV power request, stopping session";
                     finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
@@ -587,9 +701,26 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
 
 bool OcppAdapter::begin_transaction(std::int32_t connector, const std::string& id_token,
                                     ocpp::SessionStartedReason reason) {
+    bool disabled = false;
+    {
+        std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+        disabled = evse_disabled_[connector];
+        reserved_connectors_[connector] = false;
+        for (auto it = reservation_lookup_.begin(); it != reservation_lookup_.end();) {
+            if (it->second == connector) {
+                it = reservation_lookup_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (sessions_.find(connector) != sessions_.end()) {
         EVLOG_warning << "Connector " << connector << " already has an active session";
+        return false;
+    }
+    if (disabled) {
+        EVLOG_warning << "Connector " << connector << " is disabled by CSMS; rejecting session start";
         return false;
     }
 
@@ -693,6 +824,31 @@ bool OcppAdapter::has_active_session(std::int32_t connector) {
 
 void OcppAdapter::apply_power_plan() {
     std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    std::map<int, std::string> fault_reasons;
+    auto enforce_hold = [&](const std::string& id, ContactorState desired,
+                            std::map<std::string, ContactorState>& last_state,
+                            std::map<std::string, std::chrono::steady_clock::time_point>& last_change,
+                            int hold_ms, bool prefer_open) -> ContactorState {
+        const auto prev_it = last_state.find(id);
+        const ContactorState prev = prev_it != last_state.end() ? prev_it->second : ContactorState::Open;
+        const auto ts_it = last_change.find(id);
+        const bool in_hold = ts_it != last_change.end() &&
+            (now - ts_it->second) < std::chrono::milliseconds(std::max(0, hold_ms));
+        if (in_hold && desired != prev) {
+            if (prefer_open && desired == ContactorState::Open) {
+                last_change[id] = now;
+                last_state[id] = desired;
+                return desired;
+            }
+            return prev;
+        }
+        if (desired != prev) {
+            last_change[id] = now;
+        }
+        last_state[id] = desired;
+        return desired;
+    };
     std::vector<GunState> guns;
     guns.reserve(cfg_.connectors.size());
     std::map<int, GunState> gun_lookup;
@@ -712,9 +868,13 @@ void OcppAdapter::apply_power_plan() {
         const double scale = 1.0 - ((temp_c - start_c) / (trip_c - start_c));
         return value * std::max(0.0, scale);
     };
+    for (const auto& c : cfg_.connectors) {
+        power_constrained_[c.id] = false;
+    }
 
     for (const auto& c : cfg_.connectors) {
         GunStatus st = hardware_->get_status(c.id);
+        const Slot* slot_for_conn = find_slot_for_gun(c.id);
         if (safety_trip_needed(st)) {
             trip_global = true;
             if (global_reason.empty()) {
@@ -730,8 +890,8 @@ void OcppAdapter::apply_power_plan() {
 
         GunState g{};
         g.id = c.id;
-        g.slot_id = c.id;
-        g.gc_id = "GC_" + std::to_string(c.id);
+        g.slot_id = slot_for_conn ? slot_for_conn->id : c.id;
+        g.gc_id = slot_for_conn ? slot_for_conn->gc_id : "GC_" + std::to_string(c.id);
         g.gun_power_limit_kw = c.max_power_w > 0 ? c.max_power_w / 1000.0 : 0.0;
         g.gun_current_limit_a = c.max_current_a > 0 ? c.max_current_a : 0.0;
         g.max_voltage_v = c.max_voltage_v > 0.0 ? c.max_voltage_v : 0.0;
@@ -743,6 +903,8 @@ void OcppAdapter::apply_power_plan() {
         g.mc_welded = st.mc_welded;
         g.safety_ok = st.safety_ok && !st.estop && !st.earth_fault && !st.isolation_fault &&
                       !st.overtemp_fault && !st.overcurrent_fault && !st.comm_fault;
+        g.plugged_in = st.plugged_in;
+        g.reserved = reserved_connectors_[c.id];
         if (planner_cfg_.connector_derate_trip_c > 0.0 &&
             st.connector_temp_c >= planner_cfg_.connector_derate_trip_c) {
             g.safety_ok = false;
@@ -750,8 +912,13 @@ void OcppAdapter::apply_power_plan() {
 
         const bool lock_required = c.require_lock;
         const bool session_active = has_active_session(c.id);
+        const bool disabled_by_csms = evse_disabled_.count(c.id) ? evse_disabled_[c.id] : false;
         const bool power_ready = session_active &&
-            (st.relay_closed || power_delivery_requested(st, lock_required));
+            (st.relay_closed || power_delivery_requested(st, lock_required)) && !disabled_by_csms;
+        if (session_active) {
+            g.reserved = false;
+            reserved_connectors_[c.id] = false;
+        }
 
         if (st.evse_max_current_a) {
             g.gun_current_limit_a = g.gun_current_limit_a > 0.0
@@ -791,8 +958,13 @@ void OcppAdapter::apply_power_plan() {
             last_power_w_[c.id] = st.present_power_w.value();
         }
 
+        const uint8_t healthy_mask = st.module_healthy_mask;
+        const uint8_t fault_mask = st.module_fault_mask;
+        const uint8_t usable_mask = static_cast<uint8_t>(healthy_mask & static_cast<uint8_t>(~fault_mask));
+        const int healthy_modules = popcount(usable_mask);
+        const bool modules_ok = healthy_modules > 0;
+
         double req_kw = 0.0;
-        const bool modules_ok = st.module_fault_mask == 0;
         if (power_ready && g.safety_ok && modules_ok && !st.gc_welded && !st.mc_welded) {
             if (st.target_voltage_v && st.target_current_a) {
                 req_kw = (st.target_voltage_v.value() * st.target_current_a.value()) / 1000.0;
@@ -828,28 +1000,10 @@ void OcppAdapter::apply_power_plan() {
         g.ev_req_voltage_v = std::min(g.ev_req_voltage_v, max_voltage_v);
         g.i_meas_a = measured_i;
 
-        const bool blocked = !g.safety_ok || !modules_ok || st.gc_welded || st.mc_welded;
-        g.ev_session_active = session_active;
-        const bool ready_for_power = power_ready && !blocked;
-
-        if (blocked) {
-            g.fsm_state = GunFsmState::Fault;
-        } else if (st.relay_closed) {
-            g.fsm_state = GunFsmState::Charging;
-        } else if (ready_for_power) {
-            g.fsm_state = GunFsmState::Ready;
-        } else if (session_active) {
-            g.fsm_state = GunFsmState::EvDetected;
-        } else {
-            g.fsm_state = GunFsmState::Idle;
-        }
-        guns.push_back(g);
-        gun_lookup[g.id] = g;
-
         // Update module health by slot
-        if (const Slot* slot = find_slot(slots_, c.id)) {
-            for (std::size_t idx = 0; idx < slot->modules.size(); ++idx) {
-                const auto& module_id = slot->modules[idx];
+        if (slot_for_conn) {
+            for (std::size_t idx = 0; idx < slot_for_conn->modules.size(); ++idx) {
+                const auto& module_id = slot_for_conn->modules[idx];
                 for (auto& mod : module_states_) {
                     if (mod.id == module_id) {
                         const uint8_t bit = static_cast<uint8_t>(1U << idx);
@@ -868,6 +1022,33 @@ void OcppAdapter::apply_power_plan() {
                 }
             }
         }
+        int runtime_healthy_modules = healthy_modules;
+        if (slot_for_conn) {
+            runtime_healthy_modules = 0;
+            for (const auto& mod : module_states_) {
+                if (mod.slot_id == slot_for_conn->id && mod.healthy) {
+                    runtime_healthy_modules++;
+                }
+            }
+        }
+        const bool blocked = !g.safety_ok || runtime_healthy_modules <= 0 || st.gc_welded || st.mc_welded;
+        g.ev_session_active = session_active;
+        const bool ready_for_power = power_ready && !blocked;
+
+        if (blocked) {
+            g.fsm_state = GunFsmState::Fault;
+        } else if (st.relay_closed) {
+            g.fsm_state = GunFsmState::Charging;
+        } else if (ready_for_power) {
+            g.fsm_state = GunFsmState::Ready;
+        } else if (session_active) {
+            g.fsm_state = GunFsmState::EvDetected;
+        } else {
+            g.fsm_state = GunFsmState::Idle;
+        }
+        guns.push_back(g);
+        gun_lookup[g.id] = g;
+
         snapshots[c.id] = ConnSnapshot{st, measured_power_kw, measured_i};
         if (g.connector_temp_c > 0.0) {
             g.gun_current_limit_a = derate_linear(g.gun_current_limit_a, g.connector_temp_c,
@@ -924,7 +1105,7 @@ void OcppAdapter::apply_power_plan() {
     }
 
     for (const auto& c : cfg_.connectors) {
-        const Slot* slot = find_slot(slots_, c.id);
+        const Slot* slot = find_slot_for_gun(c.id);
         if (!slot) continue;
 
         const auto gc_it = plan.gc_commands.find(slot->gc_id);
@@ -933,6 +1114,7 @@ void OcppAdapter::apply_power_plan() {
             gc_it != plan.gc_commands.end() ? gc_it->second : ContactorState::Open;
         const ContactorState mc_state =
             mc_it != plan.mc_commands.end() ? mc_it->second : ContactorState::Closed;
+        const bool disabled_by_csms = evse_disabled_.count(c.id) ? evse_disabled_[c.id] : false;
 
         const auto disp_it = gun_dispatch.find(c.id);
         GunDispatch dispatch{};
@@ -942,6 +1124,7 @@ void OcppAdapter::apply_power_plan() {
             dispatch.gun_id = c.id;
             dispatch.modules_assigned = 0;
             dispatch.p_budget_kw = 0.0;
+            dispatch.p_set_kw = 0.0;
             dispatch.current_limit_a = 0.0;
             dispatch.voltage_set_v = last_voltage_v_[c.id] > 0.0 ? last_voltage_v_[c.id] : 800.0;
         }
@@ -950,78 +1133,239 @@ void OcppAdapter::apply_power_plan() {
         const GunStatus status = snap_it != snapshots.end() ? snap_it->second.status : GunStatus{};
         const double meas_i = snap_it != snapshots.end() ? snap_it->second.measured_current_a : 0.0;
         const GunState g = gun_lookup.count(c.id) ? gun_lookup.at(c.id) : GunState{};
+        ContactorState planned_mc_state = mc_state;
+        // Prevent MC state changes while connector is actively relaying energy or current above threshold.
+        const bool mc_change_requested = last_mc_state_.count(slot->mc_id) &&
+            mc_state != last_mc_state_[slot->mc_id];
+        const double mc_lock_thresh = planner_cfg_.mc_open_current_a > 0.0 ? planner_cfg_.mc_open_current_a : 0.5;
+        if (mc_change_requested &&
+            ((status.relay_closed || std::fabs(meas_i) >= mc_lock_thresh))) {
+            planned_mc_state = last_mc_state_[slot->mc_id];
+            power_constrained_[c.id] = true;
+            EVLOG_debug << "Deferring MC change for slot " << slot->id << " while charging is active";
+        }
 
-        const bool local_fault = !g.safety_ok || status.module_fault_mask != 0 || status.gc_welded ||
-                                 status.mc_welded || status.isolation_fault || status.overtemp_fault ||
-                                 status.overcurrent_fault || status.comm_fault;
-        bool evse_paused = paused_evse_[c.id];
-
-        // MC open sequencing: keep MC closed until current nearly zero when commanded open
-        bool mc_closed_cmd = (mc_state == ContactorState::Closed);
-        const bool mc_wants_open = (mc_state == ContactorState::Open);
-        if (mc_wants_open && !local_fault) {
-            const bool safe_to_open = std::fabs(meas_i) < 1.0 && dispatch.modules_assigned == 0;
-            if (!safe_to_open) {
-                mc_open_pending_[slot->id] = true;
-                mc_closed_cmd = true;
-            } else {
-                mc_open_pending_.erase(slot->id);
-                mc_closed_cmd = false;
+        int runtime_healthy_modules = 0;
+        const auto island_it =
+            std::find_if(plan.islands.begin(), plan.islands.end(),
+                         [&](const IslandState& island) { return island.gun_id && island.gun_id.value() == c.id; });
+        if (island_it != plan.islands.end()) {
+            for (const auto& mod_id : island_it->module_ids) {
+                const auto mit = std::find_if(module_states_.begin(), module_states_.end(),
+                                              [&](const ModuleState& m) { return m.id == mod_id; });
+                if (mit != module_states_.end() && mit->healthy) {
+                    runtime_healthy_modules++;
+                }
             }
-        } else {
-            mc_open_pending_.erase(slot->id);
-            if (mc_state == ContactorState::Open) {
-                mc_closed_cmd = false;
+        }
+        if (runtime_healthy_modules == 0) {
+            for (const auto& mod : module_states_) {
+                if (mod.slot_id == slot->id && mod.healthy) {
+                    runtime_healthy_modules++;
+                }
             }
         }
 
-        const bool allow_energy = (!local_fault) && (gc_state == ContactorState::Closed) && mc_closed_cmd &&
-                                  dispatch.modules_assigned > 0;
-        const int effective_modules = allow_energy ? dispatch.modules_assigned : 0;
-        uint8_t module_mask = allow_energy ? compute_module_mask_for_gun(plan, *slot, c.id) : 0;
+        bool local_fault = !g.safety_ok || runtime_healthy_modules <= 0 || status.gc_welded ||
+                           status.mc_welded || status.isolation_fault || status.overtemp_fault ||
+                           status.overcurrent_fault || status.comm_fault;
+        if (status.gc_welded) fault_reasons[c.id] = "GCWelded";
+        if (status.mc_welded) fault_reasons[c.id] = "MCWelded";
+        bool evse_paused = paused_evse_[c.id] || disabled_by_csms;
+
+        // MC sequencing: honor open-on-charge islands but gate opens on low current with a short timeout.
+        const double mc_open_thresh = planner_cfg_.mc_open_current_a > 0.0 ? planner_cfg_.mc_open_current_a : 0.5;
+        bool mc_closed_cmd = (mc_state == ContactorState::Closed);
+        bool isolation_ready = true;
+        if (mc_state == ContactorState::Open && !local_fault) {
+            const bool already_isolated =
+                (last_mc_state_[slot->mc_id] == ContactorState::Open) &&
+                (!mc_open_pending_.count(slot->id) || !mc_open_pending_[slot->id]);
+            if (already_isolated) {
+                mc_closed_cmd = false;
+            } else {
+                const bool safe_to_open = (std::fabs(meas_i) < mc_open_thresh) || !status.relay_closed;
+                if (safe_to_open) {
+                    mc_closed_cmd = false;
+                    mc_open_pending_.erase(slot->id);
+                    mc_open_request_time_.erase(slot->id);
+                } else {
+                    mc_closed_cmd = true;
+                    mc_open_pending_[slot->id] = true;
+                    auto& ts = mc_open_request_time_[slot->id];
+                    if (ts.time_since_epoch().count() == 0) {
+                        ts = now;
+                    } else if ((now - ts) > MC_OPEN_TIMEOUT_MS) {
+                        local_fault = true;
+                        fault_reasons[c.id] = "MCOpenTimeout";
+                        EVLOG_warning << "MC open timeout for slot " << slot->id << " (gun " << c.id
+                                      << "); locking out connector";
+                    }
+                    isolation_ready = false;
+                }
+            }
+        } else {
+            mc_open_pending_.erase(slot->id);
+            mc_open_request_time_.erase(slot->id);
+            mc_closed_cmd = (mc_state == ContactorState::Closed);
+        }
+        if (local_fault) {
+            isolation_ready = false;
+            mc_open_pending_.erase(slot->id);
+            mc_open_request_time_.erase(slot->id);
+            mc_closed_cmd = false;
+        }
+
+        // GC: avoid opening under load unless forced; rely on PLC to ramp to zero.
+        const double gc_open_thresh = planner_cfg_.gc_open_current_a > 0.0 ? planner_cfg_.gc_open_current_a : 0.5;
+        bool gc_closed_cmd = (gc_state == ContactorState::Closed);
+        if (!gc_closed_cmd && !local_fault) {
+            const bool safe_to_open = std::fabs(meas_i) < gc_open_thresh || !status.relay_closed;
+            if (!safe_to_open) {
+                gc_closed_cmd = true;
+                gc_open_pending_[c.id] = true;
+                auto& ts = gc_open_request_time_[c.id];
+                if (ts.time_since_epoch().count() == 0) {
+                    ts = now;
+                } else if ((now - ts) > GC_OPEN_TIMEOUT_MS) {
+                    local_fault = true;
+                    EVLOG_warning << "GC open timeout for connector " << c.id
+                                  << " while waiting for current to drop";
+                }
+            } else {
+                gc_open_pending_.erase(c.id);
+                gc_open_request_time_.erase(c.id);
+            }
+        } else {
+            gc_open_pending_.erase(c.id);
+            gc_open_request_time_.erase(c.id);
+        }
+        if (disabled_by_csms || local_fault) {
+            gc_closed_cmd = false;
+        }
+
+        mc_closed_cmd = (planned_mc_state == ContactorState::Closed);
+        const auto enforced_mc = enforce_hold(slot->mc_id,
+                                              mc_closed_cmd ? ContactorState::Closed : ContactorState::Open,
+                                              last_mc_state_, mc_command_change_time_,
+                                              planner_cfg_.min_mc_hold_ms, true);
+        mc_closed_cmd = (enforced_mc == ContactorState::Closed);
+        const auto enforced_gc = enforce_hold(slot->gc_id,
+                                              gc_closed_cmd ? ContactorState::Closed : ContactorState::Open,
+                                              last_gc_state_, gc_command_change_time_,
+                                              planner_cfg_.min_gc_hold_ms, true);
+        gc_closed_cmd = (enforced_gc == ContactorState::Closed);
+
+        // Precharge/voltage match before closing GC.
+        const double v_target = dispatch.voltage_set_v;
+        double v_meas = status.present_voltage_v ? status.present_voltage_v.value() : last_voltage_v_[c.id];
+        if (v_meas <= 0.0) v_meas = last_voltage_v_[c.id];
+        if (v_meas <= 0.0) v_meas = planner_cfg_.default_voltage_v;
+        bool precharge_ok = true;
+        const bool precharge_needed = dispatch.modules_assigned > 0 && gc_state == ContactorState::Closed &&
+                                      !disabled_by_csms && !local_fault;
+        if (precharge_needed) {
+            const double dv = std::fabs(v_meas - v_target);
+            precharge_ok = dv <= cfg_.precharge_voltage_tolerance_v;
+            if (!precharge_ok) {
+                auto& ts = precharge_start_[c.id];
+                if (ts.time_since_epoch().count() == 0) {
+                    ts = now;
+                } else if ((now - ts) > std::chrono::milliseconds(cfg_.precharge_timeout_ms)) {
+                    local_fault = true;
+                    precharge_ok = false;
+                    EVLOG_warning << "Precharge timeout for connector " << c.id;
+                }
+            } else {
+                precharge_start_.erase(c.id);
+            }
+        } else {
+            precharge_start_.erase(c.id);
+        }
+        if (!precharge_ok) {
+            gc_closed_cmd = false;
+        }
+        if (local_fault) {
+            precharge_start_.erase(c.id);
+        }
+
+        // Allow modules to energize the island even if GC stays open for precharge.
+        const bool modules_allowed = (!local_fault) && !disabled_by_csms && mc_closed_cmd &&
+                                     dispatch.modules_assigned > 0;
+        const bool allow_energy = modules_allowed && gc_closed_cmd && isolation_ready && precharge_ok;
+        const int effective_modules = modules_allowed ? dispatch.modules_assigned : 0;
+        uint8_t module_mask = modules_allowed ? compute_module_mask_for_gun(plan, *slot, c.id) : 0;
 
         PowerCommand cmd;
         cmd.connector = c.id;
         cmd.module_count = effective_modules;
         cmd.module_mask = module_mask;
-        cmd.gc_closed = allow_energy;
-        cmd.mc_closed = mc_closed_cmd && !local_fault;
+        cmd.gc_closed = gc_closed_cmd;
+        cmd.mc_closed = (!disabled_by_csms && !local_fault) ? mc_closed_cmd : false;
         cmd.voltage_set_v = dispatch.voltage_set_v;
         cmd.current_limit_a = allow_energy ? dispatch.current_limit_a : 0.0;
-        cmd.power_kw = allow_energy ? dispatch.p_budget_kw : 0.0;
+        cmd.power_kw = allow_energy ? dispatch.p_set_kw : 0.0;
 
         if (evse_paused && g.ev_session_active) {
             // Keep contactors closed but clamp current to zero for a graceful pause.
             cmd.current_limit_a = 0.0;
             cmd.power_kw = 0.0;
-            cmd.gc_closed = !local_fault;
-            cmd.mc_closed = !local_fault;
-            if (cmd.module_count <= 0) {
-                cmd.module_count = std::max(1, last_module_alloc_[c.id] > 0 ? last_module_alloc_[c.id] : 1);
-            }
-            if (cmd.module_mask == 0) {
-                cmd.module_mask = last_module_mask_cmd_[c.id];
+            if (disabled_by_csms) {
+                cmd.gc_closed = false;
+                cmd.mc_closed = (!local_fault && !disabled_by_csms) ? mc_closed_cmd : false;
+                cmd.module_count = 0;
+                cmd.module_mask = 0;
+            } else {
+                if (!allow_energy && isolation_ready && !local_fault) {
+                    cmd.gc_closed = gc_closed_cmd;
+                }
+                cmd.mc_closed = (!disabled_by_csms && !local_fault) ? mc_closed_cmd : false;
+                if (cmd.module_count <= 0 && isolation_ready && dispatch.modules_assigned > 0 && !local_fault) {
+                    cmd.module_count = dispatch.modules_assigned;
+                    cmd.module_mask = compute_module_mask_for_gun(plan, *slot, c.id);
+                }
                 if (cmd.module_mask == 0 && cmd.module_count > 0) {
-                    cmd.module_mask = static_cast<uint8_t>((1U << cmd.module_count) - 1U) << 1U;
-                    cmd.module_mask |= 0x01; // ensure gun relay command bit
+                    cmd.module_mask = compute_module_mask_for_gun(plan, *slot, c.id);
+                }
+                if (cmd.module_mask == 0 && last_module_mask_cmd_[c.id] != 0) {
+                    cmd.module_mask = last_module_mask_cmd_[c.id];
                 }
             }
         }
 
         last_current_limit_a_[c.id] = cmd.current_limit_a;
-        last_requested_power_kw_[c.id] = dispatch.p_budget_kw;
+        last_requested_power_kw_[c.id] = dispatch.p_set_kw;
         last_module_alloc_[c.id] = cmd.module_count;
         last_module_mask_cmd_[c.id] = cmd.module_mask;
         hardware_->apply_power_command(cmd);
+        last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
+        last_gc_state_[slot->gc_id] = cmd.gc_closed ? ContactorState::Closed : ContactorState::Open;
 
         // Inform OCPP of offered limits
         charge_point_->on_max_current_offered(c.id, static_cast<std::int32_t>(std::round(cmd.current_limit_a)));
         charge_point_->on_max_power_offered(
             c.id, static_cast<std::int32_t>(std::round(cmd.power_kw * 1000.0)));
 
-        if ((dispatch.modules_assigned == 0 || local_fault) && g.ev_session_active) {
+        const bool constrained = g.ev_session_active && !local_fault && !disabled_by_csms &&
+                                 (((dispatch.modules_assigned == 0 && dispatch.p_budget_kw > 0.0) ||
+                                   (cmd.module_count == 0 && dispatch.modules_assigned > 0) ||
+                                   (dispatch.p_set_kw + 1e-3 < dispatch.p_budget_kw)));
+        power_constrained_[c.id] = constrained;
+
+        if (local_fault && g.ev_session_active) {
             finish_transaction(c.id, ocpp::v16::Reason::PowerLoss, std::nullopt);
             hardware_->disable(c.id);
+            fault_reasons[c.id] = fault_reasons.count(c.id) ? fault_reasons[c.id] : "LocalFault";
+            if (charge_point_) {
+                ocpp::v16::ErrorInfo err(fault_reasons[c.id],
+                                         ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
+                charge_point_->on_error(c.id, err);
+            }
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                connector_faulted_[c.id] = true;
+                connector_state_[c.id] = ConnectorState::Faulted;
+            }
         }
 
         EVLOG_debug << "Planner dispatch gun " << c.id << " slots=" << (slot ? slot->id : -1)
@@ -1059,6 +1403,9 @@ void OcppAdapter::enter_global_fault(const std::string& reason, ocpp::v16::Reaso
 
 void OcppAdapter::apply_zero_power_plan() {
     mc_open_pending_.clear();
+    mc_open_request_time_.clear();
+    gc_open_pending_.clear();
+    gc_open_request_time_.clear();
     for (const auto& c : cfg_.connectors) {
         PowerCommand cmd;
         cmd.connector = c.id;
@@ -1124,16 +1471,20 @@ void OcppAdapter::update_connector_state(std::int32_t connector, const GunStatus
     ConnectorState next = ConnectorState::Available;
     const bool cp_known = status.cp_state != 'U';
     bool paused = false;
+    bool constrained = false;
+    bool disabled = false;
     {
         std::lock_guard<std::mutex> lock(plan_mutex_);
         paused = paused_evse_[connector];
+        constrained = power_constrained_[connector];
+        disabled = evse_disabled_[connector];
     }
     if (fault_active || status.meter_stale) {
         next = ConnectorState::Faulted;
     } else if (has_session) {
         if (cp_known && !status.plugged_in) {
             next = ConnectorState::SuspendedEV;
-        } else if (paused) {
+        } else if (paused || constrained || disabled) {
             next = ConnectorState::SuspendedEVSE;
         } else if (!status.relay_closed) {
             const bool ev_requesting = cp_known ? (status.cp_state == 'C' || status.cp_state == 'D') : true;
@@ -1141,6 +1492,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, const GunStatus
         } else {
             next = ConnectorState::Charging;
         }
+    } else if (disabled) {
+        next = ConnectorState::SuspendedEVSE;
     }
 
     ConnectorState current;
