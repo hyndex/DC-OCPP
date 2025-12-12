@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -18,7 +19,7 @@
 
 namespace charger {
 
-enum class ConnectorState { Available, Charging, SuspendedEV, SuspendedEVSE, Faulted };
+enum class ConnectorState { Available, Preparing, Charging, SuspendedEV, SuspendedEVSE, Finishing, Faulted };
 
 class OcppAdapter {
 public:
@@ -28,7 +29,7 @@ public:
     bool start();
     void stop();
 
-    bool begin_transaction(std::int32_t connector, const std::string& id_token,
+    bool begin_transaction(std::int32_t connector, const std::string& id_token, bool prevalidated = false,
                            ocpp::SessionStartedReason reason = ocpp::SessionStartedReason::Authorized);
     void finish_transaction(std::int32_t connector, ocpp::v16::Reason reason,
                             std::optional<ocpp::CiString<20>> id_tag_end = std::nullopt);
@@ -40,10 +41,20 @@ public:
 private:
     struct ActiveSession {
         std::string session_id;
-        std::string id_token;
+        std::optional<std::string> id_token;
         double meter_start_wh{0.0};
-        std::chrono::steady_clock::time_point started_at;
+        std::chrono::steady_clock::time_point connected_at;
+        std::optional<std::chrono::steady_clock::time_point> authorized_at;
+        std::optional<std::chrono::steady_clock::time_point> power_requested_at;
         bool transaction_started{false};
+        bool authorized{false};
+        bool ev_connected{false};
+        AuthTokenSource token_source{AuthTokenSource::RFID};
+    };
+
+    struct PendingToken {
+        AuthToken token;
+        std::chrono::steady_clock::time_point expires_at;
     };
 
     ChargerConfig cfg_;
@@ -55,6 +66,9 @@ private:
 
     std::atomic<bool> running_{false};
     std::map<std::int32_t, ActiveSession> sessions_;
+    std::map<std::int32_t, std::deque<PendingToken>> pending_tokens_;
+    std::map<std::int32_t, std::chrono::steady_clock::time_point> plug_event_time_;
+    std::map<std::int32_t, bool> plugged_in_state_;
     std::map<std::int32_t, bool> connector_faulted_;
     std::map<std::int32_t, ConnectorState> connector_state_;
     std::vector<std::thread> meter_threads_;
@@ -98,7 +112,8 @@ private:
     std::string make_session_id() const;
     void prepare_security_files() const;
     const Slot* find_slot_for_gun(int gun_id) const;
-    void update_connector_state(std::int32_t connector, const GunStatus& status, bool has_session, bool fault_active);
+    void update_connector_state(std::int32_t connector, const GunStatus& status, bool has_session, bool tx_started,
+                                bool authorized, bool fault_active, bool disabled);
     bool has_active_session(std::int32_t connector);
     void initialize_slots();
     void apply_power_plan();
@@ -106,6 +121,15 @@ private:
     void enter_global_fault(const std::string& reason, ocpp::v16::Reason stop_reason);
     void apply_zero_power_plan();
     bool safety_trip_needed(const GunStatus& status) const;
+    void record_presence_state(std::int32_t connector, bool plugged_in,
+                               const std::chrono::steady_clock::time_point& now);
+    void ingest_auth_tokens(const std::vector<AuthToken>& tokens,
+                            const std::chrono::steady_clock::time_point& now);
+    int select_connector_for_token(const AuthToken& token) const;
+    std::optional<PendingToken> pop_next_pending_token(std::int32_t connector,
+                                                       const std::chrono::steady_clock::time_point& now);
+    bool try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
+    std::string clamp_id_token(const std::string& raw) const;
 };
 
 } // namespace charger

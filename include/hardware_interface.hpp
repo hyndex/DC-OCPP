@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <chrono>
 #include <optional>
 #include <cstdint>
 #include <array>
@@ -15,6 +16,16 @@
 
 namespace charger {
 
+enum class AuthTokenSource { RFID, Autocharge, RemoteStart };
+
+struct AuthToken {
+    std::string id_token;
+    AuthTokenSource source{AuthTokenSource::RFID};
+    int connector_hint{0}; // 0 => no preference
+    bool prevalidated{false};
+    std::chrono::steady_clock::time_point received_at{std::chrono::steady_clock::now()};
+};
+
 struct GunStatus {
     bool safety_ok{true};
     bool estop{false};
@@ -28,6 +39,7 @@ struct GunStatus {
     bool plugged_in{false};
     bool cp_fault{false};
     bool lock_engaged{true};
+    bool authorization_granted{false};
     char cp_state{'U'};
     uint8_t hlc_stage{0};
     bool hlc_cable_check_ok{false};
@@ -98,6 +110,10 @@ public:
     /// \brief Return latest safety/comm/meter state for the connector.
     virtual GunStatus get_status(std::int32_t connector) = 0;
 
+    /// \brief Notify hardware/PLC that authorization has been granted or revoked for the connector.
+    /// Implementations that do not need this can keep the default no-op.
+    virtual void set_authorization_state(std::int32_t connector, bool authorized) { (void)connector; (void)authorized; }
+
     /// \brief Apply computed power allocation (modules, contactors, setpoints) for the connector.
     /// Default fallbacks map to the older apply_power_allocation + enable/disable calls.
     virtual void apply_power_command(const PowerCommand& cmd) {
@@ -113,6 +129,10 @@ public:
     /// \brief Apply computed power allocation (module count / enable) for the connector.
     /// Implementations may no-op if unsupported.
     virtual void apply_power_allocation(std::int32_t connector, int modules) { (void)connector; (void)modules; }
+
+    /// \brief Drain any auth tokens (RFID/Autocharge/etc.) detected by the hardware since the last poll.
+    /// Default implementation returns an empty list.
+    virtual std::vector<AuthToken> poll_auth_tokens() { return {}; }
 };
 
 } // namespace charger

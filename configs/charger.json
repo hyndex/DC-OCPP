@@ -20,7 +20,12 @@
   },
   "planner": {
     "prechargeVoltageToleranceV": 50,
-    "prechargeTimeoutMs": 2000
+    "prechargeTimeoutMs": 2000,
+    "allowCrossSlotIslands": true
+  },
+  "timeouts": {
+    "authorizationSeconds": 1800,
+    "powerRequestSeconds": 60
   },
   "modulePowerKW": 30,
   "gridLimitKW": 720,

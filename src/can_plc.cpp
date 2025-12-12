@@ -12,6 +12,8 @@
 #include <fstream>
 #include <mutex>
 #include <cstdio>
+#include <sstream>
+#include <iomanip>
 
 #ifdef __linux__
 #include <linux/can.h>
@@ -33,6 +35,7 @@ constexpr uint32_t RELAY_STATUS_BASE = 0x160;
 constexpr uint32_t SAFETY_STATUS_BASE = 0x190;
 constexpr uint32_t ENERGY_METER_BASE = 0x170;
 constexpr uint32_t CONFIG_ACK_BASE = 0x1A0;
+constexpr uint32_t CONFIG_CMD_BASE = 0x380;
 constexpr uint32_t CP_LEVELS_BASE = 0x430;
 constexpr uint32_t CHARGING_SESSION_BASE = 0x410;
 constexpr uint32_t EVAC_CTRL_BASE = 0x250;
@@ -41,12 +44,18 @@ constexpr uint32_t EVDC_TARGETS_BASE = 0x210;
 constexpr uint32_t EVDC_ENERGY_LIMITS_BASE = 0x230;
 constexpr uint32_t EV_STATUS_DISPLAY_BASE = 0x220;
 constexpr uint32_t CHARGE_INFO_BASE = 0x100;
+constexpr uint32_t RFID_EVENT_BASE = 0x180;
+constexpr uint32_t EVCCID_BASE = 0x280;
+constexpr uint32_t EMAID0_BASE = 0x260;
+constexpr uint32_t EMAID1_BASE = 0x270;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
 constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
+constexpr std::chrono::seconds SEGMENT_TTL(5);
+constexpr uint8_t CONFIG_PARAM_AUTH_STATE = 20;
 
 uint16_t le_u16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -58,6 +67,15 @@ int16_t le_i16(const uint8_t* p) {
 
 uint32_t le_u32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
+}
+
+std::string bytes_to_hex(const std::vector<uint8_t>& bytes, size_t len) {
+    std::ostringstream oss;
+    oss << std::uppercase << std::hex;
+    for (size_t i = 0; i < len && i < bytes.size(); ++i) {
+        oss << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[i]);
+    }
+    return oss.str();
 }
 
 bool cp_state_plugged(char state_char) {
@@ -317,6 +335,14 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8)
         f.can_id = ev_status.id; f.can_mask = ev_status.mask; filters.push_back(f);
         const PlcFilterSpec charge_info = make_plc_rx_filter(CHARGE_INFO_BASE, plc_id);
         f.can_id = charge_info.id; f.can_mask = charge_info.mask; filters.push_back(f);
+        const PlcFilterSpec rfid = make_plc_rx_filter(RFID_EVENT_BASE, plc_id);
+        f.can_id = rfid.id; f.can_mask = rfid.mask; filters.push_back(f);
+        const PlcFilterSpec evccid = make_plc_rx_filter(EVCCID_BASE, plc_id);
+        f.can_id = evccid.id; f.can_mask = evccid.mask; filters.push_back(f);
+        const PlcFilterSpec emaid0 = make_plc_rx_filter(EMAID0_BASE, plc_id);
+        f.can_id = emaid0.id; f.can_mask = emaid0.mask; filters.push_back(f);
+        const PlcFilterSpec emaid1 = make_plc_rx_filter(EMAID1_BASE, plc_id);
+        f.can_id = emaid1.id; f.can_mask = emaid1.mask; filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -396,10 +422,22 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto* node = find_node(cmd.connector);
     if (!node) return;
+    if (!node->authorization_granted) {
+        node->module_mask = 0x00;
+        node->status.target_voltage_v = 0.0;
+        node->status.target_current_a = 0.0;
+        send_relay_command(*node, false, true);
+        return;
+    }
     node->status.target_voltage_v = cmd.voltage_set_v;
     node->status.target_current_a = cmd.current_limit_a;
     node->mc_closed_cmd = cmd.mc_closed;
     node->gc_closed_cmd = cmd.gc_closed;
+    if (!cmd.mc_closed) {
+        node->module_mask = 0x00;
+        send_relay_command(*node, false, true);
+        return;
+    }
     uint8_t mask = 0x00;
     // module_mask bit0 -> module0, map to RLY2 (bit1)
     if (cmd.module_mask & 0x01) {
@@ -412,14 +450,19 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
         mask |= 0x01;
     }
     node->module_mask = mask;
-    const bool close = (mask & 0x01) != 0;
-    send_relay_command(*node, close, !close);
+    const bool any_relay_cmd = (mask & 0x07) != 0;
+    send_relay_command(*node, any_relay_cmd, !any_relay_cmd);
 }
 
 void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto* node = find_node(connector);
     if (!node) return;
+    if (!node->authorization_granted) {
+        node->module_mask = 0x00;
+        send_relay_command(*node, false, true);
+        return;
+    }
     uint8_t mask = 0x00;
     if (modules >= 1) {
         mask |= 0x02; // module 1
@@ -664,7 +707,8 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.hlc_cable_check_ok = node->status.hlc_cable_check_ok;
     st.hlc_precharge_active = node->status.hlc_precharge_active;
     st.hlc_charge_complete = node->status.hlc_charge_complete;
-    st.hlc_power_ready = node->status.hlc_power_ready;
+    st.hlc_power_ready = node->authorization_granted && node->status.hlc_power_ready;
+    st.authorization_granted = node->authorization_granted;
     st.pilot_duty_pct = node->status.cp.duty_pct;
     st.present_voltage_v = node->status.present_voltage_v > 0.0 ? std::optional<double>(node->status.present_voltage_v) : std::nullopt;
     st.present_current_a = std::optional<double>(node->status.present_current_a);
@@ -723,6 +767,45 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.module_healthy_mask = healthy_mask;
     st.module_fault_mask = fault_mask;
     return st;
+}
+
+void PlcHardware::set_authorization_state(std::int32_t connector, bool authorized) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (auto* node = find_node(connector)) {
+        node->authorization_granted = authorized;
+        node->status.hlc_power_ready = derive_hlc_power_ready(node->status, node->authorization_granted);
+        send_config_command(*node, CONFIG_PARAM_AUTH_STATE, authorized ? 1U : 0U);
+    }
+}
+
+std::vector<AuthToken> PlcHardware::poll_auth_tokens() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<AuthToken> tokens;
+    tokens.swap(auth_events_);
+    return tokens;
+}
+
+bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t value) {
+#ifdef __linux__
+    uint8_t data[8] = {};
+    data[0] = param_id;
+    data[1] = 0x00; // set operation
+    data[2] = static_cast<uint8_t>(value & 0xFF);
+    data[3] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    data[4] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    data[5] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    data[6] = 0;
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
+    uint32_t can_id = CONFIG_CMD_BASE | (node.cfg.plc_id & 0x0F);
+    return send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
+#else
+    (void)node;
+    (void)param_id;
+    (void)value;
+    return false;
+#endif
 }
 
 bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off) {
@@ -862,6 +945,7 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
     }
     node->crc_fault_logged = false;
     node->status.last_any_rx = rx_time;
+    prune_segment_buffers(*node, rx_time);
 
     if ((can_id & PLC_TX_MASK) == (RELAY_STATUS_BASE & PLC_TX_MASK)) {
         handle_relay_status(*node, data, len);
@@ -884,6 +968,10 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         handle_ev_status_display(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CHARGE_INFO_BASE & PLC_TX_MASK)) {
         handle_charge_info(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (RFID_EVENT_BASE & PLC_TX_MASK)) {
+        handle_rfid_event(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (EVCCID_BASE & PLC_TX_MASK)) {
+        handle_identity_segment(*node, node->evccid, AuthTokenSource::Autocharge, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CONFIG_ACK_BASE & PLC_TX_MASK)) {
         if (len >= 6) {
             const uint8_t param_id = data[0];
@@ -1075,6 +1163,116 @@ void PlcHardware::handle_charge_info(Node& node, const uint8_t* data, size_t len
     update_hlc_state(node, stage, flags);
 }
 
+void PlcHardware::prune_segment_buffers(Node& node, const std::chrono::steady_clock::time_point& now) {
+    auto stale = [&](const SegmentBuffer& buf) {
+        return buf.last_rx.time_since_epoch().count() != 0 && (now - buf.last_rx) > SEGMENT_TTL;
+    };
+    for (auto it = node.rfid_events.begin(); it != node.rfid_events.end();) {
+        if (stale(it->second)) {
+            it = node.rfid_events.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto prune_single = [&](SegmentBuffer& buf) {
+        if (stale(buf)) {
+            buf = SegmentBuffer{};
+        }
+    };
+    prune_single(node.evccid);
+    prune_single(node.emaid0);
+    prune_single(node.emaid1);
+}
+
+void PlcHardware::handle_rfid_event(Node& node, const uint8_t* data, size_t len) {
+    if (len < 3) return;
+    const uint8_t len_nibble = static_cast<uint8_t>(data[0] & 0x0F);
+    const uint8_t event_type = static_cast<uint8_t>((data[0] >> 4) & 0x0F);
+    // Only handle UID events (type=0)
+    if (event_type != 0 || len_nibble == 0) {
+        return;
+    }
+    const uint8_t event_id = data[1];
+    const uint8_t seg_idx = static_cast<uint8_t>(data[2] & 0x0F);
+    const uint8_t seg_cnt_raw = static_cast<uint8_t>((data[2] >> 4) & 0x0F);
+    const uint8_t expected_segments = std::max<uint8_t>(static_cast<uint8_t>(1), seg_cnt_raw);
+    const auto now = std::chrono::steady_clock::now();
+    auto& buf = node.rfid_events[event_id];
+    const bool need_reset = buf.total_len != len_nibble || buf.expected_segments != expected_segments ||
+        seg_idx == 0 || buf.data.size() < len_nibble;
+    if (need_reset) {
+        buf.reset(len_nibble, expected_segments, now);
+    } else {
+        buf.last_rx = now;
+    }
+    if (seg_idx >= buf.expected_segments) {
+        buf.received.resize(seg_idx + 1, false);
+    }
+    const size_t payload_len = len > 3 ? std::min<size_t>(5, len - 3) : 0;
+    const size_t offset = static_cast<size_t>(seg_idx) * 5;
+    if (buf.data.size() < buf.total_len) {
+        buf.data.resize(buf.total_len, 0);
+    }
+    for (size_t i = 0; i < payload_len && (offset + i) < buf.data.size(); ++i) {
+        buf.data[offset + i] = data[3 + i];
+    }
+    if (seg_idx < buf.received.size()) {
+        buf.received[seg_idx] = true;
+    }
+    if (buf.complete()) {
+        AuthToken token;
+        token.id_token = bytes_to_hex(buf.data, buf.total_len);
+        token.source = AuthTokenSource::RFID;
+        token.connector_hint = node.cfg.id;
+        token.received_at = now;
+        auth_events_.push_back(std::move(token));
+        node.rfid_events.erase(event_id);
+    }
+}
+
+void PlcHardware::handle_identity_segment(Node& node, SegmentBuffer& buffer, AuthTokenSource source,
+                                          const uint8_t* data, size_t len) {
+    if (len < 3) return;
+    const uint8_t total_len = data[0];
+    const uint8_t seg_cnt = data[1];
+    const uint8_t seg_idx = data[2];
+    if (total_len == 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const uint8_t expected_segments = std::max<uint8_t>(static_cast<uint8_t>(1), seg_cnt);
+    const bool need_reset = buffer.total_len != total_len || buffer.expected_segments != expected_segments ||
+        seg_idx == 0 || buffer.data.size() < total_len;
+    if (need_reset) {
+        buffer.reset(total_len, expected_segments, now);
+    } else {
+        buffer.last_rx = now;
+    }
+    if (seg_idx >= buffer.expected_segments) {
+        buffer.received.resize(seg_idx + 1, false);
+    }
+    const size_t payload_len = len > 3 ? std::min<size_t>(5, len - 3) : 0;
+    const size_t offset = static_cast<size_t>(seg_idx) * 5;
+    if (buffer.data.size() < buffer.total_len) {
+        buffer.data.resize(buffer.total_len, 0);
+    }
+    for (size_t i = 0; i < payload_len && (offset + i) < buffer.data.size(); ++i) {
+        buffer.data[offset + i] = data[3 + i];
+    }
+    if (seg_idx < buffer.received.size()) {
+        buffer.received[seg_idx] = true;
+    }
+    if (buffer.complete()) {
+        AuthToken token;
+        token.id_token = bytes_to_hex(buffer.data, buffer.total_len);
+        token.source = source;
+        token.connector_hint = node.cfg.id;
+        token.received_at = now;
+        auth_events_.push_back(std::move(token));
+        buffer = SegmentBuffer{};
+    }
+}
+
 bool PlcHardware::derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool relay_status_frame) const {
     const int idx = node.cfg.lock_input_switch;
     if (idx < 1 || idx > 4) return true;
@@ -1083,7 +1281,10 @@ bool PlcHardware::derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool
     return (sw_mask_byte & (1 << bit)) != 0;
 }
 
-bool PlcHardware::derive_hlc_power_ready(const PlcStatus& status) const {
+bool PlcHardware::derive_hlc_power_ready(const PlcStatus& status, bool authorized) const {
+    if (!authorized) {
+        return false;
+    }
     if (status.hlc_charge_complete) {
         return false;
     }
@@ -1098,7 +1299,7 @@ void PlcHardware::update_hlc_state(Node& node, uint8_t stage, uint8_t flags) {
     node.status.hlc_charge_complete = (flags & 0x01) != 0;
     node.status.hlc_precharge_active = (flags & 0x02) != 0;
     node.status.hlc_cable_check_ok = (flags & 0x04) != 0;
-    node.status.hlc_power_ready = derive_hlc_power_ready(node.status);
+    node.status.hlc_power_ready = derive_hlc_power_ready(node.status, node.authorization_granted);
 }
 
 void PlcHardware::update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak,

@@ -5,6 +5,7 @@
 #include "hardware_interface.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #ifdef __linux__
 #include <linux/can.h>
@@ -138,9 +140,31 @@ public:
 
     ocpp::Measurement sample_meter(std::int32_t connector) override;
     GunStatus get_status(std::int32_t connector) override;
+    void set_authorization_state(std::int32_t connector, bool authorized) override;
     void apply_power_command(const PowerCommand& cmd) override;
+    std::vector<AuthToken> poll_auth_tokens() override;
 
 private:
+    struct SegmentBuffer {
+        uint8_t total_len{0};
+        uint8_t expected_segments{0};
+        std::vector<uint8_t> data;
+        std::vector<bool> received;
+        std::chrono::steady_clock::time_point last_rx{};
+        void reset(uint8_t len, uint8_t segments, const std::chrono::steady_clock::time_point& now) {
+            total_len = len;
+            expected_segments = std::max<uint8_t>(static_cast<uint8_t>(1), segments);
+            data.assign(total_len, 0);
+            received.assign(expected_segments, false);
+            last_rx = now;
+        }
+        bool complete() const {
+            return !data.empty() && expected_segments > 0 &&
+                   received.size() >= expected_segments &&
+                   std::all_of(received.begin(), received.begin() + expected_segments, [](bool v) { return v; });
+        }
+    };
+
     struct Node {
         ConnectorConfig cfg;
         PlcStatus status;
@@ -162,6 +186,11 @@ private:
         bool crc_mode_mismatch{false};
         bool crc_mode_mismatch_logged{false};
         bool crc_fault_logged{false};
+        bool authorization_granted{false};
+        std::map<uint8_t, SegmentBuffer> rfid_events;
+        SegmentBuffer evccid;
+        SegmentBuffer emaid0;
+        SegmentBuffer emaid1;
     };
 
     std::map<std::int32_t, Node> nodes_; // keyed by connector id; one node per CAN iface (enforced in config)
@@ -177,6 +206,7 @@ private:
     std::atomic<bool> running_{false};
     std::thread rx_thread_;
     std::mutex mtx_;
+    std::vector<AuthToken> auth_events_;
 
     void rx_loop();
     void handle_frame(uint32_t can_id, const uint8_t* data, size_t len);
@@ -190,6 +220,11 @@ private:
     void handle_evdc_limits(Node& node, const uint8_t* data, size_t len);
     void handle_ev_status_display(Node& node, const uint8_t* data, size_t len);
     void handle_charge_info(Node& node, const uint8_t* data, size_t len);
+    void handle_rfid_event(Node& node, const uint8_t* data, size_t len);
+    void handle_identity_segment(Node& node, SegmentBuffer& buffer, AuthTokenSource source, const uint8_t* data,
+                                 size_t len);
+    void prune_segment_buffers(Node& node, const std::chrono::steady_clock::time_point& now);
+    bool send_config_command(Node& node, uint8_t param_id, uint32_t value);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);
 #endif
@@ -202,7 +237,7 @@ private:
                           uint16_t mv_min = 0, bool has_mv = false);
     void update_hlc_state(Node& node, uint8_t stage, uint8_t flags);
     bool derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool relay_status_frame) const;
-    bool derive_hlc_power_ready(const PlcStatus& status) const;
+    bool derive_hlc_power_ready(const PlcStatus& status, bool authorized) const;
 };
 
 } // namespace charger

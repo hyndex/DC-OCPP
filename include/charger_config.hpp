@@ -80,6 +80,8 @@ struct ChargerConfig {
     bool upload_allow_file_targets{true};
     double precharge_voltage_tolerance_v{50.0};
     int precharge_timeout_ms{2000};
+    int auth_wait_timeout_s{1800};
+    int power_request_timeout_s{60};
 
     fs::path ocpp_config;
     fs::path share_path;

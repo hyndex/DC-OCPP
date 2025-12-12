@@ -15,6 +15,23 @@ namespace charger {
 /// \brief Simple in-process hardware stub so OCPP flows can be exercised without real EVSE hardware.
 class SimulatedHardware : public HardwareInterface {
 public:
+    struct FaultOverride {
+        bool estop{false};
+        bool earth_fault{false};
+        bool isolation_fault{false};
+        bool overtemp_fault{false};
+        bool overcurrent_fault{false};
+        bool comm_fault{false};
+        bool gc_welded{false};
+        bool mc_welded{false};
+        bool paused{false};
+        bool disabled{false};
+        std::optional<uint8_t> healthy_mask;
+        std::optional<uint8_t> fault_mask;
+        std::optional<double> connector_temp_c;
+        std::array<double, 2> module_temp_c{{0.0, 0.0}};
+    };
+
     explicit SimulatedHardware(const ChargerConfig& cfg);
     ~SimulatedHardware() override = default;
 
@@ -40,14 +57,19 @@ public:
                                bool prevalidated) override;
     ocpp::Measurement sample_meter(std::int32_t connector) override;
     GunStatus get_status(std::int32_t connector) override;
+    void set_authorization_state(std::int32_t connector, bool authorized) override;
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
+    std::vector<AuthToken> poll_auth_tokens() override;
 
     // Simulation controls for tests/harnesses
     void set_fault_override(std::int32_t connector, const FaultOverride& fault);
     void clear_fault_override(std::int32_t connector);
     void set_paused(std::int32_t connector, bool paused);
     void set_disabled(std::int32_t connector, bool disabled);
+    void set_plugged_in(std::int32_t connector, bool plugged, bool lock_engaged = true);
+    void set_ev_power_request(std::int32_t connector, bool request);
+    void inject_auth_token(const AuthToken& token);
 
 private:
     struct ConnectorState {
@@ -58,24 +80,11 @@ private:
         std::optional<std::int32_t> reservation_id;
         double target_power_w{0.0};
         double energy_Wh{0.0};
+        bool plugged_in{true};
+        bool request_power{false};
         bool lock_engaged{true};
+        bool authorized{false};
         std::chrono::steady_clock::time_point last_update;
-    };
-    struct FaultOverride {
-        bool estop{false};
-        bool earth_fault{false};
-        bool isolation_fault{false};
-        bool overtemp_fault{false};
-        bool overcurrent_fault{false};
-        bool comm_fault{false};
-        bool gc_welded{false};
-        bool mc_welded{false};
-        bool paused{false};
-        bool disabled{false};
-        std::optional<uint8_t> healthy_mask;
-        std::optional<uint8_t> fault_mask;
-        std::optional<double> connector_temp_c;
-        std::array<double, 2> module_temp_c{{0.0, 0.0}};
     };
 
     std::mutex mutex_;
@@ -86,6 +95,7 @@ private:
     int upload_transfer_timeout_s_{60};
     bool upload_allow_file_targets_{true};
     std::map<std::int32_t, FaultOverride> fault_overrides_;
+    std::vector<AuthToken> auth_events_;
 
     ConnectorState& get_state(std::int32_t connector);
     void update_energy(ConnectorState& state);

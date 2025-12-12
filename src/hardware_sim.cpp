@@ -8,6 +8,7 @@
 #include <fstream>
 #include <cstdio>
 #include <mutex>
+#include <utility>
 #include <curl/curl.h>
 #include <everest/logging.hpp>
 #include <ocpp/v16/ocpp_enums.hpp>
@@ -204,6 +205,9 @@ SimulatedHardware::SimulatedHardware(const ChargerConfig& cfg) {
         state.reserved = false;
         state.target_power_w = conn_cfg.max_power_w;
         state.energy_Wh = 0.0;
+        state.plugged_in = false;
+        state.request_power = false;
+        state.authorized = false;
         state.last_update = now;
         connectors_.emplace(conn_cfg.id, state);
     }
@@ -242,6 +246,8 @@ bool SimulatedHardware::disable(std::int32_t connector) {
     auto& state = get_state(connector);
     state.enabled = false;
     state.charging = false;
+    state.request_power = false;
+    state.authorized = false;
     state.lock_engaged = true;
     return true;
 }
@@ -267,6 +273,7 @@ bool SimulatedHardware::stop_transaction(std::int32_t connector, ocpp::v16::Reas
     auto& state = get_state(connector);
     update_energy(state);
     state.charging = false;
+    state.request_power = false;
     state.reserved = false;
     state.reservation_id.reset();
     return true;
@@ -421,17 +428,19 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.safety_ok = true;
     st.relay_closed = state.enabled && state.charging;
     st.meter_stale = false;
-    const bool ev_connected = state.charging || (fault && fault->paused);
+    const bool ev_connected = state.plugged_in;
+    const bool ev_requests_power = state.request_power || state.charging;
     st.plugged_in = ev_connected;
     st.cp_fault = false;
-    st.cp_state = ev_connected ? 'C' : 'U';
+    st.cp_state = ev_connected ? (ev_requests_power ? 'C' : 'B') : 'U';
     st.pilot_duty_pct = ev_connected ? 100.0 : 0.0;
     st.hlc_stage = st.relay_closed ? 5 : (ev_connected ? 4 : 0);
     st.hlc_cable_check_ok = ev_connected;
     st.hlc_precharge_active = false;
     st.hlc_charge_complete = false;
-    st.hlc_power_ready = st.relay_closed || ev_connected;
+    st.hlc_power_ready = state.authorized && (st.relay_closed || ev_requests_power);
     st.lock_engaged = state.lock_engaged || !state.config.require_lock;
+    st.authorization_granted = state.authorized;
     st.module_healthy_mask = fault && fault->healthy_mask ? *fault->healthy_mask : 0x03;
     st.module_fault_mask = fault && fault->fault_mask ? *fault->fault_mask : 0x00;
     st.gc_welded = fault ? fault->gc_welded : false;
@@ -479,7 +488,7 @@ void SimulatedHardware::apply_power_command(const PowerCommand& cmd) {
     update_energy(state);
     const bool disabled = fault && fault->disabled;
     const bool paused = fault && fault->paused;
-    const bool enable = cmd.module_count > 0 && cmd.gc_closed && !disabled;
+    const bool enable = cmd.module_count > 0 && cmd.gc_closed && !disabled && state.authorized;
     state.enabled = enable;
     state.charging = enable && !paused;
     double target_power_w = cmd.power_kw * 1000.0;
@@ -532,6 +541,51 @@ void SimulatedHardware::set_disabled(std::int32_t connector, bool disabled) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& fo = fault_overrides_[connector];
     fo.disabled = disabled;
+}
+
+void SimulatedHardware::set_authorization_state(std::int32_t connector, bool authorized) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = get_state(connector);
+    state.authorized = authorized;
+    if (!authorized) {
+        state.charging = false;
+        state.request_power = false;
+    }
+}
+
+void SimulatedHardware::set_plugged_in(std::int32_t connector, bool plugged, bool lock_engaged) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = get_state(connector);
+    update_energy(state);
+    state.plugged_in = plugged;
+    state.lock_engaged = lock_engaged || !state.config.require_lock;
+    if (!plugged) {
+        state.request_power = false;
+        state.charging = false;
+        state.enabled = false;
+        state.target_power_w = 0.0;
+        state.authorized = false;
+    }
+}
+
+void SimulatedHardware::set_ev_power_request(std::int32_t connector, bool request) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = get_state(connector);
+    state.request_power = request;
+}
+
+std::vector<AuthToken> SimulatedHardware::poll_auth_tokens() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<AuthToken> tokens;
+    tokens.swap(auth_events_);
+    return tokens;
+}
+
+void SimulatedHardware::inject_auth_token(const AuthToken& token) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    AuthToken t = token;
+    t.received_at = std::chrono::steady_clock::now();
+    auth_events_.push_back(std::move(t));
 }
 
 } // namespace charger

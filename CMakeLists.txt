@@ -277,14 +277,7 @@ add_executable(dc_ocpp
   src/power_manager.cpp
 )
 
-add_custom_target(evse_security_build
-  COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build --target evse_security
-  BYPRODUCTS ${EVSE_SECURITY_LIBRARY}
-  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build
-)
-
 target_include_directories(dc_ocpp PRIVATE include)
-add_dependencies(dc_ocpp evse_security_build)
 
 # Prefer CMake targets for dependencies when available to avoid stale archive paths
 set(EVEREST_LOG_LIBRARY "${CMAKE_BINARY_DIR}/_deps/everest_log-build/lib/libeverest_log.a" CACHE STRING "everest log lib path" FORCE)
@@ -308,17 +301,23 @@ if(NOT TARGET nlohmann_json_schema_validator)
   add_custom_target(nlohmann_json_schema_validator DEPENDS "${_JSON_SCHEMA_ARCHIVE}")
 endif()
 
-set(_EVSE_SECURITY_DEP ${EVSE_SECURITY_LIBRARY})
-set(EVSE_SECURITY_LIBRARY "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security/libevse_security.a" CACHE STRING "evse security lib path" FORCE)
-if(NOT TARGET evse_security)
-  if(EXISTS "${EVSE_SECURITY_LIBRARY}")
+if(NOT DEFINED EVSE_SECURITY_LIBRARY)
+  set(EVSE_SECURITY_LIBRARY "" CACHE STRING "evse security lib path" FORCE)
+endif()
+set(_EVSE_SECURITY_DEP )
+if(TARGET everest::evse_security)
+  set(_EVSE_SECURITY_DEP everest::evse_security)
+elseif(TARGET everest_evse_security)
+  set(_EVSE_SECURITY_DEP everest_evse_security)
+elseif(TARGET evse_security)
+  set(_EVSE_SECURITY_DEP evse_security)
+elseif(EXISTS "${EVSE_SECURITY_LIBRARY}")
+  if(NOT TARGET evse_security)
     add_library(evse_security STATIC IMPORTED)
     set_target_properties(evse_security PROPERTIES IMPORTED_LOCATION "${EVSE_SECURITY_LIBRARY}")
-  else()
-    add_custom_target(evse_security DEPENDS "${EVSE_SECURITY_LIBRARY}")
   endif()
+  set(_EVSE_SECURITY_DEP evse_security)
 endif()
-set(_EVSE_SECURITY_DEP ${EVSE_SECURITY_LIBRARY})
 
 set(_EVEREST_SQLITE_DEP ${EVEREST_SQLITE_LIBRARY})
 if(TARGET everest_sqlite)
@@ -333,7 +332,6 @@ target_link_libraries(dc_ocpp PRIVATE
   CURL::libcurl
   ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
-  ${_EVSE_SECURITY_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
   Boost::log_setup
@@ -363,3 +361,28 @@ add_executable(can_crc_filter_tests
 )
 target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
 target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
+
+add_executable(auth_flow_tests
+  tests/auth_flow_tests.cpp
+  src/ocpp_adapter.cpp
+  src/power_manager.cpp
+  src/charger_config.cpp
+  src/hardware_sim.cpp
+  src/can_plc.cpp
+)
+target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
+target_link_libraries(auth_flow_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_EVEREST_LOG_DEP}
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)

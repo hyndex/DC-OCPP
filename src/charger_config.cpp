@@ -113,6 +113,9 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
         }
         return json.value<T>(key, default_value);
     };
+    const auto timeouts = json.value("timeouts", nlohmann::json::object());
+    cfg.auth_wait_timeout_s = timeouts.value("authorizationSeconds", cfg.auth_wait_timeout_s);
+    cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
     cfg.allow_cross_slot_islands = planner_value("allowCrossSlotIslands", cfg.allow_cross_slot_islands);
     cfg.max_modules_per_gun = planner_value("maxModulesPerGun", cfg.max_modules_per_gun);
     cfg.min_modules_per_active_gun = planner_value("minModulesPerActiveGun", cfg.min_modules_per_active_gun);
@@ -132,6 +135,12 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.default_voltage_v <= 0.0) {
         cfg.default_voltage_v = 800.0;
+    }
+    if (cfg.auth_wait_timeout_s <= 0) {
+        cfg.auth_wait_timeout_s = 1800;
+    }
+    if (cfg.power_request_timeout_s <= 0) {
+        cfg.power_request_timeout_s = 60;
     }
 
     cfg.ocpp_config = make_absolute(base_dir, json.value("ocppConfig", "configs/ocpp16-config.json"));
