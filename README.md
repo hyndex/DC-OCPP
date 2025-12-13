@@ -83,14 +83,18 @@ Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/
 - **RX IDs (host → PLC)**  
   - `RelayControl`: `0x0300 | ((0x4<<4)|plcId)` — safety-critical. Signals: `RLY1_CMD`, `SYS_ENABLE`, `FORCE_ALL_OFF`, `CLEAR_FAULTS`, `CMD_SEQ`, enable mask, mode, pulse_ms, CRC. Timeout ≈300 ms forces relays off and faults.
   - `ConfigCmd`: `0x0300 | ((0x8<<4)|plcId)` — runtime config get/set. Signals: `CFG_PARAM_ID`, `CFG_OP`, `CFG_VALUE`, reserved, CRC.
+  - `GCMC_Command`: `0x0300 | ((0x9<<4)|plcId)` — GC/MC/MN command mask + force-off/clear (maps onto existing relays for current hardware).
 - **TX IDs (PLC → host)**  
   - `RelayStatus`: `0x0100 | ((0x6<<4)|plcId)` — relay states, switches, `SAFETY_OK`, `EARTH_FAULT`, `ESTOP_INPUT`, `FAULT_REASON`, `LAST_CMD_SEQ_APPLIED`, `COMM_FAULT`, CRC.  
   - `SafetySwitchStatus`: `0x0100 | ((0x9<<4)|plcId)` — debounced switch states, estop, safety_ok, earth_fault, mask, CRC.  
   - `EnergyMeterData`: `0x0100 | ((0x7<<4)|plcId)` — multiplexed:  
-    - MUX0: flags `METER_OK/COMM_ERROR/DATA_STALE/OVERRANGE`, `VOLTAGE_0p1V`, signed `CURRENT_0p01A`, signed `ACTIVE_POWER_0p01kW`  
+    - MUX0: flags `METER_OK/COMM_ERROR/DATA_STALE/OVERRANGE/FALLBACK_ACTIVE`, `VOLTAGE_0p1V`, signed `CURRENT_0p01A`, signed `ACTIVE_POWER_0p01kW`  
     - MUX1: same flags, `IMPORT_ENERGY_0p1kWh`, `FREQ_0p01Hz`  
   - `ConfigAck`: `0x0100 | ((0xA<<4)|plcId)` — echoes param/status/value/plcId, CRC.  
+  - `GCMC_Status`: `0x0100 | ((0x5<<4)|plcId)` — GC/MC/MN command/feedback bits, fault reason, comm/safety flags, seqs.
   - Additional TX for CP/V2G telemetry (CP_Voltage_Levels, ChargingSession, RTEVLog/RTTLog, EVDC_* limits/targets) are defined in the DBC; firmware may publish them as available.
+  - Identity frames now include EVCCID/EMAID0/EMAID1 **and EVMAC** (AutoCharge MAC) using segmented 5-byte payloads.
+  - ChargeInfo flags include `auth_granted`, `auth_pending`, and `lock_engaged` in addition to HLC stage flags.
 - **Fault semantics**: Relay timeout/bus-off/CRC fail drive `FAULT_REASON` and `COMM_FAULT`, force relays off. Estop/earth faults clear safety_ok. Remote force-off flagged separately. Missing RX beyond timeout sets comm_fault.
 - **Driver behavior (current code)**:
   - SocketCAN filters per PLC ID, error-frame handling (bus-off/restart), CRC8 verification when present.
