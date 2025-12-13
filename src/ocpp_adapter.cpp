@@ -13,6 +13,7 @@
 #include <limits>
 #include <type_traits>
 #include <cstddef>
+#include <nlohmann/json.hpp>
 
 #include <everest/logging.hpp>
 #include <ocpp/common/evse_security_impl.hpp>
@@ -152,6 +153,7 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
     hardware_(std::move(hardware)),
     planner_cfg_{},
     power_manager_(planner_cfg_) {
+    pending_token_store_ = cfg_.database_dir / "pending_tokens.json";
     for (const auto& c : cfg_.connectors) {
         connector_faulted_[c.id] = false;
         connector_state_[c.id] = ConnectorState::Available;
@@ -162,6 +164,7 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
         plugged_in_state_[c.id] = false;
         plug_event_time_[c.id] = std::chrono::steady_clock::time_point{};
     }
+    load_pending_tokens_from_disk();
     initialize_slots();
 }
 
@@ -188,6 +191,11 @@ const Slot* OcppAdapter::find_slot_for_gun(int gun_id) const {
 
 void OcppAdapter::initialize_slots() {
     if (slots_initialized_) return;
+
+    if (cfg_.allow_cross_slot_islands && hardware_ && !hardware_->supports_cross_slot_islands()) {
+        EVLOG_warning << "Cross-slot islands requested in config but hardware does not support it; disabling.";
+        cfg_.allow_cross_slot_islands = false;
+    }
 
     PlannerConfig pcfg;
     pcfg.module_power_kw = cfg_.module_power_kw > 0.0 ? cfg_.module_power_kw : 30.0;
@@ -508,9 +516,15 @@ void OcppAdapter::start_metering_threads() {
 }
 
 void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
+    const auto meter_period = std::chrono::seconds(std::max(1, interval_s));
+    const auto control_tick = std::chrono::seconds(1);
+    auto next_meter_push = std::chrono::steady_clock::now();
+
     while (running_) {
         try {
-            const auto now = std::chrono::steady_clock::now();
+            const auto loop_start = std::chrono::steady_clock::now();
+            const bool push_meter_now = loop_start >= next_meter_push;
+            const auto now = loop_start;
             const auto auth_wait_timeout = std::chrono::seconds(std::max(1, cfg_.auth_wait_timeout_s));
             const auto power_request_timeout = std::chrono::seconds(std::max(1, cfg_.power_request_timeout_s));
             auto hw_tokens = hardware_->poll_auth_tokens();
@@ -532,12 +546,14 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
 
             ActiveSession session{};
             bool had_session = false;
+            bool pending_changed = false;
             {
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 auto qit = pending_tokens_.find(connector);
                 if (qit != pending_tokens_.end()) {
                     for (auto pit = qit->second.begin(); pit != qit->second.end();) {
                         if (pit->expires_at <= now) {
+                            pending_changed = true;
                             pit = qit->second.erase(pit);
                         } else {
                             ++pit;
@@ -575,6 +591,9 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 if (it != sessions_.end()) {
                     session = it->second;
                     had_session = true;
+                }
+                if (pending_changed) {
+                    persist_pending_tokens_locked();
                 }
             }
             bool fault = false;
@@ -707,7 +726,12 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 fault = true;
             }
 
-            push_meter_values(connector, measurement);
+            if (push_meter_now) {
+                push_meter_values(connector, measurement);
+                while (next_meter_push <= loop_start) {
+                    next_meter_push += meter_period;
+                }
+            }
             {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                 const auto v_dc = extract_dc_value(measurement.power_meter.voltage_V);
@@ -774,7 +798,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
         } catch (const std::exception& e) {
             EVLOG_warning << "Metering loop error on connector " << connector << ": " << e.what();
         }
-        std::this_thread::sleep_for(std::chrono::seconds(interval_s));
+        std::this_thread::sleep_for(control_tick);
     }
 }
 
@@ -815,6 +839,7 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
                                               static_cast<float>(energy_wh), id_tag_end, std::nullopt);
     }
     pending_tokens_.erase(connector);
+    persist_pending_tokens_locked();
     hardware_->set_authorization_state(connector, false);
     charge_point_->on_session_stopped(connector, session_id);
     sessions_.erase(it);
@@ -882,6 +907,7 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
         const int target = select_connector_for_token(pending.token);
         pending_tokens_[target].push_back(std::move(pending));
     }
+    persist_pending_tokens_locked();
 }
 
 int OcppAdapter::select_connector_for_token(const AuthToken& token) const {
@@ -946,6 +972,7 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
     }
     PendingToken selected = queue[best_idx];
     queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(best_idx));
+    persist_pending_tokens_locked();
     return selected;
 }
 
@@ -971,6 +998,7 @@ bool OcppAdapter::try_authorize_with_token(std::int32_t connector, ActiveSession
     } else {
         hardware_->set_authorization_state(connector, false);
     }
+    persist_pending_tokens_locked();
     return accepted;
 }
 
@@ -1749,6 +1777,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, const GunStatus
         } else {
             next = ConnectorState::Charging;
         }
+    } else if (status.plugged_in || (cp_known && status.cp_state != 'U')) {
+        next = ConnectorState::Preparing;
     }
 
     ConnectorState current;
@@ -1787,6 +1817,119 @@ void OcppAdapter::update_connector_state(std::int32_t connector, const GunStatus
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     connector_state_[connector] = next;
+}
+
+std::chrono::steady_clock::time_point OcppAdapter::to_steady(std::chrono::system_clock::time_point t_sys) const {
+    const auto now_sys = std::chrono::system_clock::now();
+    const auto now_steady = std::chrono::steady_clock::now();
+    return now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(t_sys - now_sys);
+}
+
+std::chrono::system_clock::time_point OcppAdapter::to_system(std::chrono::steady_clock::time_point t_steady) const {
+    const auto now_sys = std::chrono::system_clock::now();
+    const auto now_steady = std::chrono::steady_clock::now();
+    return now_sys + std::chrono::duration_cast<std::chrono::system_clock::duration>(t_steady - now_steady);
+}
+
+std::string OcppAdapter::token_source_to_string(AuthTokenSource src) {
+    switch (src) {
+    case AuthTokenSource::RFID: return "rfid";
+    case AuthTokenSource::Autocharge: return "autocharge";
+    case AuthTokenSource::RemoteStart: return "remotestart";
+    default: return "unknown";
+    }
+}
+
+AuthTokenSource OcppAdapter::token_source_from_string(const std::string& s) {
+    if (s == "rfid") return AuthTokenSource::RFID;
+    if (s == "autocharge") return AuthTokenSource::Autocharge;
+    if (s == "remotestart") return AuthTokenSource::RemoteStart;
+    return AuthTokenSource::RFID;
+}
+
+void OcppAdapter::persist_pending_tokens() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    persist_pending_tokens_locked();
+}
+
+void OcppAdapter::persist_pending_tokens_locked() {
+    try {
+        nlohmann::json root;
+        root["tokens"] = nlohmann::json::array();
+        const auto now_sys = std::chrono::system_clock::now();
+        for (const auto& kv : pending_tokens_) {
+            for (const auto& pending : kv.second) {
+                nlohmann::json entry;
+                entry["connector"] = kv.first;
+                entry["idToken"] = pending.token.id_token;
+                entry["source"] = token_source_to_string(pending.token.source);
+                entry["connectorHint"] = pending.token.connector_hint;
+                entry["prevalidated"] = pending.token.prevalidated;
+                entry["receivedAt"] =
+                    std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.token.received_at).time_since_epoch()).count();
+                entry["expiresAt"] =
+                    std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.expires_at).time_since_epoch()).count();
+                root["tokens"].push_back(entry);
+            }
+        }
+        if (!pending_token_store_.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(pending_token_store_.parent_path(), ec);
+            std::ofstream out(pending_token_store_);
+            if (out) {
+                out << root.dump(2);
+            }
+        }
+    } catch (const std::exception& e) {
+        EVLOG_warning << "Failed to persist pending tokens: " << e.what();
+    }
+}
+
+void OcppAdapter::load_pending_tokens_from_disk() {
+    if (pending_token_store_.empty()) return;
+    if (!std::filesystem::exists(pending_token_store_)) return;
+    try {
+        std::ifstream in(pending_token_store_);
+        if (!in) return;
+        nlohmann::json root;
+        in >> root;
+        if (!root.contains("tokens") || !root["tokens"].is_array()) return;
+        const auto now_sys = std::chrono::system_clock::now();
+        const auto now_steady = std::chrono::steady_clock::now();
+        const auto ttl = std::chrono::seconds(std::max(1, cfg_.auth_wait_timeout_s));
+        for (const auto& entry : root["tokens"]) {
+            try {
+                const int connector = entry.value("connector", 0);
+                const std::string id = entry.value("idToken", "");
+                if (connector <= 0 || id.empty()) continue;
+                const std::string src_str = entry.value("source", "rfid");
+                AuthToken token;
+                token.id_token = id;
+                token.source = token_source_from_string(src_str);
+                token.connector_hint = entry.value("connectorHint", 0);
+                token.prevalidated = entry.value("prevalidated", false);
+                const auto recv_epoch = std::chrono::seconds(entry.value("receivedAt", 0LL));
+                const auto exp_epoch = std::chrono::seconds(entry.value("expiresAt", 0LL));
+                const auto recv_sys = std::chrono::system_clock::time_point(recv_epoch);
+                const auto exp_sys = std::chrono::system_clock::time_point(exp_epoch);
+                if (exp_sys <= now_sys) continue;
+                const auto recv_delta = recv_sys - now_sys;
+                const auto exp_delta = exp_sys - now_sys;
+                token.received_at = now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(recv_delta);
+                PendingToken pending;
+                pending.token = token;
+                // If stored expiry is missing, recompute via TTL from receive time
+                pending.expires_at = exp_epoch.count() > 0
+                    ? now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(exp_delta)
+                    : token.received_at + ttl;
+                pending_tokens_[connector].push_back(pending);
+            } catch (...) {
+                continue;
+            }
+        }
+    } catch (const std::exception& e) {
+        EVLOG_warning << "Failed to load pending tokens: " << e.what();
+    }
 }
 
 } // namespace charger

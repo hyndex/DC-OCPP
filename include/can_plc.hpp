@@ -143,6 +143,7 @@ public:
     void set_authorization_state(std::int32_t connector, bool authorized) override;
     void apply_power_command(const PowerCommand& cmd) override;
     std::vector<AuthToken> poll_auth_tokens() override;
+    bool supports_cross_slot_islands() const override;
 
 private:
     struct SegmentBuffer {

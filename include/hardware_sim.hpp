@@ -61,6 +61,7 @@ public:
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
     std::vector<AuthToken> poll_auth_tokens() override;
+    bool supports_cross_slot_islands() const override;
 
     // Simulation controls for tests/harnesses
     void set_fault_override(std::int32_t connector, const FaultOverride& fault);

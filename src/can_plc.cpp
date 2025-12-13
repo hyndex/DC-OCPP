@@ -1302,6 +1302,10 @@ void PlcHardware::update_hlc_state(Node& node, uint8_t stage, uint8_t flags) {
     node.status.hlc_power_ready = derive_hlc_power_ready(node.status, node.authorization_granted);
 }
 
+bool PlcHardware::supports_cross_slot_islands() const {
+    return false;
+}
+
 void PlcHardware::update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak,
                                    uint16_t mv_min, bool has_mv) {
     auto& cp = node.status.cp;

@@ -588,4 +588,8 @@ void SimulatedHardware::inject_auth_token(const AuthToken& token) {
     auth_events_.push_back(std::move(t));
 }
 
+bool SimulatedHardware::supports_cross_slot_islands() const {
+    return false;
+}
+
 } // namespace charger

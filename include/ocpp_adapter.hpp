@@ -13,6 +13,7 @@
 #include <optional>
 #include <thread>
 #include <mutex>
+#include <filesystem>
 
 #include <everest/logging.hpp>
 #include <ocpp/v16/charge_point.hpp>
@@ -65,6 +66,7 @@ private:
     std::vector<Slot> slots_;
 
     std::atomic<bool> running_{false};
+    std::filesystem::path pending_token_store_;
     std::map<std::int32_t, ActiveSession> sessions_;
     std::map<std::int32_t, std::deque<PendingToken>> pending_tokens_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> plug_event_time_;
@@ -130,6 +132,13 @@ private:
                                                        const std::chrono::steady_clock::time_point& now);
     bool try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
     std::string clamp_id_token(const std::string& raw) const;
+    void persist_pending_tokens();
+    void persist_pending_tokens_locked();
+    void load_pending_tokens_from_disk();
+    std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
+    std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
+    static std::string token_source_to_string(AuthTokenSource src);
+    static AuthTokenSource token_source_from_string(const std::string& s);
 };
 
 } // namespace charger

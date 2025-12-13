@@ -386,3 +386,58 @@ target_link_libraries(auth_flow_tests PRIVATE
   Boost::date_time
   Threads::Threads
 )
+
+add_executable(pending_token_persistence_tests
+  tests/pending_token_persistence_tests.cpp
+  src/ocpp_adapter.cpp
+  src/power_manager.cpp
+  src/charger_config.cpp
+  src/hardware_sim.cpp
+  src/can_plc.cpp
+)
+target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
+target_link_libraries(pending_token_persistence_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_EVEREST_LOG_DEP}
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)
+
+add_executable(derate_fault_tests
+  tests/derate_fault_tests.cpp
+  src/ocpp_adapter.cpp
+  src/power_manager.cpp
+  src/charger_config.cpp
+)
+target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
+target_link_libraries(derate_fault_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_EVEREST_LOG_DEP}
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)
+
+add_executable(island_manager_tests
+  tests/island_manager_tests.cpp
+  src/island_manager.cpp
+)
+target_include_directories(island_manager_tests PRIVATE include)
+target_link_libraries(island_manager_tests PRIVATE pthread)

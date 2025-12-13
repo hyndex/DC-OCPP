@@ -133,6 +133,9 @@ public:
     /// \brief Drain any auth tokens (RFID/Autocharge/etc.) detected by the hardware since the last poll.
     /// Default implementation returns an empty list.
     virtual std::vector<AuthToken> poll_auth_tokens() { return {}; }
+
+    /// \brief Capability flag: can this hardware switch modules across slots/islands.
+    virtual bool supports_cross_slot_islands() const { return false; }
 };
 
 } // namespace charger
