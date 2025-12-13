@@ -36,6 +36,7 @@ set(everest_cmake_DIR "${everest-cmake_SOURCE_DIR}" CACHE PATH "everest-cmake di
 
 cmake_policy(SET CMP0167 OLD)
 set(Boost_NO_BOOST_CMAKE ON)
+set(Boost_NO_WARN_NEW_VERSIONS ON)
 
 find_package(date QUIET)
 find_package(nlohmann_json QUIET)
@@ -379,7 +380,6 @@ target_include_directories(dc_ocpp PRIVATE include)
 # Prefer CMake targets for dependencies when available to avoid stale archive paths
 set(_everest_log_archive "${CMAKE_BINARY_DIR}/_deps/everest_log-build/lib/libeverest_log.a")
 set(EVEREST_LOG_LIBRARY "${_everest_log_archive}" CACHE STRING "everest log lib path" FORCE)
-set(_EVEREST_LOG_DEP "${_everest_log_archive}")
 
 set(_JSON_SCHEMA_DEP )
 set(_JSON_SCHEMA_ARCHIVE "${CMAKE_BINARY_DIR}/_deps/nlohmann_json_schema_validator-build/libnlohmann_json_schema_validator.a")
@@ -417,7 +417,6 @@ target_link_libraries(dc_ocpp PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
-  ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
@@ -462,7 +461,6 @@ target_link_libraries(auth_flow_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
-  ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
@@ -487,7 +485,6 @@ target_link_libraries(deterministic_vectors_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
-  ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
@@ -512,7 +509,6 @@ target_link_libraries(pending_token_persistence_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
-  ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
@@ -535,7 +531,6 @@ target_link_libraries(derate_fault_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
-  ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   Boost::log
