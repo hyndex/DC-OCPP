@@ -46,6 +46,9 @@ find_package(Threads REQUIRED)
 find_package(everest-evse_security QUIET)
 find_package(everest-sqlite QUIET)
 find_package(Boost REQUIRED COMPONENTS log log_setup filesystem thread regex date_time)
+if(NOT TARGET evse_security)
+  add_library(evse_security INTERFACE)
+endif()
 if(NOT date_FOUND OR NOT TARGET date::date-tz)
   message(STATUS "date::date-tz not found, fetching header-only date library")
   set(BUILD_TZ_LIB ON CACHE BOOL "" FORCE)
@@ -223,6 +226,9 @@ if(NOT everest-evse_security_FOUND)
   if(EXISTS "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security")
     set(EVSE_SECURITY_LIBRARY "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security" CACHE STRING "evse security lib path" FORCE)
     set(EVSE_SECURITY_INCLUDE_DIR "${everest_evse_security_SOURCE_DIR}/include" CACHE PATH "evse security include dir" FORCE)
+  elseif(EXISTS "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security/libevse_security.a")
+    set(EVSE_SECURITY_LIBRARY "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security/libevse_security.a" CACHE STRING "evse security lib path" FORCE)
+    set(EVSE_SECURITY_INCLUDE_DIR "${everest_evse_security_SOURCE_DIR}/include" CACHE PATH "evse security include dir" FORCE)
   endif()
   if(TARGET evse_security)
     set(EVSE_SECURITY_INCLUDE_DIR "${everest_evse_security_SOURCE_DIR}/include" CACHE PATH "evse security include dir" FORCE)
@@ -330,13 +336,15 @@ elseif(EXISTS "${EVSE_SECURITY_LIBRARY}")
   endif()
   set(_EVSE_SECURITY_DEP evse_security)
 endif()
+if(NOT TARGET evse_security AND EXISTS "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security/libevse_security.a")
+  add_library(evse_security STATIC IMPORTED GLOBAL)
+  set_target_properties(evse_security PROPERTIES IMPORTED_LOCATION "${CMAKE_BINARY_DIR}/_deps/everest_evse_security-build/lib/evse_security/libevse_security.a")
+  target_include_directories(evse_security INTERFACE "${everest_evse_security_SOURCE_DIR}/include")
+  set(_EVSE_SECURITY_DEP evse_security)
+endif()
 if(NOT TARGET evse_security AND EXISTS "${EVSE_SECURITY_LIBRARY}")
   add_library(evse_security STATIC IMPORTED)
   set_target_properties(evse_security PROPERTIES IMPORTED_LOCATION "${EVSE_SECURITY_LIBRARY}")
-  set(_EVSE_SECURITY_DEP evse_security)
-endif()
-if(NOT TARGET evse_security)
-  add_library(evse_security INTERFACE)
   set(_EVSE_SECURITY_DEP evse_security)
 endif()
 
@@ -354,7 +362,6 @@ target_link_libraries(dc_ocpp PRIVATE
   ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
-  ${_EVSE_SECURITY_DEP}
   Boost::log
   Boost::log_setup
   Boost::filesystem
@@ -400,7 +407,6 @@ target_link_libraries(auth_flow_tests PRIVATE
   ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
-  ${_EVSE_SECURITY_DEP}
   Boost::log
   Boost::log_setup
   Boost::filesystem
@@ -426,7 +432,6 @@ target_link_libraries(deterministic_vectors_tests PRIVATE
   ${_EVEREST_LOG_DEP}
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
-  ${_EVSE_SECURITY_DEP}
   Boost::log
   Boost::log_setup
   Boost::filesystem

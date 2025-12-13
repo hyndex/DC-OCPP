@@ -142,8 +142,6 @@ private:
     static std::string token_source_to_string(AuthTokenSource src);
     static AuthTokenSource token_source_from_string(const std::string& s);
     void set_auth_state(std::int32_t connector, AuthorizationState state);
-    ocpp::v16::RemoteStartStopStatus evaluate_remote_start_acceptance(
-        const std::string& id_token, const std::vector<std::int32_t>& referenced_connectors);
 };
 
 } // namespace charger

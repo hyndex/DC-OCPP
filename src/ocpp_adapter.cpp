@@ -423,11 +423,6 @@ void OcppAdapter::register_callbacks() {
             ingest_auth_tokens({token}, token.received_at);
         });
 
-    charge_point_->register_remote_start_acceptance_callback(
-        [this](const std::string& id_token, const std::vector<std::int32_t>& referenced) {
-            (void)id_token;
-            return evaluate_remote_start_acceptance(id_token, referenced);
-        });
 
     charge_point_->register_reserve_now_callback(
         [this](std::int32_t reservation_id, std::int32_t connector, ocpp::DateTime expiryDate,
@@ -1896,52 +1891,6 @@ void OcppAdapter::set_auth_state(std::int32_t connector, AuthorizationState stat
         auth_state_cache_[connector] = state;
     }
     hardware_->set_authorization_state(connector, state);
-}
-
-ocpp::v16::RemoteStartStopStatus
-OcppAdapter::evaluate_remote_start_acceptance(const std::string& /*id_token*/,
-                                              const std::vector<std::int32_t>& referenced_connectors) {
-    std::vector<int> candidates;
-    if (!referenced_connectors.empty()) {
-        for (auto c : referenced_connectors) {
-            if (c > 0) candidates.push_back(static_cast<int>(c));
-        }
-    }
-    if (candidates.empty()) {
-        for (const auto& cfgc : cfg_.connectors) {
-            candidates.push_back(cfgc.id);
-        }
-    }
-    auto is_disabled_or_reserved = [&](int cid) {
-        std::lock_guard<std::mutex> lock(plan_mutex_);
-        const bool disabled = evse_disabled_.count(cid) ? evse_disabled_[cid] : false;
-        const bool reserved = reserved_connectors_.count(cid) ? reserved_connectors_[cid] : false;
-        return disabled || reserved;
-    };
-    auto is_faulted = [&](int cid) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        return connector_faulted_.count(cid) ? connector_faulted_[cid] : false;
-    };
-
-    for (int cid : candidates) {
-        if (is_disabled_or_reserved(cid) || is_faulted(cid)) {
-            continue;
-        }
-        const auto cfg_it = std::find_if(cfg_.connectors.begin(), cfg_.connectors.end(),
-                                         [&](const ConnectorConfig& c) { return c.id == cid; });
-        const bool lock_required = cfg_it != cfg_.connectors.end() ? cfg_it->require_lock : true;
-        const auto st = hardware_->get_status(cid);
-        const bool healthy_modules = (static_cast<uint8_t>(st.module_healthy_mask &
-                                                           static_cast<uint8_t>(~st.module_fault_mask)) != 0);
-        const bool safe = st.safety_ok && !st.estop && !st.earth_fault && !st.comm_fault && !st.cp_fault &&
-            !st.hlc_charge_complete && !st.isolation_fault && !st.overtemp_fault && !st.overcurrent_fault &&
-            !st.meter_stale && !st.gc_welded && !st.mc_welded && healthy_modules;
-        const bool lock_ok = !lock_required || st.lock_engaged;
-        if (st.plugged_in && safe && lock_ok) {
-            return ocpp::v16::RemoteStartStopStatus::Accepted;
-        }
-    }
-    return ocpp::v16::RemoteStartStopStatus::Rejected;
 }
 
 void OcppAdapter::persist_pending_tokens() {
