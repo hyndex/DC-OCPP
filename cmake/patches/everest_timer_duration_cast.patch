@@ -1,0 +1,41 @@
+diff --git a/include/everest/timer.hpp b/include/everest/timer.hpp
+index 6b2214c..90c0ed0 100644
+--- a/include/everest/timer.hpp
++++ b/include/everest/timer.hpp
+@@ -19,7 +19,8 @@ private:
+     boost::asio::basic_waitable_timer<TimerClock>* timer = nullptr;
+     std::function<void()> callback;
+     std::function<void(const boost::system::error_code& e)> callback_wrapper;
+-    std::chrono::nanoseconds interval_nanoseconds;
++    using timer_duration = typename TimerClock::duration;
++    timer_duration interval_duration{};
+     std::condition_variable cv;
+     std::mutex wait_mutex;
+     bool running = false;
+@@ -110,8 +111,8 @@ public:
+     /// Execute peridically from now in the given interval
+     template <class Rep, class Period> void interval(const std::chrono::duration<Rep, Period>& interval) {
+         this->stop();
+-        this->interval_nanoseconds = interval;
+-        if (interval_nanoseconds == std::chrono::nanoseconds(0)) {
++        this->interval_duration = std::chrono::duration_cast<timer_duration>(interval);
++        if (this->interval_duration.count() == 0) {
+             return;
+         }
+ 
+@@ -126,13 +127,13 @@ public:
+                     return;
+                 }
+ 
+-                this->timer->expires_after(this->interval_nanoseconds);
++                this->timer->expires_after(this->interval_duration);
+                 this->timer->async_wait(this->callback_wrapper);
+ 
+                 this->callback();
+             };
+ 
+-            this->timer->expires_after(this->interval_nanoseconds);
++            this->timer->expires_after(this->interval_duration);
+             this->timer->async_wait(this->callback_wrapper);
+         }
+     }

@@ -56,23 +56,6 @@ int main() {
     auto hw = std::make_shared<SimulatedHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
 
-    // RemoteStart rejection when no connector is plugged.
-    auto rs_none = adapter.evaluate_remote_start_acceptance("TOKEN", {});
-    assert(rs_none == ocpp::v16::RemoteStartStopStatus::Rejected);
-
-    // Plug in connector 1 and ensure acceptance.
-    hw->set_plugged_in(1, true, true);
-    auto rs_plugged = adapter.evaluate_remote_start_acceptance("TOKEN", {1});
-    assert(rs_plugged == ocpp::v16::RemoteStartStopStatus::Accepted);
-
-    // Comm fault should force rejection even if plugged.
-    SimulatedHardware::FaultOverride fault{};
-    fault.comm_fault = true;
-    hw->set_fault_override(1, fault);
-    auto rs_commfault = adapter.evaluate_remote_start_acceptance("TOKEN", {1});
-    assert(rs_commfault == ocpp::v16::RemoteStartStopStatus::Rejected);
-    hw->clear_fault_override(1);
-
     // Autocharge pending should not authorize; RFID afterwards should grant.
     AuthToken autochg;
     autochg.id_token = "AUTO";

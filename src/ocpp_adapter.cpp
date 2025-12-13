@@ -899,7 +899,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
 
             if (!fault && had_session && session.transaction_started && status.hlc_charge_complete) {
                 EVLOG_info << "Charge complete reported on connector " << connector << ", ending session";
-                finish_and_mark(ocpp::v16::Reason::EV, std::nullopt);
+                finish_and_mark(ocpp::v16::Reason::EVDisconnected, std::nullopt);
                 hardware_->disable(connector);
                 had_session = false;
                 session = ActiveSession{};

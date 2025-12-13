@@ -1663,7 +1663,6 @@ void PlcHardware::handle_error_frame(const struct can_frame& frame) {
 }
 #endif
 
-} // namespace charger
 bool PlcHardware::send_gcmc_command(Node& node, uint8_t seq, bool close, bool force_all_off) {
 #ifdef __linux__
     uint8_t data[8] = {};
@@ -1696,3 +1695,5 @@ bool PlcHardware::send_gcmc_command(Node& node, uint8_t seq, bool close, bool fo
     return false;
 #endif
 }
+
+} // namespace charger
