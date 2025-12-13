@@ -28,11 +28,18 @@ namespace {
 constexpr uint8_t HLC_MIN_POWER_STAGE = 4;
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
-constexpr std::chrono::milliseconds EVSE_LIMIT_ACK_TIMEOUT_MS(1500);
 constexpr std::chrono::seconds LOCAL_AUTH_CACHE_TTL(24 * 3600);
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
+
+std::chrono::milliseconds evse_limit_ack_timeout(const ChargerConfig& cfg) {
+    return std::chrono::milliseconds(std::max(1, cfg.evse_limit_ack_timeout_ms));
+}
+
+std::chrono::milliseconds telemetry_timeout(const ChargerConfig& cfg) {
+    return std::chrono::milliseconds(std::max(1, cfg.telemetry_timeout_ms));
+}
 
 const Slot* find_slot(const std::vector<Slot>& slots, int id) {
     auto it = std::find_if(slots.begin(), slots.end(), [&](const Slot& s) { return s.id == id; });
@@ -197,6 +204,22 @@ void OcppAdapter::prepare_security_files() const {
     touch(cfg_.security.v2g_ca_bundle);
 }
 
+void OcppAdapter::seed_default_evse_limits() {
+    for (const auto& c : cfg_.connectors) {
+        EvseLimits limits{};
+        if (c.max_voltage_v > 0.0) {
+            limits.max_voltage_v = c.max_voltage_v;
+        }
+        if (c.max_current_a > 0.0) {
+            limits.max_current_a = c.max_current_a;
+        }
+        if (c.max_power_w > 0.0) {
+            limits.max_power_kw = c.max_power_w / 1000.0;
+        }
+        hardware_->set_evse_limits(c.id, limits);
+    }
+}
+
 const Slot* OcppAdapter::find_slot_for_gun(int gun_id) const {
     return charger::find_slot_for_gun(slots_, gun_id);
 }
@@ -312,6 +335,7 @@ bool OcppAdapter::start() {
     }
 
     refresh_charging_profile_limits();
+    seed_default_evse_limits();
 
     running_ = true;
     start_metering_threads();
@@ -323,7 +347,7 @@ bool OcppAdapter::start() {
             } catch (const std::exception& e) {
                 EVLOG_warning << "Planner thread error: " << e.what();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     });
     return true;
@@ -544,7 +568,7 @@ void OcppAdapter::start_metering_threads() {
 
 void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
     const auto meter_period = std::chrono::seconds(std::max(1, interval_s));
-    const auto control_tick = std::chrono::milliseconds(200);
+    const auto control_tick = std::chrono::milliseconds(50);
     auto next_meter_push = std::chrono::steady_clock::now();
 
     while (running_) {
@@ -580,7 +604,59 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 }
                 post_stop_plugged = post_stop_plugged_[connector];
             }
+
+            auto finish_and_mark = [&](ocpp::v16::Reason reason,
+                                       std::optional<ocpp::CiString<20>> id_tag_end = std::nullopt) {
+                finish_transaction(connector, reason, id_tag_end);
+                if (status.plugged_in) {
+                    mark_post_stop(true);
+                }
+            };
+
+            ActiveSession session{};
+            bool had_session = false;
+            bool pending_changed = false;
+            bool fault = false;
+
             auto measurement = hardware_->sample_meter(connector);
+            // Check measurement vs reported telemetry for consistency.
+            auto dc_voltage = extract_dc_value(measurement.power_meter.voltage_V);
+            auto dc_current = extract_dc_value(measurement.power_meter.current_A);
+            auto dc_power = extract_dc_value(measurement.power_meter.power_W);
+            const auto has_measured = dc_voltage || dc_current || dc_power;
+            const bool has_status = status.present_voltage_v || status.present_current_a || status.present_power_w;
+            if (has_measured && has_status) {
+                double v_meas = dc_voltage.value_or(status.present_voltage_v.value_or(0.0));
+                double i_meas = dc_current.value_or(status.present_current_a.value_or(0.0));
+                double p_meas = dc_power.value_or(status.present_power_w.value_or(0.0));
+                double v_stat = status.present_voltage_v.value_or(v_meas);
+                double i_stat = status.present_current_a.value_or(i_meas);
+                double p_stat = status.present_power_w.value_or(p_meas);
+                auto within = [](double a, double b, double rel, double abs_tol) {
+                    const double diff = std::fabs(a - b);
+                    return diff <= abs_tol || diff <= std::max(std::fabs(a), std::fabs(b)) * rel;
+                };
+                const bool v_ok = within(v_meas, v_stat, 0.05, 20.0);
+                const bool i_ok = within(i_meas, i_stat, 0.10, 2.0);
+                const bool p_ok = within(p_meas, p_stat, 0.10, 500.0);
+                if (!(v_ok && i_ok && p_ok)) {
+                    telemetry_mismatch_count_[connector]++;
+                } else {
+                    telemetry_mismatch_count_[connector] = 0;
+                }
+                if (telemetry_mismatch_count_[connector] >= 5) {
+                    EVLOG_error << "Telemetry mismatch on connector " << connector
+                                << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
+                                << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")";
+                    finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                    fault = true;
+                    telemetry_mismatch_count_[connector] = 0;
+                }
+            } else {
+                telemetry_mismatch_count_[connector] = 0;
+            }
             bool constrained = false;
             bool paused = false;
             bool disabled = false;
@@ -601,17 +677,6 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 }
             }
 
-            auto finish_and_mark = [&](ocpp::v16::Reason reason,
-                                       std::optional<ocpp::CiString<20>> id_tag_end = std::nullopt) {
-                finish_transaction(connector, reason, id_tag_end);
-                if (status.plugged_in) {
-                    mark_post_stop(true);
-                }
-            };
-
-            ActiveSession session{};
-            bool had_session = false;
-            bool pending_changed = false;
             {
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 auto qit = pending_tokens_.find(connector);
@@ -702,7 +767,6 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                     persist_pending_tokens_locked();
                 }
             }
-            bool fault = false;
             const auto cfg_it = std::find_if(cfg_.connectors.begin(), cfg_.connectors.end(),
                                              [&](const ConnectorConfig& c) { return c.id == connector; });
             const bool lock_required = cfg_it != cfg_.connectors.end() ? cfg_it->require_lock : true;
@@ -886,13 +950,29 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             if (!fault && had_session && session.transaction_started &&
                 status.last_evse_limit_ack.time_since_epoch().count() != 0) {
                 const auto age = now - status.last_evse_limit_ack;
-                if (age > EVSE_LIMIT_ACK_TIMEOUT_MS) {
+                const auto ack_timeout = evse_limit_ack_timeout(cfg_);
+                if (age > ack_timeout) {
                     EVLOG_error << "EVSE limit ACK stale on connector " << connector << " age=" << age.count()
                                 << "ms ack_count=" << status.evse_limit_ack_count
                                 << " -- stopping session for safety";
                     finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
                     hardware_->disable(connector);
                     had_session = false;
+                    fault = true;
+                }
+            }
+
+            if (!fault && cfg_.telemetry_timeout_ms > 0 &&
+                status.last_telemetry.time_since_epoch().count() != 0) {
+                const auto age = now - status.last_telemetry;
+                if (age > telemetry_timeout(cfg_)) {
+                    EVLOG_error << "Telemetry stale on connector " << connector << " age=" << age.count()
+                                << "ms -- forcing stop for safety";
+                    if (had_session) {
+                        finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
+                        had_session = false;
+                    }
+                    hardware_->disable(connector);
                     fault = true;
                 }
             }
@@ -1471,7 +1551,9 @@ void OcppAdapter::apply_power_plan() {
         // EVSE limit watchdog: if we have offered limits recently but PLC hasn't ACKed, constrain power.
         if (st.last_evse_limit_ack.time_since_epoch().count() > 0) {
             const auto age = now - st.last_evse_limit_ack;
-            if (age > std::chrono::milliseconds(1000) && ready_for_power) {
+            const auto warn_threshold = std::max(std::chrono::milliseconds(500),
+                                                 evse_limit_ack_timeout(cfg_) / 2);
+            if (age > warn_threshold && ready_for_power) {
                 power_constrained_[c.id] = true;
                 EVLOG_warning << "Connector " << c.id << " EVSE limit ACK stale (" << age.count()
                               << "ms); constraining power";

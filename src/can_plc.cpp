@@ -794,6 +794,7 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.evse_max_power_kw = choose_limit(st.evse_max_power_kw, node->last_limit_power_kw, cfg_power_kw);
     st.evse_limit_ack_count = node->status.limit_ack_count;
     st.last_evse_limit_ack = node->status.last_limit_ack;
+    st.last_telemetry = node->status.last_any_rx;
     uint8_t healthy_mask = node->crc_mode_mismatch ? 0x00 : 0x03; // two modules default healthy
     uint8_t fault_mask = node->crc_mode_mismatch ? 0xFF : 0x00;
     if (!node->crc_mode_mismatch) {

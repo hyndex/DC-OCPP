@@ -62,6 +62,7 @@ struct GunStatus {
     std::optional<double> evse_max_voltage_v;
     std::optional<double> evse_max_current_a;
     std::optional<double> evse_max_power_kw;
+    std::chrono::steady_clock::time_point last_telemetry{};
     uint8_t module_healthy_mask{0x00}; // bit0=module0, bit1=module1, etc. Slot-local ordering.
     uint8_t module_fault_mask{0x00};   // bitmask mirroring module_healthy_mask for detected faults/welds
     bool gc_welded{false};

@@ -469,6 +469,7 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.evse_max_current_a = apply_limit(state.evse_limits.max_current_a, state.config.max_current_a);
     st.module_temp_c = fault ? fault->module_temp_c : std::array<double, 2>{{40.0, 40.0}};
     st.connector_temp_c = fault && fault->connector_temp_c ? *fault->connector_temp_c : 40.0;
+    st.last_telemetry = std::chrono::steady_clock::now();
     st.estop = fault ? fault->estop : false;
     st.earth_fault = fault ? fault->earth_fault : false;
     st.isolation_fault = fault ? fault->isolation_fault : false;

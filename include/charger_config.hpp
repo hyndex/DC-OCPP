@@ -82,6 +82,9 @@ struct ChargerConfig {
     int precharge_timeout_ms{2000};
     int auth_wait_timeout_s{1800};
     int power_request_timeout_s{60};
+    int evse_limit_ack_timeout_ms{1500};
+    int telemetry_timeout_ms{2000};
+    std::string ocpp_config_inline; // Preferred inline OCPP base config JSON (single source)
 
     fs::path ocpp_config;
     fs::path share_path;

@@ -58,13 +58,12 @@ Run
 ./build/dc_ocpp --config configs/charger.json
 ```
 
-The default config targets a SteVe instance on `ws://127.0.0.1:8180/steve/websocket/CentralSystemService/`. Update `configs/charger.json` to point at your CSMS, set the ChargePointId, and size the connector list to match your number of guns. Connector IDs must start at 1.
+The default config targets a SteVe instance on `ws://127.0.0.1:8180/steve/websocket/CentralSystemService/`. Update `configs/charger.json` to point at your CSMS, set the ChargePointId, and size the connector list to match your number of guns. OCPP parameters live under the same file’s `ocpp` block; set `ocppConfig` only if you need to override with a separate base config for legacy setups. Connector IDs must start at 1.
 For PLC/CAN hardware, set `"usePLC": true`, `"canInterface": "can0"` (or your iface), and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs, so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.
 
 Project layout
 --------------
-- `configs/charger.json` – charger/topology settings (connectors, URIs, paths)
-- `configs/ocpp16-config.json` – libocpp base config; dynamically patched with ChargePointId, URI, NumberOfConnectors
+- `configs/charger.json` – single source of charger + OCPP settings (connectors, URIs, paths, `ocpp` block). You can still point `ocppConfig` to a custom external file if you maintain one privately.
 - `src/` and `include/` – adapter, config loader, simulated hardware, and the main entrypoint
 - `data/` – placeholder certificate/key directories and user config file location
 - `logs/` – message log output

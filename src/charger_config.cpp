@@ -73,6 +73,20 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
     }
     return slot;
 }
+
+nlohmann::json load_ocpp_base_config(const ChargerConfig& cfg) {
+    if (!cfg.ocpp_config_inline.empty()) {
+        return nlohmann::json::parse(cfg.ocpp_config_inline);
+    }
+    if (!cfg.ocpp_config.empty()) {
+        if (!fs::exists(cfg.ocpp_config)) {
+            throw std::runtime_error("OCPP base config missing: " + cfg.ocpp_config.string());
+        }
+        std::ifstream file(cfg.ocpp_config);
+        return nlohmann::json::parse(file);
+    }
+    throw std::runtime_error("OCPP base config missing: provide an inline 'ocpp' block in charger.json");
+}
 } // namespace
 
 ChargerConfig load_charger_config(const fs::path& config_path) {
@@ -116,6 +130,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     const auto timeouts = json.value("timeouts", nlohmann::json::object());
     cfg.auth_wait_timeout_s = timeouts.value("authorizationSeconds", cfg.auth_wait_timeout_s);
     cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
+    cfg.evse_limit_ack_timeout_ms = timeouts.value("evseLimitAckMs", cfg.evse_limit_ack_timeout_ms);
+    cfg.telemetry_timeout_ms = timeouts.value("telemetryTimeoutMs", cfg.telemetry_timeout_ms);
     cfg.allow_cross_slot_islands = planner_value("allowCrossSlotIslands", cfg.allow_cross_slot_islands);
     cfg.max_modules_per_gun = planner_value("maxModulesPerGun", cfg.max_modules_per_gun);
     cfg.min_modules_per_active_gun = planner_value("minModulesPerActiveGun", cfg.min_modules_per_active_gun);
@@ -142,8 +158,21 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.power_request_timeout_s <= 0) {
         cfg.power_request_timeout_s = 60;
     }
+    if (cfg.evse_limit_ack_timeout_ms <= 0) {
+        cfg.evse_limit_ack_timeout_ms = 1500;
+    }
+    if (cfg.telemetry_timeout_ms <= 0) {
+        cfg.telemetry_timeout_ms = 2000;
+    }
 
-    cfg.ocpp_config = make_absolute(base_dir, json.value("ocppConfig", "configs/ocpp16-config.json"));
+    if (json.contains("ocpp") && json["ocpp"].is_object()) {
+        cfg.ocpp_config_inline = json["ocpp"].dump();
+    }
+
+    const auto ocpp_config_path = json.value("ocppConfig", "");
+    if (!ocpp_config_path.empty()) {
+        cfg.ocpp_config = make_absolute(base_dir, ocpp_config_path);
+    }
     cfg.share_path = make_absolute(base_dir, json.value("sharePath", "libocpp/config/v16"));
     cfg.user_config = make_absolute(base_dir, json.value("userConfig", "data/user_config.json"));
     cfg.database_dir = make_absolute(base_dir, json.value("databaseDir", "data/db"));
@@ -258,11 +287,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
 }
 
 std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
-    if (!fs::exists(cfg.ocpp_config)) {
-        throw std::runtime_error("OCPP base config missing: " + cfg.ocpp_config.string());
-    }
-    std::ifstream file(cfg.ocpp_config);
-    auto json = nlohmann::json::parse(file);
+    auto json = load_ocpp_base_config(cfg);
 
     json["Internal"]["ChargePointId"] = cfg.charge_point_id;
     json["Internal"]["ChargeBoxSerialNumber"] = cfg.charge_point_id;

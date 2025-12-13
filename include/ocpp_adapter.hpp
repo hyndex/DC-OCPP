@@ -119,12 +119,14 @@ private:
     std::string global_fault_reason_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
     std::map<int, AuthorizationState> auth_state_cache_;
+    std::map<int, int> telemetry_mismatch_count_;
 
     void register_callbacks();
     void start_metering_threads();
     void metering_loop(std::int32_t connector, int interval_s);
     std::string make_session_id() const;
     void prepare_security_files() const;
+    void seed_default_evse_limits();
     const Slot* find_slot_for_gun(int gun_id) const;
     void update_connector_state(std::int32_t connector, GunStatus status, bool has_session, bool tx_started,
                                 bool authorized, bool fault_active, bool disabled, bool post_stop_plugged,

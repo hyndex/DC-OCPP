@@ -22,8 +22,8 @@ Provisioning steps
 
 Enabling TLS
 ------------
-- Set the OCPP endpoint in `configs/charger.json` to `wss://...` and update `ocpp16-config.json`
-  `SecurityProfile` as required by your CSMS.
+- Set the OCPP endpoint in `configs/charger.json` to `wss://...` and update `ocpp.Security.SecurityProfile`
+  (or the external `ocppConfig` file if you are using one) as required by your CSMS.
 - The adapter touches all certificate/key files on boot so libocpp can open them; missing files are
   created empty but must be populated with real material before connecting to production.
 
