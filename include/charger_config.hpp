@@ -60,6 +60,8 @@ struct ChargerConfig {
     std::string central_system_uri;
     std::string can_interface; // Default CAN interface for PLC nodes (e.g. "can0")
     bool use_plc{false};
+    bool simulation_mode{false}; // If true, suppress comm faults and run purely simulated hardware
+    bool plc_backend_available{false}; // Set at runtime when PLC backend actually initialized
     bool plc_use_crc8{false};
     bool require_https_uploads{true};
     double module_power_kw{30.0};

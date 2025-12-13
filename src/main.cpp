@@ -41,9 +41,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::shared_ptr<charger::HardwareInterface> hardware;
+    bool plc_available = false;
     try {
         if (cfg.use_plc) {
             hardware = std::make_shared<charger::PlcHardware>(cfg);
+            plc_available = true;
         }
     } catch (const std::exception& e) {
         std::cerr << "PLC hardware init failed (" << e.what() << "), falling back to simulation." << std::endl;
@@ -51,6 +53,7 @@ int main(int argc, char* argv[]) {
     if (!hardware) {
         hardware = std::make_shared<charger::SimulatedHardware>(cfg);
     }
+    cfg.plc_backend_available = plc_available;
     charger::OcppAdapter adapter(cfg, hardware);
 
     if (!adapter.start()) {

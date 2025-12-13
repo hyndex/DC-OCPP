@@ -106,6 +106,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.firmware_version = cp.value("firmwareVersion", "0.0.0");
     cfg.central_system_uri = cp.value("centralSystemURI", "");
     cfg.use_plc = cp.value("usePLC", false);
+    cfg.simulation_mode = cp.value("simulationMode", false);
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", false);

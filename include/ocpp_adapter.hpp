@@ -122,6 +122,8 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
     std::map<int, AuthorizationState> auth_state_cache_;
     std::map<int, int> telemetry_mismatch_count_;
+    bool simulation_mode_{false};
+    bool force_comm_fault_{false};
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
     std::map<int, int> connector_meter_intervals_;
 

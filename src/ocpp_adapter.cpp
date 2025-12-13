@@ -166,6 +166,12 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
     hardware_(std::move(hardware)),
     planner_cfg_{},
     power_manager_(planner_cfg_) {
+    simulation_mode_ = cfg_.simulation_mode;
+    force_comm_fault_ = cfg_.use_plc && !cfg_.simulation_mode && !cfg_.plc_backend_available;
+    if (force_comm_fault_) {
+        EVLOG_warning << "PLC communication not established; marking connectors as Fault. "
+                      << "Enable chargePoint.simulationMode=true to suppress comm faults for simulation.";
+    }
     pending_token_store_ = cfg_.database_dir / "pending_tokens.json";
     local_auth_cache_store_ = cfg_.database_dir / "local_auth_cache.json";
     for (const auto& c : cfg_.connectors) {
@@ -709,6 +715,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 ingest_auth_tokens(hw_tokens, now);
             }
             auto status = hardware_->get_status(connector);
+            bool comm_fault = status.comm_fault || force_comm_fault_;
+            if (simulation_mode_) {
+                comm_fault = false;
+            }
+            status.comm_fault = comm_fault;
             record_presence_state(connector, status.plugged_in, now);
             auto mark_post_stop = [&](bool active) {
                 std::lock_guard<std::mutex> lock(state_mutex_);
