@@ -73,6 +73,7 @@ struct PlcCpStatus {
     double duty_pct{0.0};
     uint16_t mv_peak{0};
     uint16_t mv_min{0};
+    uint16_t mv_robust{0};
     bool valid{false};
     std::chrono::steady_clock::time_point last_rx{};
 };
@@ -107,7 +108,17 @@ struct PlcStatus {
     std::chrono::steady_clock::time_point last_relay_status{};
     std::chrono::steady_clock::time_point last_safety_status{};
     std::chrono::steady_clock::time_point last_any_rx{};
-  };
+    uint32_t session_epoch{0};
+    bool auth_pending_flag{false};
+    uint32_t rx_count{0};
+    uint32_t tx_count{0};
+    uint32_t uptime_s{0};
+    uint8_t fw_major{0};
+    uint8_t fw_minor{0};
+    uint8_t fw_patch{0};
+    uint8_t feature_flags{0};
+    uint8_t error_code{0};
+};
 
 /// \brief PLC/CAN-backed implementation of HardwareInterface using the DBC in Ref/Basic/docs/CAN_DBC.dbc.
 class PlcHardware : public HardwareInterface {
@@ -191,7 +202,9 @@ private:
         bool crc_mode_mismatch{false};
         bool crc_mode_mismatch_logged{false};
         bool crc_fault_logged{false};
+        bool bus_off_logged{false};
         bool authorization_granted{false};
+        uint8_t gcmc_cmd_seq{0};
         double last_limit_voltage_v{0.0};
         double last_limit_current_a{0.0};
         double last_limit_power_kw{0.0};
@@ -231,6 +244,15 @@ private:
     void handle_evdc_limits(Node& node, const uint8_t* data, size_t len);
     void handle_ev_status_display(Node& node, const uint8_t* data, size_t len);
     void handle_charge_info(Node& node, const uint8_t* data, size_t len);
+    void handle_gcmc_status(Node& node, const uint8_t* data, size_t len);
+    void handle_hw_status(Node& node, const uint8_t* data, size_t len);
+    void handle_debug_info(Node& node, const uint8_t* data, size_t len);
+    void handle_boot_config(Node& node, const uint8_t* data, size_t len);
+    void handle_rtev_log(Node& node, const uint8_t* data, size_t len);
+    void handle_rtt_log(Node& node, const uint8_t* data, size_t len);
+    void handle_software_info(Node& node, const uint8_t* data, size_t len);
+    void handle_error_codes(Node& node, const uint8_t* data, size_t len);
+    void handle_hw_config(Node& node, const uint8_t* data, size_t len);
     void handle_rfid_event(Node& node, const uint8_t* data, size_t len);
     void handle_identity_segment(Node& node, SegmentBuffer& buffer, AuthTokenSource source, const uint8_t* data,
                                  size_t len);
@@ -242,11 +264,13 @@ private:
 #endif
 
     bool send_relay_command(Node& node, bool close, bool force_all_off = false);
+    bool send_gcmc_command(Node& node, uint8_t seq, bool close, bool force_all_off);
     bool send_frame(uint32_t can_id, const uint8_t* data, size_t len);
     Node* find_node(std::int32_t connector);
     Node* find_node_by_plc(int plc_id);
     void update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak = 0,
-                          uint16_t mv_min = 0, bool has_mv = false);
+                          uint16_t mv_min = 0, bool has_mv = false, uint16_t mv_robust = 0,
+                          bool has_robust = false);
     void update_hlc_state(Node& node, uint8_t stage, uint8_t flags);
     bool derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool relay_status_frame) const;
     bool derive_hlc_power_ready(const PlcStatus& status, bool authorized) const;

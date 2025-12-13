@@ -51,6 +51,17 @@ constexpr uint32_t EMAID0_BASE = 0x260;
 constexpr uint32_t EMAID1_BASE = 0x270;
 constexpr uint32_t EVMAC_BASE = 0x240;
 constexpr uint32_t EVSE_DC_MAX_LIMITS_CMD_BASE = 0x300;
+constexpr uint32_t GCMC_STATUS_BASE = 0x150;
+constexpr uint32_t HW_STATUS_BASE = 0x130;
+constexpr uint32_t DEBUG_INFO_BASE = 0x1B0;
+constexpr uint32_t BOOT_CONFIG_BASE = 0x90000;
+constexpr uint32_t GCMC_CMD_BASE = 0x390;
+constexpr uint32_t RELAY_CMD_BASE = 0x340;
+constexpr uint32_t RTEVLOG_BASE = 0x420;
+constexpr uint32_t RTTLOG_BASE = 0x400;
+constexpr uint32_t SOFTWARE_INFO_BASE = 0x110;
+constexpr uint32_t ERROR_CODES_BASE = 0x120;
+constexpr uint32_t HW_CONFIG_BASE = 0x306;
 constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = 90;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
@@ -270,6 +281,17 @@ uint16_t clamp_to_deciv(double value) {
     if (scaled <= 0.0) return 0;
     return static_cast<uint16_t>(scaled);
 }
+
+bool crc_expected(uint32_t can_id) {
+    const uint32_t masked = can_id & PLC_TX_MASK;
+    return masked == (RELAY_STATUS_BASE & PLC_TX_MASK) ||
+           masked == (SAFETY_STATUS_BASE & PLC_TX_MASK) ||
+           masked == (CONFIG_ACK_BASE & PLC_TX_MASK) ||
+           masked == (GCMC_STATUS_BASE & PLC_TX_MASK) ||
+           masked == (RELAY_CMD_BASE & PLC_TX_MASK) ||
+           masked == (CONFIG_CMD_BASE & PLC_TX_MASK) ||
+           masked == (GCMC_CMD_BASE & PLC_TX_MASK);
+}
 } // namespace
 
 PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8),
@@ -358,6 +380,24 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8)
         f.can_id = emaid1.id; f.can_mask = emaid1.mask; filters.push_back(f);
         const PlcFilterSpec evmac = make_plc_rx_filter(EVMAC_BASE, plc_id);
         f.can_id = evmac.id; f.can_mask = evmac.mask; filters.push_back(f);
+        const PlcFilterSpec gcmc_status = make_plc_rx_filter(GCMC_STATUS_BASE, plc_id);
+        f.can_id = gcmc_status.id; f.can_mask = gcmc_status.mask; filters.push_back(f);
+        const PlcFilterSpec hw_status = make_plc_rx_filter(HW_STATUS_BASE, plc_id);
+        f.can_id = hw_status.id; f.can_mask = hw_status.mask; filters.push_back(f);
+        const PlcFilterSpec debug_info = make_plc_rx_filter(DEBUG_INFO_BASE, plc_id);
+        f.can_id = debug_info.id; f.can_mask = debug_info.mask; filters.push_back(f);
+        const PlcFilterSpec boot_cfg = make_plc_rx_filter(BOOT_CONFIG_BASE, plc_id);
+        f.can_id = boot_cfg.id; f.can_mask = boot_cfg.mask; filters.push_back(f);
+        const PlcFilterSpec rtev = make_plc_rx_filter(RTEVLOG_BASE, plc_id);
+        f.can_id = rtev.id; f.can_mask = rtev.mask; filters.push_back(f);
+        const PlcFilterSpec rtt = make_plc_rx_filter(RTTLOG_BASE, plc_id);
+        f.can_id = rtt.id; f.can_mask = rtt.mask; filters.push_back(f);
+        const PlcFilterSpec sw_info = make_plc_rx_filter(SOFTWARE_INFO_BASE, plc_id);
+        f.can_id = sw_info.id; f.can_mask = sw_info.mask; filters.push_back(f);
+        const PlcFilterSpec err = make_plc_rx_filter(ERROR_CODES_BASE, plc_id);
+        f.can_id = err.id; f.can_mask = err.mask; filters.push_back(f);
+        const PlcFilterSpec hw_cfg = make_plc_rx_filter(HW_CONFIG_BASE, plc_id);
+        f.can_id = hw_cfg.id; f.can_mask = hw_cfg.mask; filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -714,7 +754,7 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.earth_fault = node->status.safety.earth_fault;
     st.comm_fault = node->status.safety.comm_fault;
     st.relay_closed = node->status.relay_closed;
-    st.meter_stale = node->status.meter.stale && !node->meter_fallback_active;
+    st.meter_stale = node->meter_fallback_active || (node->status.meter.stale && !node->meter_fallback_active);
     st.plugged_in = plugged;
     st.cp_fault = cp_stale;
     st.cp_state = node->status.cp.state_char;
@@ -860,9 +900,6 @@ void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
     data[4] = static_cast<uint8_t>(p_decik & 0xFF);
     data[5] = static_cast<uint8_t>((p_decik >> 8) & 0xFF);
     data[6] = 0;
-    if (use_crc8_) {
-        data[7] = plc_crc8(data, 7);
-    }
     const uint32_t can_id = EVSE_DC_MAX_LIMITS_CMD_BASE | static_cast<uint32_t>(node.cfg.plc_id & 0x0F);
     const bool ok = send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
     if (ok) {
@@ -895,7 +932,8 @@ bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off)
     if (force_all_off) data[0] |= (1 << 4);
     const bool clear_faults = node.status.last_fault_reason != 0;
     if (clear_faults) data[0] |= (1 << 5); // CLEAR_FAULTS
-    data[1] = node.cmd_seq++;
+    const uint8_t seq = node.cmd_seq++;
+    data[1] = seq;
     // Enable mask for relays present
     data[2] = node.module_mask & 0x07; // RLY1/2/3_ENABLE
     // CMD_MODE (steady)
@@ -909,12 +947,16 @@ bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off)
     uint32_t can_id = 0x0300 | ((0x4 << 4) | (node.cfg.plc_id & 0x0F));
     const auto ok = send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
     if (ok) {
-        node.expected_cmd_seq = data[1];
+        node.expected_cmd_seq = seq;
         node.awaiting_ack = true;
         node.last_cmd_sent = std::chrono::steady_clock::now();
         node.retry_count = 0;
         node.last_cmd_close = close;
         node.last_force_all_off = force_all_off;
+        // Mirror command on GCMC path for firmware that consumes it.
+        if (!send_gcmc_command(node, seq, close, force_all_off)) {
+            EVLOG_warning << "Failed to send GCMC command to PLC " << node.cfg.plc_id;
+        }
     }
     return ok;
 #else
@@ -1004,8 +1046,8 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         }
     };
 
-    // CRC check based on configuration (always validate when enabled, even if CRC byte is 0).
-    if (use_crc8_) {
+    // CRC check based on DBC (only specific frames carry CRC).
+    if (use_crc8_ && crc_expected(can_id)) {
         if (len < 8) {
             mark_crc_mismatch("expected CRC8 byte but frame shorter than 8 bytes");
             return;
@@ -1015,9 +1057,6 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
             mark_crc_fault("CRC8 verification failed");
             return;
         }
-    } else if (len == 8 && data[7] != 0) {
-        mark_crc_mismatch("PLC is sending CRC8 while host configuration disabled CRC");
-        return;
     }
     node->crc_fault_logged = false;
     node->status.last_any_rx = rx_time;
@@ -1044,6 +1083,24 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         handle_ev_status_display(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CHARGE_INFO_BASE & PLC_TX_MASK)) {
         handle_charge_info(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (GCMC_STATUS_BASE & PLC_TX_MASK)) {
+        handle_gcmc_status(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (HW_STATUS_BASE & PLC_TX_MASK)) {
+        handle_hw_status(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (DEBUG_INFO_BASE & PLC_TX_MASK)) {
+        handle_debug_info(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (BOOT_CONFIG_BASE & PLC_TX_MASK)) {
+        handle_boot_config(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (RTEVLOG_BASE & PLC_TX_MASK)) {
+        handle_rtev_log(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (RTTLOG_BASE & PLC_TX_MASK)) {
+        handle_rtt_log(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (SOFTWARE_INFO_BASE & PLC_TX_MASK)) {
+        handle_software_info(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (ERROR_CODES_BASE & PLC_TX_MASK)) {
+        handle_error_codes(*node, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (HW_CONFIG_BASE & PLC_TX_MASK)) {
+        handle_hw_config(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (RFID_EVENT_BASE & PLC_TX_MASK)) {
         handle_rfid_event(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (EVCCID_BASE & PLC_TX_MASK)) {
@@ -1126,6 +1183,7 @@ void PlcHardware::handle_meter(Node& node, const uint8_t* data, size_t len) {
     const bool comm_error = (data[1] & 0x02) != 0;
     const bool data_stale = (data[1] & 0x04) != 0;
     const bool overrange = (data[1] & 0x08) != 0;
+    const bool fallback_active = (data[1] & 0x10) != 0;
     if (mux == 0) {
         const uint16_t v = le_u16(&data[2]);
         const int16_t i = le_i16(&data[4]);
@@ -1133,7 +1191,7 @@ void PlcHardware::handle_meter(Node& node, const uint8_t* data, size_t len) {
         meter.voltage_v = v * 0.1;
         meter.current_a = i * 0.01;
         meter.power_w = p * 10.0;
-        meter.ok = meter_ok && !overrange;
+        meter.ok = meter_ok && !overrange && !fallback_active;
         node.status.present_voltage_v = meter.voltage_v;
         node.status.present_current_a = meter.current_a;
         node.status.present_power_w = meter.power_w;
@@ -1142,9 +1200,10 @@ void PlcHardware::handle_meter(Node& node, const uint8_t* data, size_t len) {
         const uint16_t f = le_u16(&data[6]);
         meter.energy_Wh = static_cast<double>(e) * 100.0; // 0.1 kWh -> Wh
         meter.freq_hz = f * 0.01;
-        meter.ok = meter_ok && !overrange;
+        meter.ok = meter_ok && !overrange && !fallback_active;
     }
-    meter.stale = data_stale;
+    meter.stale = data_stale || fallback_active;
+    node.meter_fallback_active = fallback_active;
     node.status.safety.comm_fault = comm_error;
     node.status.last_meter_rx = std::chrono::steady_clock::now();
     if (comm_error) {
@@ -1154,26 +1213,35 @@ void PlcHardware::handle_meter(Node& node, const uint8_t* data, size_t len) {
 
 void PlcHardware::handle_cp_levels(Node& node, const uint8_t* data, size_t len) {
     if (len < 8) return;
+    const uint16_t mv_robust = le_u16(&data[0]);
     const char cp_state_char = static_cast<char>(data[2]);
     const uint8_t duty = data[3];
     const uint16_t mv_peak = le_u16(&data[4]);
     const uint16_t mv_min = le_u16(&data[6]);
-    update_cp_status(node, cp_state_char, duty, mv_peak, mv_min, true);
+    update_cp_status(node, cp_state_char, duty, mv_peak, mv_min, true, mv_robust, true);
 }
 
 void PlcHardware::handle_charging_session(Node& node, const uint8_t* data, size_t len) {
     if (len < 6) return;
+    node.status.session_epoch = le_u32(&data[0]);
     const char cp_state_char = static_cast<char>(data[4]);
     const uint8_t duty = data[5];
-    update_cp_status(node, cp_state_char, duty, 0, 0, false);
+    update_cp_status(node, cp_state_char, duty, 0, 0, false, 0, false);
     uint8_t stage = node.status.hlc_stage;
     if (len >= 7) {
         stage = data[6];
     }
+    bool auth_pending = false;
+    if (len >= 8) {
+        auth_pending = (data[7] & 0x01) != 0;
+    }
+    node.status.auth_pending_flag = auth_pending;
     uint8_t flags = 0;
     if (node.status.hlc_charge_complete) flags |= 0x01;
     if (node.status.hlc_precharge_active) flags |= 0x02;
     if (node.status.hlc_cable_check_ok) flags |= 0x04;
+    if (node.authorization_granted) flags |= 0x08;
+    if (auth_pending) flags |= 0x10;
     update_hlc_state(node, stage, flags);
 }
 
@@ -1242,7 +1310,163 @@ void PlcHardware::handle_charge_info(Node& node, const uint8_t* data, size_t len
     if (len < 2) return;
     const uint8_t stage = data[0];
     const uint8_t flags = data[1];
+    const bool auth_granted = (flags & 0x08) != 0;
+    const bool auth_pending = (flags & 0x10) != 0;
+    const bool lock_engaged = (flags & 0x20) != 0;
+    node.authorization_granted = auth_granted;
+    node.status.auth_pending_flag = auth_pending;
+    node.lock_feedback_engaged = lock_engaged;
+    node.lock_engaged = node.cfg.require_lock ? lock_engaged : true;
     update_hlc_state(node, stage, flags);
+}
+
+void PlcHardware::handle_gcmc_status(Node& node, const uint8_t* data, size_t len) {
+    if (len < 7) return;
+    const uint8_t cmd_bits = data[0];
+    const uint8_t fb_bits = data[1];
+    const uint8_t fault_reason = data[2];
+    const uint8_t comm_fault = data[3];
+    const uint8_t safety_active = data[4];
+    const uint8_t last_applied = data[5];
+    const uint8_t cmd_seq_rx = data[6];
+
+    uint8_t mask = 0;
+    if (fb_bits & 0x01) mask |= 0x01; // GC
+    if (fb_bits & 0x02) mask |= 0x02; // MC
+    if (fb_bits & 0x04) mask |= 0x04; // MN0/module
+    node.status.relay_state_mask = mask;
+    node.status.relay_closed = (mask & 0x01) != 0;
+    PlcSafetyStatus s = node.status.safety;
+    s.comm_fault = comm_fault != 0;
+    s.remote_force_off = false;
+    s.safety_ok = !safety_active;
+    if (fault_reason != 0) {
+        s.safety_ok = false;
+        if (fault_reason == 6 || fault_reason == 5 || fault_reason == 8) {
+            s.comm_fault = true;
+        }
+        if (fault_reason == 7) {
+            s.remote_force_off = true;
+        }
+        if (fault_reason == 10 || fault_reason == 12) {
+            s.earth_fault = true;
+        }
+    }
+    node.status.last_fault_reason = fault_reason;
+    node.status.pending_safety = s;
+    node.status.pending_safety_since = std::chrono::steady_clock::now();
+    node.status.last_cmd_seq = last_applied;
+    node.expected_cmd_seq = cmd_seq_rx;
+    node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_rx));
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+        node.awaiting_ack = false;
+        node.retry_count = 0;
+    }
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+    (void)cmd_bits;
+}
+
+void PlcHardware::handle_hw_status(Node& node, const uint8_t* data, size_t len) {
+    if (len < 7) return;
+    const uint8_t tec = data[0];
+    const uint8_t rec = data[1];
+    const bool bus_off = data[2] != 0;
+    node.status.uptime_s = static_cast<uint32_t>(le_u16(&data[5]));
+    node.status.rx_count = static_cast<uint32_t>(data[3]);
+    node.status.tx_count = static_cast<uint32_t>(data[4]);
+    if (bus_off) {
+        node.status.safety.comm_fault = true;
+        node.status.safety.safety_ok = false;
+        node.status.relay_closed = false;
+        if (!node.bus_off_logged) {
+            EVLOG_error << "CAN controller bus-off (TEC=" << static_cast<int>(tec)
+                        << ", REC=" << static_cast<int>(rec) << ") on PLC " << node.cfg.plc_id;
+            node.bus_off_logged = true;
+        }
+    } else {
+        node.bus_off_logged = false;
+    }
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_debug_info(Node& node, const uint8_t* data, size_t len) {
+    if (len < 4) return;
+    const uint8_t cmd_seq_tx = data[0];
+    const uint8_t last_applied = data[1];
+    const uint8_t relay_fault = data[2];
+    const bool bus_off = data[3] != 0;
+    if (bus_off) {
+        node.status.safety.comm_fault = true;
+        node.status.safety.safety_ok = false;
+    }
+    node.status.last_cmd_seq = last_applied;
+    node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_tx));
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+        node.awaiting_ack = false;
+        node.retry_count = 0;
+    }
+    if (relay_fault != 0) {
+        node.status.last_fault_reason = relay_fault;
+        node.status.safety.safety_ok = false;
+    }
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_boot_config(Node& node, const uint8_t* data, size_t len) {
+    if (len < 4) return;
+    const uint8_t fw_major = data[0];
+    const uint8_t fw_minor = data[1];
+    const uint8_t fw_patch = data[2];
+    const uint8_t features = data[3];
+    const bool relays = (features & 0x01) != 0;
+    const bool safety = (features & 0x02) != 0;
+    if (!relays || !safety) {
+        EVLOG_warning << "PLC " << node.cfg.plc_id << " reports missing features (relays=" << relays
+                      << ", safety=" << safety << ") fw=" << static_cast<int>(fw_major) << "."
+                      << static_cast<int>(fw_minor) << "." << static_cast<int>(fw_patch);
+    }
+    node.status.fw_major = fw_major;
+    node.status.fw_minor = fw_minor;
+    node.status.fw_patch = fw_patch;
+    node.status.feature_flags = features;
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_rtev_log(Node& node, const uint8_t* data, size_t len) {
+    if (len < 8) return;
+    node.status.rx_count = le_u32(&data[0]);
+    node.status.tx_count = le_u32(&data[4]);
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_rtt_log(Node& node, const uint8_t* data, size_t len) {
+    if (len < 4) return;
+    node.status.uptime_s = le_u32(&data[0]);
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_software_info(Node& node, const uint8_t* data, size_t len) {
+    if (len < 8) return;
+    node.status.fw_major = data[5];
+    node.status.fw_minor = data[6];
+    node.status.fw_patch = data[7];
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_error_codes(Node& node, const uint8_t* data, size_t len) {
+    if (len < 1) return;
+    node.status.error_code = data[0];
+    if (node.status.error_code != 0) {
+        EVLOG_error << "PLC " << node.cfg.plc_id << " error code " << static_cast<int>(node.status.error_code);
+        node.status.safety.safety_ok = false;
+    }
+    node.status.last_any_rx = std::chrono::steady_clock::now();
+}
+
+void PlcHardware::handle_hw_config(Node& node, const uint8_t* data, size_t len) {
+    (void)data;
+    (void)len;
+    node.status.last_any_rx = std::chrono::steady_clock::now();
 }
 
 void PlcHardware::prune_segment_buffers(Node& node, const std::chrono::steady_clock::time_point& now) {
@@ -1382,6 +1606,13 @@ void PlcHardware::update_hlc_state(Node& node, uint8_t stage, uint8_t flags) {
     node.status.hlc_charge_complete = (flags & 0x01) != 0;
     node.status.hlc_precharge_active = (flags & 0x02) != 0;
     node.status.hlc_cable_check_ok = (flags & 0x04) != 0;
+    const bool auth_granted = (flags & 0x08) != 0;
+    const bool auth_pending = (flags & 0x10) != 0;
+    const bool lock_feedback = (flags & 0x20) != 0;
+    node.authorization_granted = auth_granted;
+    node.status.auth_pending_flag = auth_pending;
+    node.lock_feedback_engaged = lock_feedback;
+    node.lock_engaged = node.cfg.require_lock ? lock_feedback : true;
     node.status.hlc_power_ready = derive_hlc_power_ready(node.status, node.authorization_granted);
 }
 
@@ -1390,7 +1621,7 @@ bool PlcHardware::supports_cross_slot_islands() const {
 }
 
 void PlcHardware::update_cp_status(Node& node, char cp_state_char, uint8_t duty_pct, uint16_t mv_peak,
-                                   uint16_t mv_min, bool has_mv) {
+                                   uint16_t mv_min, bool has_mv, uint16_t mv_robust, bool has_robust) {
     auto& cp = node.status.cp;
     if (cp_state_char == 0) {
         cp_state_char = 'U';
@@ -1400,6 +1631,9 @@ void PlcHardware::update_cp_status(Node& node, char cp_state_char, uint8_t duty_
     if (has_mv) {
         cp.mv_peak = mv_peak;
         cp.mv_min = mv_min;
+    }
+    if (has_robust) {
+        cp.mv_robust = mv_robust;
     }
     cp.valid = true;
     cp.last_rx = std::chrono::steady_clock::now();
@@ -1430,3 +1664,35 @@ void PlcHardware::handle_error_frame(const struct can_frame& frame) {
 #endif
 
 } // namespace charger
+bool PlcHardware::send_gcmc_command(Node& node, uint8_t seq, bool close, bool force_all_off) {
+#ifdef __linux__
+    uint8_t data[8] = {};
+    uint8_t cmd_bits = 0;
+    if (close && (node.module_mask & 0x01)) cmd_bits |= 0x01; // GC_CMD
+    if (node.mc_closed_cmd) cmd_bits |= 0x02;                 // MC_CMD
+    if (close && (node.module_mask & 0x02)) cmd_bits |= 0x04; // MN0_CMD (module 1)
+    if (close && (node.module_mask & 0x04)) cmd_bits |= 0x08; // MN1_CMD (module 2)
+    data[0] = cmd_bits;
+    data[1] = seq;
+    data[2] = 0;
+    data[3] = 0;
+    data[4] = 0;
+    data[5] = 0;
+    data[6] = 0;
+    data[7] = 0;
+    if (force_all_off) data[0] |= (1 << 7);
+    const bool clear_faults = node.status.last_fault_reason != 0;
+    if (clear_faults) data[0] |= (1 << 6);
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
+    uint32_t can_id = GCMC_CMD_BASE | static_cast<uint32_t>(node.cfg.plc_id & 0x0F);
+    return send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
+#else
+    (void)node;
+    (void)seq;
+    (void)close;
+    (void)force_all_off;
+    return false;
+#endif
+}
