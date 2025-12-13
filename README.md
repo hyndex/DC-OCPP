@@ -3,6 +3,14 @@ OCPP DC charger integration scaffold
 
 This project wires up a multi‑gun DC charger against libocpp (https://github.com/EVerest/libocpp) and provides a thin orchestration layer you can extend with real hardware controls. The focus is OCPP 1.6 with N connectors (“guns”) and a small simulated hardware backend so you can exercise the protocol end‑to‑end.
 
+Architecture at a glance
+------------------------
+- One controller (this repo) ↔ multiple PLC nodes, one PLC per connector/gun.
+- Each PLC (Ref/Basic firmware) exposes 1 gun relay + 2 module relays; controller treats each PLC as one connector.
+- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (via PLC relays).
+- Controller owns OCPP, auth, session lifecycle, and power planning; PLC owns IEC61851/SLAC/ISO15118 timing and safety IO.
+- Ring/islanding: controller planner can model multi-slot islands, but Basic PLC interface only actuates the two module relays per PLC and cannot switch MC/MN/ring contactors; cross-slot/island routing is blocked until PLC exposes those actuators.
+
 What’s here
 -----------
 - `libocpp/` fetched from upstream for the OCPP 1.6/2.0.1 stack
@@ -104,16 +112,18 @@ Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/
 
 OCPP adapter behavior (current)
 -------------------------------
-- Per-connector state tracking to issue `StatusNotification` transitions via libocpp callbacks:
-  - Available → Charging when a session exists and relay closed.
-  - Available/Suspended → Suspended when a session exists but relay open.
-  - Any → Faulted on safety/estop/earth/comm/meter-stale; clears to Available when healthy.
-- Transaction start is aligned with ISO 15118 HLC `PowerDelivery` readiness: HLC stage/flags from PLC are gated with CP
-  state and lock feedback to prevent premature energy delivery or OCPP transaction start.
-- Transactions gated by safety_ok/comm_ok before start; faults auto-stop transactions and disable connector.
-- Connector lock feedback is enforced (configurable), with MC/GC weld detection propagated as precise OCPP faults.
-- Firmware/diagnostics/log uploads: now emit progress notifications (Downloading/Installing/Installed, Uploading/Uploaded) via libocpp status callbacks.
-- Meter loop pushes calibrated measurements each interval (plc/shunt selectable), enforces monotonic energy counters, and faults reported as OCPP errors (power meter, comm, safety). Diagnostics/log upload now bundles real log sets and can push to HTTP/file targets.
+- Per-connector state tracking drives `StatusNotification`:
+  - Plug-in with/without session → Preparing; post-stop while still plugged or HLC charge complete → Finishing; Charging/SuspendedEV/Evse as appropriate.
+  - Faulted on safety/estop/earth/comm/meter-stale/weld; clears to Available when healthy.
+  - Seamless retry tolerance: brief CP/B1-B2 drops or quick unplug/replug within 8s keep the session and avoid Finishing.
+- Auth pipeline:
+  - Pending auth pushed to PLC (AuthorizationState::Pending) so PLC can reply ISO15118 AuthorizationRes=Ongoing.
+  - Tokens flow from RFID/RemoteStart/Autocharge (EVCCID/EMAID/EVMAC), with 10s dedup and 24h local auth cache for offline acceptance.
+  - Reservations enforced: sessions won’t start without matching idTag/parentId.
+- Transaction start aligned with ISO15118 HLC `PowerDelivery` readiness, CP state, and lock feedback to prevent premature energy delivery or OCPP transaction start.
+- Safety gating: all faults auto-stop transactions and disable connector; weld/isolation/lock faults mapped to precise OCPP error codes.
+- Metering/control loop: 200 ms supervisor for state/fault/auth handling; meter push interval per connector; monotonic energy enforcement; meter-stale triggers fault; PLC/shunt source selectable.
+- Firmware/diagnostics/log uploads: emit progress notifications (Downloading/Installing/Installed, Uploading/Uploaded); log bundling and HTTPS/file upload supported.
 
 Configuration notes
 -------------------
@@ -144,14 +154,14 @@ Operational playbooks
 ---------------------
 - TLS/PKI provisioning: `docs/security_pki.md`
 - Soak testing and resilience: `docs/soak_test_plan.md`
+- HIL/system scenarios: `tests/HIL_PLAN.md`
 
 Known gaps / TODO for production
 --------------------------------
-- Availability/state transitions tied to CP states (plug/unplug) are still limited; PLC HLC state is now honored but CP-only transitions remain.
-- Offline buffering/resume, auth list/cache, and automated TLS/cert provisioning/renewal are not yet wired (see docs/security_pki.md for manual provisioning).
-- PLC: broader seq/ack beyond relay, finer debounce tuning, loss/reorder protection, richer telemetry usage remain open.
-- V2G/PnC flows are not supported in this release; roadmap and backend expectations are documented below.
-- Run the soak test plan (docs/soak_test_plan.md) before production rollout to validate long-haul stability.
+- PLC firmware must be validated to map AuthorizationState::Pending to ISO15118 AuthorizationRes=Ongoing on-device.
+- Ring/islanding and cross-slot module routing remain blocked until PLC exposes MC/MN/ring actuators; current interface only supports two module relays per PLC.
+- V2G/PnC flows are not supported in this release; Autocharge via EVCCID/EMAID/EVMAC is available.
+- Run the soak test plan (`docs/soak_test_plan.md`) and HIL plan (`tests/HIL_PLAN.md`) before production rollout to validate long-haul stability.
 
 Security and TLS
 ----------------
