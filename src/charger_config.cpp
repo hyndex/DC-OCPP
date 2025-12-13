@@ -167,6 +167,12 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
 
     if (json.contains("ocpp") && json["ocpp"].is_object()) {
         cfg.ocpp_config_inline = json["ocpp"].dump();
+        const auto& ocpp_obj = json["ocpp"];
+        if (ocpp_obj.contains("Core") && ocpp_obj["Core"].is_object()) {
+            const auto& core = ocpp_obj["Core"];
+            cfg.meter_sample_interval_s = core.value("MeterValueSampleInterval", cfg.meter_sample_interval_s);
+            cfg.minimum_status_duration_s = core.value("MinimumStatusDuration", cfg.minimum_status_duration_s);
+        }
     }
 
     const auto ocpp_config_path = json.value("ocppConfig", "");
@@ -181,6 +187,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.logging_config = make_absolute(base_dir, json.value("loggingConfig", "libocpp/config/logging.ini"));
 
     cfg.meter_sample_interval_s = json.value("meterSampleIntervalSeconds", 30);
+    cfg.meter_keepalive_s = json.value("meterKeepAliveSeconds", cfg.meter_keepalive_s);
+    cfg.minimum_status_duration_s = json.value("minimumStatusDurationSeconds", cfg.minimum_status_duration_s);
 
     const auto security = json.value("security", nlohmann::json::object());
     cfg.security.csms_ca_bundle = make_absolute(base_dir, security.value("csmsCaBundle", "data/certs/ca/csms/CSMS_ROOT_CA.pem"));
@@ -300,6 +308,12 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
 
     const auto connector_count = static_cast<int>(cfg.connectors.size());
     json["Core"]["NumberOfConnectors"] = connector_count;
+    if (cfg.minimum_status_duration_s > 0) {
+        json["Core"]["MinimumStatusDuration"] = cfg.minimum_status_duration_s;
+    }
+    if (cfg.meter_sample_interval_s > 0) {
+        json["Core"]["MeterValueSampleInterval"] = cfg.meter_sample_interval_s;
+    }
 
     return json.dump();
 }

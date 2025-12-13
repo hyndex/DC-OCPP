@@ -84,6 +84,8 @@ struct ChargerConfig {
     int power_request_timeout_s{60};
     int evse_limit_ack_timeout_ms{1500};
     int telemetry_timeout_ms{2000};
+    int minimum_status_duration_s{0};
+    int meter_keepalive_s{300};
     std::string ocpp_config_inline; // Preferred inline OCPP base config JSON (single source)
 
     fs::path ocpp_config;

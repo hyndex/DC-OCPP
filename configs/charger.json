@@ -64,20 +64,23 @@
       "ChargePointModel": "Joulepoint-DC",
       "ChargePointVendor": "JoulePoint",
       "FirmwareVersion": "0.0.1",
-      "LogMessagesFormat": []
+      "LogMessages": true,
+      "LogMessagesFormat": ["log","console_detailed"]
     },
     "Core": {
       "AuthorizeRemoteTxRequests": true,
       "ClockAlignedDataInterval": 900,
       "ConnectionTimeOut": 10,
       "ConnectorPhaseRotation": "0.RST,1.RST,2.RST,3.RST,4.RST,5.RST,6.RST,7.RST,8.RST,9.RST,10.RST,11.RST,12.RST",
+      "AuthorizationCacheEnabled": true,
+      "MinimumStatusDuration": 5,
       "GetConfigurationMaxKeys": 100,
       "HeartbeatInterval": 300,
       "LocalAuthorizeOffline": false,
       "LocalPreAuthorize": false,
       "MeterValuesAlignedData": "Energy.Active.Import.Register",
       "MeterValuesSampledData": "Energy.Active.Import.Register",
-      "MeterValueSampleInterval": 0,
+      "MeterValueSampleInterval": 30,
       "NumberOfConnectors": 12,
       "ResetRetries": 1,
       "StopTransactionOnEVSideDisconnect": true,
@@ -115,12 +118,12 @@
       "CustomDisplayCostAndPrice": false
     }
   },
-  "sharePath": "libocpp/config/v16",
-  "userConfig": "data/user_config.json",
-  "databaseDir": "data/db",
-  "sqlMigrationsPath": "libocpp/config/v16/core_migrations",
-  "messageLogPath": "logs",
-  "loggingConfig": "libocpp/config/logging.ini",
+  "sharePath": "../libocpp/config/v16",
+  "userConfig": "../data/user_config.json",
+  "databaseDir": "../data/db",
+  "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
+  "messageLogPath": "../logs",
+  "loggingConfig": "../libocpp/config/logging.ini",
   "meterSampleIntervalSeconds": 30,
   "connectors": [
     { "id": 1, "plcId": 0, "label": "Gun 1", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
@@ -149,12 +152,12 @@
       "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 }
   ],
   "security": {
-    "csmsCaBundle": "data/certs/ca/csms/CSMS_ROOT_CA.pem",
-    "moCaBundle": "data/certs/ca/mo/MO_ROOT_CA.pem",
-    "v2gCaBundle": "data/certs/ca/v2g/V2G_ROOT_CA.pem",
-    "clientCertDir": "data/certs/client/csms",
-    "clientKeyDir": "data/certs/client/csms",
-    "seccCertDir": "data/certs/client/cso",
-    "seccKeyDir": "data/certs/client/cso"
+    "csmsCaBundle": "../data/certs/ca/csms/CSMS_ROOT_CA.pem",
+    "moCaBundle": "../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "v2gCaBundle": "../data/certs/ca/v2g/V2G_ROOT_CA.pem",
+    "clientCertDir": "../data/certs/client/csms",
+    "clientKeyDir": "../data/certs/client/csms",
+    "seccCertDir": "../data/certs/client/cso",
+    "seccKeyDir": "../data/certs/client/cso"
   }
 }

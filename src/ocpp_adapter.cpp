@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -181,6 +182,8 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
         post_stop_time_[c.id] = std::chrono::steady_clock::time_point{};
         reservation_required_tag_.erase(c.id);
         reservation_parent_tag_.erase(c.id);
+        connector_meter_intervals_[c.id] = c.meter_sample_interval_s > 0 ? c.meter_sample_interval_s
+                                                                         : cfg_.meter_sample_interval_s;
     }
     load_pending_tokens_from_disk();
     load_local_auth_cache_from_disk();
@@ -343,6 +346,15 @@ bool OcppAdapter::start() {
     planner_thread_ = std::thread([this]() {
         while (running_ && planner_thread_running_) {
             try {
+                const auto now = std::chrono::steady_clock::now();
+                bool refresh_due = false;
+                {
+                    std::lock_guard<std::mutex> lock(plan_mutex_);
+                    refresh_due = profile_next_refresh_.has_value() && now >= *profile_next_refresh_;
+                }
+                if (refresh_due) {
+                    refresh_charging_profile_limits();
+                }
                 apply_power_plan();
             } catch (const std::exception& e) {
                 EVLOG_warning << "Planner thread error: " << e.what();
@@ -453,9 +465,29 @@ void OcppAdapter::register_callbacks() {
             token.prevalidated = prevalidated;
             token.connector_hint = referenced_connectors.empty() ? 0 : referenced_connectors.front();
             token.received_at = std::chrono::steady_clock::now();
+            std::optional<std::string> required_tag;
+            std::optional<std::string> parent_tag;
             if (token.connector_hint > 0) {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                if (reservation_required_tag_.count(token.connector_hint)) {
+                    required_tag = reservation_required_tag_[token.connector_hint];
+                }
+                if (reservation_parent_tag_.count(token.connector_hint)) {
+                    parent_tag = reservation_parent_tag_[token.connector_hint];
+                }
+            }
+            if (token.connector_hint > 0 && required_tag) {
+                if (!token_matches_reservation(token.connector_hint, token.id_token, parent_tag)) {
+                    EVLOG_warning << "RemoteStart token does not match reservation on connector "
+                                  << token.connector_hint << "; ignoring remote start token";
+                    return;
+                }
+            }
+            if (token.connector_hint > 0 && required_tag) {
+                std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                 reserved_connectors_[token.connector_hint] = false;
+                reservation_required_tag_.erase(token.connector_hint);
+                reservation_parent_tag_.erase(token.connector_hint);
                 for (auto it = reservation_lookup_.begin(); it != reservation_lookup_.end();) {
                     if (it->second == token.connector_hint) {
                         it = reservation_lookup_.erase(it);
@@ -506,38 +538,74 @@ void OcppAdapter::register_callbacks() {
     charge_point_->register_upload_diagnostics_callback(
         [this](const ocpp::v16::GetDiagnosticsRequest& request) {
             charge_point_->on_log_status_notification(-1, "Uploading");
-            auto resp = hardware_->upload_diagnostics(request);
-            charge_point_->on_log_status_notification(-1, resp.status == ocpp::v16::LogStatusEnumType::Accepted
-                                                                ? "Uploaded"
-                                                                : "UploadFailed");
-            return resp;
+            try {
+                auto resp = hardware_->upload_diagnostics(request);
+                charge_point_->on_log_status_notification(-1, resp.status == ocpp::v16::LogStatusEnumType::Accepted
+                                                                    ? "Uploaded"
+                                                                    : "UploadFailed");
+                return resp;
+            } catch (const std::exception& e) {
+                EVLOG_error << "Diagnostics upload failed: " << e.what();
+                ocpp::v16::GetLogResponse resp;
+                resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+                charge_point_->on_log_status_notification(-1, "UploadFailed");
+                return resp;
+            }
         });
 
     charge_point_->register_upload_logs_callback(
         [this](const ocpp::v16::GetLogRequest& request) {
             const int req_id = request.requestId;
             charge_point_->on_log_status_notification(req_id, "Uploading");
-            auto resp = hardware_->upload_logs(request);
-            charge_point_->on_log_status_notification(req_id, resp.status == ocpp::v16::LogStatusEnumType::Accepted
-                                                                  ? "Uploaded"
-                                                                  : "UploadFailed");
-            return resp;
+            try {
+                auto resp = hardware_->upload_logs(request);
+                charge_point_->on_log_status_notification(req_id, resp.status == ocpp::v16::LogStatusEnumType::Accepted
+                                                                      ? "Uploaded"
+                                                                      : "UploadFailed");
+                return resp;
+            } catch (const std::exception& e) {
+                EVLOG_error << "Log upload failed: " << e.what();
+                ocpp::v16::GetLogResponse resp;
+                resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+                charge_point_->on_log_status_notification(req_id, "UploadFailed");
+                return resp;
+            }
         });
 
     charge_point_->register_update_firmware_callback(
         [this](const ocpp::v16::UpdateFirmwareRequest msg) {
             charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
-            hardware_->update_firmware(msg);
-            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
-            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
+            try {
+                hardware_->update_firmware(msg);
+                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
+                charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
+            } catch (const std::exception& e) {
+                EVLOG_error << "Firmware update failed: " << e.what();
+                charge_point_->on_firmware_update_status_notification(
+                    -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+            }
         });
 
     charge_point_->register_signed_update_firmware_callback(
         [this](const ocpp::v16::SignedUpdateFirmwareRequest msg) {
             charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
             charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installing);
-            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Installed);
-            return hardware_->update_firmware_signed(msg);
+            try {
+                const auto status = hardware_->update_firmware_signed(msg);
+                if (status == ocpp::v16::UpdateFirmwareStatusEnumType::Accepted) {
+                    charge_point_->on_firmware_update_status_notification(
+                        -1, ocpp::FirmwareStatusNotification::Installed);
+                } else {
+                    charge_point_->on_firmware_update_status_notification(
+                        -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                }
+                return status;
+            } catch (const std::exception& e) {
+                EVLOG_error << "Signed firmware update failed: " << e.what();
+                charge_point_->on_firmware_update_status_notification(
+                    -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                return ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
+            }
         });
 
     charge_point_->register_set_connection_timeout_callback(
@@ -549,33 +617,85 @@ void OcppAdapter::register_callbacks() {
     charge_point_->register_reset_callback(
         [this](const ocpp::v16::ResetType& reset_type) { hardware_->reset(reset_type); });
 
+    charge_point_->register_data_transfer_callback(
+        [this](const ocpp::v16::DataTransferRequest& request) { return handle_data_transfer_request(request); });
+
+    charge_point_->register_is_token_reserved_for_connector_callback(
+        [this](const std::int32_t connector, const std::string& id_token) {
+            std::optional<std::string> parent;
+            bool reserved = false;
+            {
+                std::lock_guard<std::mutex> lock(plan_mutex_);
+                if (reservation_parent_tag_.count(connector)) {
+                    parent = reservation_parent_tag_[connector];
+                }
+                reserved = reserved_connectors_.count(connector) ? reserved_connectors_[connector] : false;
+            }
+            const bool matches = token_matches_reservation(connector, id_token, parent);
+            if (!reserved) {
+                return ocpp::ReservationCheckStatus::NotReserved;
+            }
+            if (matches) {
+                return ocpp::ReservationCheckStatus::ReservedForToken;
+            }
+            if (parent && !parent->empty()) {
+                return ocpp::ReservationCheckStatus::ReservedForOtherTokenAndHasParentToken;
+            }
+            return ocpp::ReservationCheckStatus::ReservedForOtherToken;
+        });
+
+    charge_point_->register_generic_configuration_key_changed_callback(
+        [this](const ocpp::v16::KeyValue& key_value) { handle_configuration_key_change(key_value); });
+
+    charge_point_->register_set_system_time_callback(
+        [](const std::string& system_time) { EVLOG_info << "CSMS provided system time: " << system_time; });
+
+    charge_point_->register_boot_notification_response_callback(
+        [](const ocpp::v16::BootNotificationResponse& resp) {
+            std::stringstream ss;
+            ss << resp.currentTime;
+            EVLOG_info << "BootNotification response status=" << resp.status << " interval=" << resp.interval
+                       << " currentTime=" << ss.str();
+        });
+
     charge_point_->register_connection_state_changed_callback([](bool is_connected) {
         EVLOG_info << "CSMS websocket state changed: " << (is_connected ? "connected" : "disconnected");
     });
 
     charge_point_->register_signal_set_charging_profiles_callback([this]() { refresh_charging_profile_limits(); });
+
+    charge_point_->register_all_connectors_unavailable_callback(
+        []() { EVLOG_info << "All connectors unavailable; safe for maintenance/firmware actions."; });
+
+    charge_point_->register_security_event_callback(
+        [](const std::string& type, const std::string& tech_info) {
+            EVLOG_warning << "Security event: " << type << " details=" << tech_info;
+        });
 }
 
 void OcppAdapter::start_metering_threads() {
     for (const auto& connector : cfg_.connectors) {
-        const auto interval = connector.meter_sample_interval_s > 0 ? connector.meter_sample_interval_s
-                                                                     : cfg_.meter_sample_interval_s;
-        meter_threads_.emplace_back([this, connector_id = connector.id, interval]() {
-            metering_loop(connector_id, interval);
-        });
+        meter_threads_.emplace_back([this, connector_id = connector.id]() { metering_loop(connector_id); });
     }
 }
 
-void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
-    const auto meter_period = std::chrono::seconds(std::max(1, interval_s));
+void OcppAdapter::metering_loop(std::int32_t connector) {
+    int current_interval_s = meter_interval_seconds_for_connector(connector);
+    auto meter_period = std::chrono::seconds(std::max(1, current_interval_s));
     const auto control_tick = std::chrono::milliseconds(50);
     auto next_meter_push = std::chrono::steady_clock::now();
 
     while (running_) {
         try {
             const auto loop_start = std::chrono::steady_clock::now();
-            const bool push_meter_now = loop_start >= next_meter_push;
             const auto now = loop_start;
+            const int desired_interval = meter_interval_seconds_for_connector(connector);
+            if (desired_interval != current_interval_s) {
+                current_interval_s = desired_interval;
+                meter_period = std::chrono::seconds(std::max(1, current_interval_s));
+                next_meter_push = now + meter_period;
+            }
+            const bool push_meter_now = loop_start >= next_meter_push;
             const bool auth_timeout_enabled = cfg_.auth_wait_timeout_s > 0;
             const bool power_request_timeout_enabled = cfg_.power_request_timeout_s > 0;
             const auto auth_wait_timeout = std::chrono::seconds(auth_timeout_enabled
@@ -617,6 +737,11 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             bool had_session = false;
             bool pending_changed = false;
             bool fault = false;
+            bool was_faulted = false;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                was_faulted = connector_faulted_[connector];
+            }
 
             auto measurement = hardware_->sample_meter(connector);
             // Check measurement vs reported telemetry for consistency.
@@ -916,7 +1041,30 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
             }
 
             if (push_meter_now) {
-                push_meter_values(connector, measurement);
+                bool send_meter = false;
+                const auto keepalive = std::chrono::seconds(std::max(1, cfg_.meter_keepalive_s));
+                {
+                    std::lock_guard<std::mutex> lock(meter_mutex_);
+                    const double energy_wh = measurement.power_meter.energy_Wh_import.total;
+                    const double last_sent_wh = last_meter_sent_wh_[connector];
+                    const auto last_sent_time_it = last_meter_sent_time_.find(connector);
+                    const auto last_sent_time =
+                        last_sent_time_it != last_meter_sent_time_.end()
+                            ? last_sent_time_it->second
+                            : std::chrono::steady_clock::time_point{};
+                    const bool tx_active = had_session && session.transaction_started;
+                    const bool changed = std::fabs(energy_wh - last_sent_wh) > 0.1;
+                    const bool stale = last_sent_time.time_since_epoch().count() == 0 ||
+                        (now - last_sent_time) >= keepalive;
+                    send_meter = tx_active || changed || stale;
+                    if (send_meter) {
+                        last_meter_sent_wh_[connector] = energy_wh;
+                        last_meter_sent_time_[connector] = now;
+                    }
+                }
+                if (send_meter) {
+                    push_meter_values(connector, measurement);
+                }
                 while (next_meter_push <= loop_start) {
                     next_meter_push += meter_period;
                 }
@@ -942,7 +1090,9 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 report_fault(connector, err);
                 fault = true;
             } else if (!fault) {
-                charge_point_->on_all_errors_cleared(connector);
+                if (was_faulted) {
+                    charge_point_->on_all_errors_cleared(connector);
+                }
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 connector_faulted_[connector] = false;
             }
@@ -2050,10 +2200,12 @@ void OcppAdapter::refresh_charging_profile_limits() {
 
     profile_current_limit_a_.clear();
     profile_power_limit_kw_.clear();
+    profile_next_refresh_.reset();
 
-    // Pull composite schedules for the next hour; stack returns schedules per connector.
     const auto schedules =
         charge_point_->get_all_composite_charging_schedules(3600, ocpp::v16::ChargingRateUnit::A);
+    const auto now_utc = ocpp::DateTime().to_time_point();
+    const auto now_steady = std::chrono::steady_clock::now();
 
     for (const auto& kv : schedules) {
         const int connector_id = kv.first;
@@ -2061,12 +2213,63 @@ void OcppAdapter::refresh_charging_profile_limits() {
         if (sched.chargingSchedulePeriod.empty()) {
             continue;
         }
-        auto period = *std::min_element(sched.chargingSchedulePeriod.begin(), sched.chargingSchedulePeriod.end(),
-                                        [](const auto& a, const auto& b) { return a.startPeriod < b.startPeriod; });
+        const auto start_tp = sched.startSchedule ? sched.startSchedule->to_time_point() : now_utc;
+        const auto elapsed = now_utc - start_tp;
+        const bool in_future = elapsed < std::chrono::seconds::zero();
+
+        // Track next refresh boundary for future periods or duration end.
+        auto consider_next_refresh = [&](const std::chrono::seconds& delta_from_now) {
+            if (delta_from_now <= std::chrono::seconds::zero()) {
+                return;
+            }
+            const auto candidate =
+                now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(delta_from_now);
+            if (!profile_next_refresh_ || candidate < *profile_next_refresh_) {
+                profile_next_refresh_ = candidate;
+            }
+        };
+
+        if (in_future) {
+            consider_next_refresh(std::chrono::duration_cast<std::chrono::seconds>(-elapsed));
+            continue;
+        }
+
+        const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        if (sched.duration && elapsed_s >= *sched.duration) {
+            continue;
+        }
+
+        const ocpp::v16::ChargingSchedulePeriod* active = nullptr;
+        std::optional<int> next_start_s;
+        for (const auto& period : sched.chargingSchedulePeriod) {
+            if (period.startPeriod <= elapsed_s) {
+                if (!active || period.startPeriod > active->startPeriod) {
+                    active = &period;
+                }
+            } else {
+                if (!next_start_s || period.startPeriod < *next_start_s) {
+                    next_start_s = period.startPeriod;
+                }
+            }
+        }
+
+        if (next_start_s) {
+            const auto next_tp = start_tp + std::chrono::seconds(*next_start_s);
+            consider_next_refresh(std::chrono::duration_cast<std::chrono::seconds>(next_tp - now_utc));
+        }
+        if (sched.duration) {
+            const auto end_tp = start_tp + std::chrono::seconds(*sched.duration);
+            consider_next_refresh(std::chrono::duration_cast<std::chrono::seconds>(end_tp - now_utc));
+        }
+
+        if (!active) {
+            continue;
+        }
+
         if (sched.chargingRateUnit == ocpp::v16::ChargingRateUnit::A) {
-            profile_current_limit_a_[connector_id] = period.limit;
+            profile_current_limit_a_[connector_id] = active->limit;
         } else if (sched.chargingRateUnit == ocpp::v16::ChargingRateUnit::W) {
-            profile_power_limit_kw_[connector_id] = period.limit / 1000.0;
+            profile_power_limit_kw_[connector_id] = active->limit / 1000.0;
         }
     }
 }
@@ -2165,6 +2368,15 @@ std::chrono::system_clock::time_point OcppAdapter::to_system(std::chrono::steady
     return now_sys + std::chrono::duration_cast<std::chrono::system_clock::duration>(t_steady - now_steady);
 }
 
+int OcppAdapter::meter_interval_seconds_for_connector(std::int32_t connector) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    auto it = connector_meter_intervals_.find(connector);
+    if (it != connector_meter_intervals_.end() && it->second > 0) {
+        return it->second;
+    }
+    return std::max(1, cfg_.meter_sample_interval_s);
+}
+
 std::string OcppAdapter::token_source_to_string(AuthTokenSource src) {
     switch (src) {
     case AuthTokenSource::RFID: return "rfid";
@@ -2192,6 +2404,91 @@ void OcppAdapter::set_auth_state(std::int32_t connector, AuthorizationState stat
         auth_state_cache_[connector] = state;
     }
     hardware_->set_authorization_state(connector, state);
+}
+
+bool OcppAdapter::token_matches_reservation(std::int32_t connector, const std::string& token,
+                                            const std::optional<std::string>& parent_token) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    const auto trimmed = clamp_id_token(token);
+    const auto req_it = reservation_required_tag_.find(connector);
+    if (req_it == reservation_required_tag_.end()) {
+        return true;
+    }
+    if (trimmed == req_it->second) {
+        return true;
+    }
+    const auto parent_it = reservation_parent_tag_.find(connector);
+    if (parent_it != reservation_parent_tag_.end() && parent_it->second) {
+        if (trimmed == parent_it->second.value()) {
+            return true;
+        }
+        if (parent_token && *parent_token == parent_it->second.value()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+ocpp::v16::DataTransferResponse
+OcppAdapter::handle_data_transfer_request(const ocpp::v16::DataTransferRequest& request) {
+    ocpp::v16::DataTransferResponse resp;
+    const std::string vendor = request.vendorId.get();
+    const std::string message_id = request.messageId ? request.messageId->get() : "";
+
+    auto known_vendor = [](const std::string& v) {
+        static const std::set<std::string> vendors = {"iso15118",
+                                                      "PnC",
+                                                      "pnc",
+                                                      "org.openchargealliance.iso15118",
+                                                      "org.openchargealliance.ocpp",
+                                                      "org.openchargealliance.iso15118pnc",
+                                                      "org.openchargealliance.pnc"};
+        return vendors.find(v) != vendors.end();
+    };
+
+    if (!known_vendor(vendor)) {
+        resp.status = ocpp::v16::DataTransferStatus::UnknownVendorId;
+        resp.data = std::string("Unsupported vendor: ") + vendor;
+        EVLOG_warning << "DataTransfer request from CSMS rejected: unknown vendorId=" << vendor
+                      << " messageId=" << message_id;
+        return resp;
+    }
+
+    // Known vendor but no specific handler: respond cleanly with UnknownMessageId to avoid silent drop.
+    resp.status = ocpp::v16::DataTransferStatus::UnknownMessageId;
+    resp.data = std::string("No handler for vendor=") + vendor +
+        (message_id.empty() ? "" : (" messageId=" + message_id));
+    EVLOG_warning << "DataTransfer request for vendor=" << vendor << " messageId=" << message_id
+                  << " is not implemented; responding UnknownMessageId";
+    return resp;
+}
+
+void OcppAdapter::handle_configuration_key_change(const ocpp::v16::KeyValue& key_value) {
+    const std::string key = key_value.key.get();
+    const std::string value = key_value.value ? key_value.value->get() : "";
+    EVLOG_info << "Configuration key changed by CSMS: " << key << "=" << value;
+
+    auto parse_int = [&](int fallback) {
+        try {
+            return std::stoi(value);
+        } catch (...) {
+            return fallback;
+        }
+    };
+
+    if (key == "MeterValueSampleInterval") {
+        const int interval = std::max(1, parse_int(cfg_.meter_sample_interval_s));
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        for (const auto& c : cfg_.connectors) {
+            connector_meter_intervals_[c.id] = interval;
+        }
+    } else if (key == "MinimumStatusDuration") {
+        cfg_.minimum_status_duration_s = parse_int(cfg_.minimum_status_duration_s);
+    } else if (key == "ConnectionTimeOut") {
+        hardware_->set_connection_timeout(parse_int(0));
+    } else if (key == "HeartbeatInterval") {
+        cfg_.meter_keepalive_s = std::max(1, parse_int(cfg_.meter_keepalive_s));
+    }
 }
 
 void OcppAdapter::persist_pending_tokens() {

@@ -54,12 +54,44 @@ cmake --build build -j --target power_manager_tests
 
 Run
 ---
-```bash
-./build/dc_ocpp --config configs/charger.json
-```
+1. Set CSMS + charger identity in `configs/charger.json`:
+   - `chargePoint.centralSystemURI` and `ocpp.Internal.CentralSystemURI`
+   - `chargePoint.id` / `ocpp.Internal.ChargePointId`
+   - Size `connectors[]` and `slots[]` to your hardware; connector IDs must start at 1.
+   - Paths in `configs/charger.json` are resolved relative to the file, and default to the repo’s top-level `libocpp`, `data`, and `logs` directories.
+2. Build if you have not already:
+   ```bash
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build -j
+   ```
+3. Run in the foreground:
+   ```bash
+   ./build/dc_ocpp --config configs/charger.json
+   ```
+   - On non-Linux hosts without SocketCAN, the PLC backend falls back to simulated hardware automatically.
+   - Logs stream to stdout and to `logs/dc_ocpp.log`; libocpp DB lives under `data/db`.
+4. Run in the background (capture PID for stopping later):
+   ```bash
+   nohup ./build/dc_ocpp --config configs/charger.json > logs/dc_ocpp.log 2>&1 & echo $!
+   tail -f logs/dc_ocpp.log
+   ```
 
-The default config targets a SteVe instance on `ws://127.0.0.1:8180/steve/websocket/CentralSystemService/`. Update `configs/charger.json` to point at your CSMS, set the ChargePointId, and size the connector list to match your number of guns. OCPP parameters live under the same file’s `ocpp` block; set `ocppConfig` only if you need to override with a separate base config for legacy setups. Connector IDs must start at 1.
-For PLC/CAN hardware, set `"usePLC": true`, `"canInterface": "can0"` (or your iface), and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs, so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.
+Stop
+----
+- If running in the foreground, press Ctrl+C.
+- If running in the background, stop by PID:
+  ```bash
+  kill <pid>
+  ```
+  or stop all matching processes:
+  ```bash
+  pkill -f "dc_ocpp --config configs/charger.json"
+  ```
+
+PLC/CAN notes
+-------------
+- For real PLC/CAN hardware, set `"usePLC": true`, configure `"canInterface"`, and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.
+- On macOS or other hosts without SocketCAN, the process stays in simulated mode for end-to-end OCPP without field IO.
 
 Project layout
 --------------

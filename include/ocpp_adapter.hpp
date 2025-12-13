@@ -112,6 +112,8 @@ private:
     std::map<int, double> profile_current_limit_a_;
     std::map<int, double> profile_power_limit_kw_;
     std::map<int, double> last_energy_wh_;
+    std::map<int, double> last_meter_sent_wh_;
+    std::map<int, std::chrono::steady_clock::time_point> last_meter_sent_time_;
     std::map<int, std::chrono::steady_clock::time_point> cp_fault_since_;
     std::map<std::string, std::chrono::steady_clock::time_point> local_auth_cache_;
     std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
@@ -120,10 +122,12 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
     std::map<int, AuthorizationState> auth_state_cache_;
     std::map<int, int> telemetry_mismatch_count_;
+    std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
+    std::map<int, int> connector_meter_intervals_;
 
     void register_callbacks();
     void start_metering_threads();
-    void metering_loop(std::int32_t connector, int interval_s);
+    void metering_loop(std::int32_t connector);
     std::string make_session_id() const;
     void prepare_security_files() const;
     void seed_default_evse_limits();
@@ -161,6 +165,12 @@ private:
     static std::string token_source_to_string(AuthTokenSource src);
     static AuthTokenSource token_source_from_string(const std::string& s);
     void set_auth_state(std::int32_t connector, AuthorizationState state);
+    ocpp::v16::DataTransferResponse
+    handle_data_transfer_request(const ocpp::v16::DataTransferRequest& request);
+    void handle_configuration_key_change(const ocpp::v16::KeyValue& key_value);
+    bool token_matches_reservation(std::int32_t connector, const std::string& token,
+                                   const std::optional<std::string>& parent_token);
+    int meter_interval_seconds_for_connector(std::int32_t connector);
 };
 
 } // namespace charger
