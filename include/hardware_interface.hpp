@@ -18,6 +18,13 @@ namespace charger {
 
 enum class AuthTokenSource { RFID, Autocharge, RemoteStart };
 
+enum class AuthorizationState {
+    Unknown,
+    Pending,
+    Granted,
+    Denied
+};
+
 struct AuthToken {
     std::string id_token;
     AuthTokenSource source{AuthTokenSource::RFID};
@@ -61,6 +68,8 @@ struct GunStatus {
     bool mc_welded{false};
     double connector_temp_c{0.0};
     std::array<double, 2> module_temp_c{{0.0, 0.0}};
+    uint32_t evse_limit_ack_count{0};
+    std::chrono::steady_clock::time_point last_evse_limit_ack{};
 };
 
 /// \brief Planner dispatch toward hardware (per connector).
@@ -73,6 +82,12 @@ struct PowerCommand {
     double voltage_set_v{0.0};
     double current_limit_a{0.0};
     double power_kw{0.0};
+};
+
+struct EvseLimits {
+    std::optional<double> max_voltage_v;
+    std::optional<double> max_current_a;
+    std::optional<double> max_power_kw;
 };
 
 /// \brief Abstract interface your EVSE controller should implement.
@@ -112,7 +127,15 @@ public:
 
     /// \brief Notify hardware/PLC that authorization has been granted or revoked for the connector.
     /// Implementations that do not need this can keep the default no-op.
-    virtual void set_authorization_state(std::int32_t connector, bool authorized) { (void)connector; (void)authorized; }
+    virtual void set_authorization_state(std::int32_t connector, bool authorized) {
+        set_authorization_state(connector, authorized ? AuthorizationState::Granted : AuthorizationState::Denied);
+    }
+
+    /// \brief Extended authorization state hook that supports Pending/Denied semantics.
+    /// Default implementation falls back to the legacy bool-based hook.
+    virtual void set_authorization_state(std::int32_t connector, AuthorizationState state) {
+        set_authorization_state(connector, state == AuthorizationState::Granted);
+    }
 
     /// \brief Apply computed power allocation (modules, contactors, setpoints) for the connector.
     /// Default fallbacks map to the older apply_power_allocation + enable/disable calls.
@@ -129,6 +152,13 @@ public:
     /// \brief Apply computed power allocation (module count / enable) for the connector.
     /// Implementations may no-op if unsupported.
     virtual void apply_power_allocation(std::int32_t connector, int modules) { (void)connector; (void)modules; }
+
+    /// \brief Publish EVSE-side limits (what the EV should be told via PLC/ISO15118).
+    /// Default is a no-op for hardware that does not support dynamic limit injection.
+    virtual void set_evse_limits(std::int32_t connector, const EvseLimits& limits) {
+        (void)connector;
+        (void)limits;
+    }
 
     /// \brief Drain any auth tokens (RFID/Autocharge/etc.) detected by the hardware since the last poll.
     /// Default implementation returns an empty list.

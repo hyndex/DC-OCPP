@@ -84,6 +84,7 @@ private:
     std::mutex state_mutex_;
     std::mutex plan_mutex_;
     std::mutex meter_mutex_;
+    std::mutex auth_mutex_;
     std::vector<ModuleState> module_states_;
     bool slots_initialized_{false};
     std::map<int, int> last_module_alloc_;
@@ -107,6 +108,7 @@ private:
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
+    std::map<int, AuthorizationState> auth_state_cache_;
 
     void register_callbacks();
     void start_metering_threads();
@@ -130,7 +132,7 @@ private:
     int select_connector_for_token(const AuthToken& token) const;
     std::optional<PendingToken> pop_next_pending_token(std::int32_t connector,
                                                        const std::chrono::steady_clock::time_point& now);
-    bool try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
+    AuthorizationState try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
     std::string clamp_id_token(const std::string& raw) const;
     void persist_pending_tokens();
     void persist_pending_tokens_locked();
@@ -139,6 +141,9 @@ private:
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
     static std::string token_source_to_string(AuthTokenSource src);
     static AuthTokenSource token_source_from_string(const std::string& s);
+    void set_auth_state(std::int32_t connector, AuthorizationState state);
+    ocpp::v16::RemoteStartStopStatus evaluate_remote_start_acceptance(
+        const std::string& id_token, const std::vector<std::int32_t>& referenced_connectors);
 };
 
 } // namespace charger

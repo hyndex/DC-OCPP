@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
 
 #ifdef __linux__
 #include <linux/can.h>
@@ -48,6 +49,9 @@ constexpr uint32_t RFID_EVENT_BASE = 0x180;
 constexpr uint32_t EVCCID_BASE = 0x280;
 constexpr uint32_t EMAID0_BASE = 0x260;
 constexpr uint32_t EMAID1_BASE = 0x270;
+constexpr uint32_t EVMAC_BASE = 0x240;
+constexpr uint32_t EVSE_DC_MAX_LIMITS_CMD_BASE = 0x300;
+constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = 90;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
@@ -56,6 +60,7 @@ constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
 constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
 constexpr std::chrono::seconds SEGMENT_TTL(5);
 constexpr uint8_t CONFIG_PARAM_AUTH_STATE = 20;
+constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = 21;
 
 uint16_t le_u16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -257,6 +262,14 @@ bool fetch_firmware(const std::string& location,
     }
     return true;
 }
+
+uint16_t clamp_to_deciv(double value) {
+    if (value <= 0.0) return 0;
+    const double scaled = std::round(value * 10.0);
+    if (scaled >= 65535.0) return 65535;
+    if (scaled <= 0.0) return 0;
+    return static_cast<uint16_t>(scaled);
+}
 } // namespace
 
 PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8),
@@ -343,6 +356,8 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8)
         f.can_id = emaid0.id; f.can_mask = emaid0.mask; filters.push_back(f);
         const PlcFilterSpec emaid1 = make_plc_rx_filter(EMAID1_BASE, plc_id);
         f.can_id = emaid1.id; f.can_mask = emaid1.mask; filters.push_back(f);
+        const PlcFilterSpec evmac = make_plc_rx_filter(EVMAC_BASE, plc_id);
+        f.can_id = evmac.id; f.can_mask = evmac.mask; filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -424,13 +439,9 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     if (!node) return;
     if (!node->authorization_granted) {
         node->module_mask = 0x00;
-        node->status.target_voltage_v = 0.0;
-        node->status.target_current_a = 0.0;
         send_relay_command(*node, false, true);
         return;
     }
-    node->status.target_voltage_v = cmd.voltage_set_v;
-    node->status.target_current_a = cmd.current_limit_a;
     node->mc_closed_cmd = cmd.mc_closed;
     node->gc_closed_cmd = cmd.gc_closed;
     if (!cmd.mc_closed) {
@@ -445,6 +456,10 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     }
     if (cmd.module_mask & 0x02) {
         mask |= 0x04;
+    }
+    if (cmd.module_mask & 0xFC) {
+        EVLOG_warning << "PLC command module mask uses unsupported bits: 0x" << std::hex
+                      << static_cast<int>(cmd.module_mask) << std::dec << " (only two modules supported by PLC relays)";
     }
     if (cmd.module_count > 0 && cmd.gc_closed) {
         mask |= 0x01;
@@ -726,16 +741,19 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
         st.safety_ok = false;
         st.comm_fault = true;
     }
-    // If PLC did not publish capabilities, fall back to configured hardware limits.
-    if (!st.evse_max_voltage_v && node->cfg.max_voltage_v > 0.0) {
-        st.evse_max_voltage_v = node->cfg.max_voltage_v;
-    }
-    if (!st.evse_max_current_a && node->cfg.max_current_a > 0.0) {
-        st.evse_max_current_a = node->cfg.max_current_a;
-    }
-    if (!st.evse_max_power_kw && node->cfg.max_power_w > 0.0) {
-        st.evse_max_power_kw = node->cfg.max_power_w / 1000.0;
-    }
+    auto choose_limit = [](std::optional<double> telem, double commanded, double cfg) -> std::optional<double> {
+        if (telem && *telem > 0.0) return telem;
+        if (commanded > 0.0) return commanded;
+        if (cfg > 0.0) return cfg;
+        return std::nullopt;
+    };
+
+    st.evse_max_voltage_v = choose_limit(st.evse_max_voltage_v, node->last_limit_voltage_v, node->cfg.max_voltage_v);
+    st.evse_max_current_a = choose_limit(st.evse_max_current_a, node->last_limit_current_a, node->cfg.max_current_a);
+    const double cfg_power_kw = node->cfg.max_power_w > 0.0 ? node->cfg.max_power_w / 1000.0 : 0.0;
+    st.evse_max_power_kw = choose_limit(st.evse_max_power_kw, node->last_limit_power_kw, cfg_power_kw);
+    st.evse_limit_ack_count = node->status.limit_ack_count;
+    st.last_evse_limit_ack = node->status.last_limit_ack;
     uint8_t healthy_mask = node->crc_mode_mismatch ? 0x00 : 0x03; // two modules default healthy
     uint8_t fault_mask = node->crc_mode_mismatch ? 0xFF : 0x00;
     if (!node->crc_mode_mismatch) {
@@ -770,11 +788,17 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
 }
 
 void PlcHardware::set_authorization_state(std::int32_t connector, bool authorized) {
+    set_authorization_state(connector, authorized ? AuthorizationState::Granted : AuthorizationState::Denied);
+}
+
+void PlcHardware::set_authorization_state(std::int32_t connector, AuthorizationState state) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (auto* node = find_node(connector)) {
-        node->authorization_granted = authorized;
+        node->authorization_granted = (state == AuthorizationState::Granted);
         node->status.hlc_power_ready = derive_hlc_power_ready(node->status, node->authorization_granted);
-        send_config_command(*node, CONFIG_PARAM_AUTH_STATE, authorized ? 1U : 0U);
+        send_config_command(*node, CONFIG_PARAM_AUTH_STATE, node->authorization_granted ? 1U : 0U);
+        const bool pending = (state == AuthorizationState::Pending);
+        send_config_command(*node, CONFIG_PARAM_AUTH_PENDING, pending ? 1U : 0U);
     }
 }
 
@@ -783,6 +807,13 @@ std::vector<AuthToken> PlcHardware::poll_auth_tokens() {
     std::vector<AuthToken> tokens;
     tokens.swap(auth_events_);
     return tokens;
+}
+
+void PlcHardware::set_evse_limits(std::int32_t connector, const EvseLimits& limits) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (auto* node = find_node(connector)) {
+        send_evse_limits(*node, limits);
+    }
 }
 
 bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t value) {
@@ -805,6 +836,51 @@ bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t val
     (void)param_id;
     (void)value;
     return false;
+#endif
+}
+
+void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
+#ifdef __linux__
+    const double cfg_v = node.cfg.max_voltage_v > 0.0 ? node.cfg.max_voltage_v : 0.0;
+    const double cfg_i = node.cfg.max_current_a > 0.0 ? node.cfg.max_current_a : 0.0;
+    const double cfg_p = node.cfg.max_power_w > 0.0 ? node.cfg.max_power_w / 1000.0 : 0.0;
+
+    const double v = limits.max_voltage_v.value_or(node.last_limit_voltage_v > 0.0 ? node.last_limit_voltage_v : cfg_v);
+    const double i = limits.max_current_a.value_or(node.last_limit_current_a > 0.0 ? node.last_limit_current_a : cfg_i);
+    const double p = limits.max_power_kw.value_or(node.last_limit_power_kw > 0.0 ? node.last_limit_power_kw : cfg_p);
+
+    uint8_t data[8] = {};
+    const uint16_t v_deciv = clamp_to_deciv(v);
+    const uint16_t i_deciv = clamp_to_deciv(i);
+    const uint16_t p_decik = clamp_to_deciv(p);
+    data[0] = static_cast<uint8_t>(v_deciv & 0xFF);
+    data[1] = static_cast<uint8_t>((v_deciv >> 8) & 0xFF);
+    data[2] = static_cast<uint8_t>(i_deciv & 0xFF);
+    data[3] = static_cast<uint8_t>((i_deciv >> 8) & 0xFF);
+    data[4] = static_cast<uint8_t>(p_decik & 0xFF);
+    data[5] = static_cast<uint8_t>((p_decik >> 8) & 0xFF);
+    data[6] = 0;
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
+    const uint32_t can_id = EVSE_DC_MAX_LIMITS_CMD_BASE | static_cast<uint32_t>(node.cfg.plc_id & 0x0F);
+    const bool ok = send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
+    if (ok) {
+        node.limit_tx_count++;
+        node.last_limit_voltage_v = v_deciv / 10.0;
+        node.last_limit_current_a = i_deciv / 10.0;
+        node.last_limit_power_kw = p_decik / 10.0;
+        node.status.max_voltage_v = node.last_limit_voltage_v;
+        node.status.max_current_a = node.last_limit_current_a;
+        node.status.max_power_kw = node.last_limit_power_kw;
+    } else {
+        node.limit_tx_fail++;
+        EVLOG_warning << "Failed to send EVSE limits to PLC " << node.cfg.plc_id
+                      << " (tx_fail=" << node.limit_tx_fail << ", sent=" << node.limit_tx_count << ")";
+    }
+#else
+    (void)node;
+    (void)limits;
 #endif
 }
 
@@ -972,6 +1048,8 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         handle_rfid_event(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (EVCCID_BASE & PLC_TX_MASK)) {
         handle_identity_segment(*node, node->evccid, AuthTokenSource::Autocharge, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (EVMAC_BASE & PLC_TX_MASK)) {
+        handle_identity_segment(*node, node->evmac, AuthTokenSource::Autocharge, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CONFIG_ACK_BASE & PLC_TX_MASK)) {
         if (len >= 6) {
             const uint8_t param_id = data[0];
@@ -979,6 +1057,10 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
             const uint32_t value = le_u32(&data[2]);
             EVLOG_info << "PLC " << node->cfg.plc_id << " ConfigAck param=" << static_cast<int>(param_id)
                        << " status=" << static_cast<int>(status) << " value=0x" << std::hex << value << std::dec;
+            if (status == 0 && param_id == CONFIG_PARAM_EVSE_LIMIT_ACK) {
+                node->status.limit_ack_count = value;
+                node->status.last_limit_ack = rx_time;
+            }
         }
     }
 }
@@ -1182,6 +1264,7 @@ void PlcHardware::prune_segment_buffers(Node& node, const std::chrono::steady_cl
     prune_single(node.evccid);
     prune_single(node.emaid0);
     prune_single(node.emaid1);
+    prune_single(node.evmac);
 }
 
 void PlcHardware::handle_rfid_event(Node& node, const uint8_t* data, size_t len) {

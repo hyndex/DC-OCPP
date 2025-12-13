@@ -208,6 +208,7 @@ SimulatedHardware::SimulatedHardware(const ChargerConfig& cfg) {
         state.plugged_in = false;
         state.request_power = false;
         state.authorized = false;
+        state.auth_state = AuthorizationState::Unknown;
         state.last_update = now;
         connectors_.emplace(conn_cfg.id, state);
     }
@@ -248,6 +249,7 @@ bool SimulatedHardware::disable(std::int32_t connector) {
     state.charging = false;
     state.request_power = false;
     state.authorized = false;
+    state.auth_state = AuthorizationState::Denied;
     state.lock_engaged = true;
     return true;
 }
@@ -276,6 +278,8 @@ bool SimulatedHardware::stop_transaction(std::int32_t connector, ocpp::v16::Reas
     state.request_power = false;
     state.reserved = false;
     state.reservation_id.reset();
+    state.authorized = false;
+    state.auth_state = AuthorizationState::Unknown;
     return true;
 }
 
@@ -438,9 +442,9 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.hlc_cable_check_ok = ev_connected;
     st.hlc_precharge_active = false;
     st.hlc_charge_complete = false;
-    st.hlc_power_ready = state.authorized && (st.relay_closed || ev_requests_power);
+    st.hlc_power_ready = state.auth_state == AuthorizationState::Granted && (st.relay_closed || ev_requests_power);
     st.lock_engaged = state.lock_engaged || !state.config.require_lock;
-    st.authorization_granted = state.authorized;
+    st.authorization_granted = state.auth_state == AuthorizationState::Granted;
     st.module_healthy_mask = fault && fault->healthy_mask ? *fault->healthy_mask : 0x03;
     st.module_fault_mask = fault && fault->fault_mask ? *fault->fault_mask : 0x00;
     st.gc_welded = fault ? fault->gc_welded : false;
@@ -453,15 +457,16 @@ GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     st.present_power_w = present_power_w;
     st.target_voltage_v = present_voltage;
     st.target_current_a = present_current;
-    if (state.config.max_power_w > 0.0) {
-        st.evse_max_power_kw = state.config.max_power_w / 1000.0;
-    }
-    if (state.config.max_voltage_v > 0.0) {
-        st.evse_max_voltage_v = state.config.max_voltage_v;
-    }
-    if (state.config.max_current_a > 0.0) {
-        st.evse_max_current_a = state.config.max_current_a;
-    }
+    const auto apply_limit = [](std::optional<double> primary, double fallback) -> std::optional<double> {
+        if (primary && *primary > 0.0) return primary;
+        if (fallback > 0.0) return std::optional<double>(fallback);
+        return std::nullopt;
+    };
+    st.evse_max_power_kw = apply_limit(state.evse_limits.max_power_kw, state.config.max_power_w > 0.0
+                                                                    ? state.config.max_power_w / 1000.0
+                                                                    : 0.0);
+    st.evse_max_voltage_v = apply_limit(state.evse_limits.max_voltage_v, state.config.max_voltage_v);
+    st.evse_max_current_a = apply_limit(state.evse_limits.max_current_a, state.config.max_current_a);
     st.module_temp_c = fault ? fault->module_temp_c : std::array<double, 2>{{40.0, 40.0}};
     st.connector_temp_c = fault && fault->connector_temp_c ? *fault->connector_temp_c : 40.0;
     st.estop = fault ? fault->estop : false;
@@ -488,7 +493,8 @@ void SimulatedHardware::apply_power_command(const PowerCommand& cmd) {
     update_energy(state);
     const bool disabled = fault && fault->disabled;
     const bool paused = fault && fault->paused;
-    const bool enable = cmd.module_count > 0 && cmd.gc_closed && !disabled && state.authorized;
+    const bool enable = cmd.module_count > 0 && cmd.gc_closed && !disabled &&
+        state.auth_state == AuthorizationState::Granted;
     state.enabled = enable;
     state.charging = enable && !paused;
     double target_power_w = cmd.power_kw * 1000.0;
@@ -544,12 +550,17 @@ void SimulatedHardware::set_disabled(std::int32_t connector, bool disabled) {
 }
 
 void SimulatedHardware::set_authorization_state(std::int32_t connector, bool authorized) {
+    set_authorization_state(connector, authorized ? AuthorizationState::Granted : AuthorizationState::Denied);
+}
+
+void SimulatedHardware::set_authorization_state(std::int32_t connector, AuthorizationState state) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto& state = get_state(connector);
-    state.authorized = authorized;
-    if (!authorized) {
-        state.charging = false;
-        state.request_power = false;
+    auto& st = get_state(connector);
+    st.auth_state = state;
+    st.authorized = (state == AuthorizationState::Granted);
+    if (state != AuthorizationState::Granted) {
+        st.charging = false;
+        st.request_power = false;
     }
 }
 
@@ -565,6 +576,7 @@ void SimulatedHardware::set_plugged_in(std::int32_t connector, bool plugged, boo
         state.enabled = false;
         state.target_power_w = 0.0;
         state.authorized = false;
+        state.auth_state = AuthorizationState::Unknown;
     }
 }
 
@@ -572,6 +584,12 @@ void SimulatedHardware::set_ev_power_request(std::int32_t connector, bool reques
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = get_state(connector);
     state.request_power = request;
+}
+
+void SimulatedHardware::set_evse_limits(std::int32_t connector, const EvseLimits& limits) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& state = get_state(connector);
+    state.evse_limits = limits;
 }
 
 std::vector<AuthToken> SimulatedHardware::poll_auth_tokens() {

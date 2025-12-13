@@ -163,6 +163,7 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
         paused_evse_[c.id] = false;
         plugged_in_state_[c.id] = false;
         plug_event_time_[c.id] = std::chrono::steady_clock::time_point{};
+        auth_state_cache_[c.id] = AuthorizationState::Unknown;
     }
     load_pending_tokens_from_disk();
     initialize_slots();
@@ -422,6 +423,12 @@ void OcppAdapter::register_callbacks() {
             ingest_auth_tokens({token}, token.received_at);
         });
 
+    charge_point_->register_remote_start_acceptance_callback(
+        [this](const std::string& id_token, const std::vector<std::int32_t>& referenced) {
+            (void)id_token;
+            return evaluate_remote_start_acceptance(id_token, referenced);
+        });
+
     charge_point_->register_reserve_now_callback(
         [this](std::int32_t reservation_id, std::int32_t connector, ocpp::DateTime expiryDate,
                ocpp::CiString<20> idTag, std::optional<ocpp::CiString<20>> parent_id) {
@@ -572,7 +579,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                     if (auto pending = pop_next_pending_token(connector, now)) {
                         try_authorize_with_token(connector, s, *pending);
                     } else {
-                        hardware_->set_authorization_state(connector, false);
+                        set_auth_state(connector, AuthorizationState::Pending);
                     }
                     sessions_[connector] = s;
                     const auto reason = s.authorized ? ocpp::SessionStartedReason::Authorized
@@ -584,6 +591,8 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                     if (!it->second.authorized) {
                         if (auto pending = pop_next_pending_token(connector, now)) {
                             try_authorize_with_token(connector, it->second, *pending);
+                        } else {
+                            set_auth_state(connector, AuthorizationState::Pending);
                         }
                     }
                 }
@@ -591,6 +600,9 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                 if (it != sessions_.end()) {
                     session = it->second;
                     had_session = true;
+                }
+                if (!status.plugged_in && it == sessions_.end()) {
+                    set_auth_state(connector, AuthorizationState::Unknown);
                 }
                 if (pending_changed) {
                     persist_pending_tokens_locked();
@@ -768,6 +780,7 @@ void OcppAdapter::metering_loop(std::int32_t connector, int interval_s) {
                        (now - session.connected_at) > auth_wait_timeout) {
                 EVLOG_warning << "Session on connector " << connector
                               << " timed out waiting for authorization, stopping session";
+                set_auth_state(connector, AuthorizationState::Denied);
                 finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
                 hardware_->disable(connector);
                 had_session = false;
@@ -840,7 +853,7 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
     }
     pending_tokens_.erase(connector);
     persist_pending_tokens_locked();
-    hardware_->set_authorization_state(connector, false);
+    set_auth_state(connector, AuthorizationState::Unknown);
     charge_point_->on_session_stopped(connector, session_id);
     sessions_.erase(it);
 }
@@ -976,10 +989,10 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
     return selected;
 }
 
-bool OcppAdapter::try_authorize_with_token(std::int32_t connector, ActiveSession& session,
-                                           const PendingToken& pending) {
+AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector, ActiveSession& session,
+                                                         const PendingToken& pending) {
     if (session.authorized) {
-        return true;
+        return AuthorizationState::Granted;
     }
     const auto trimmed = clamp_id_token(pending.token.id_token);
     bool accepted = false;
@@ -994,12 +1007,16 @@ bool OcppAdapter::try_authorize_with_token(std::int32_t connector, ActiveSession
         session.id_token = trimmed;
         session.authorized_at = std::chrono::steady_clock::now();
         session.token_source = pending.token.source;
-        hardware_->set_authorization_state(connector, true);
+        set_auth_state(connector, AuthorizationState::Granted);
+        persist_pending_tokens_locked();
+        return AuthorizationState::Granted;
     } else {
-        hardware_->set_authorization_state(connector, false);
+        const bool keep_waiting = (pending.token.source == AuthTokenSource::Autocharge);
+        const auto state = keep_waiting ? AuthorizationState::Pending : AuthorizationState::Denied;
+        set_auth_state(connector, state);
+        persist_pending_tokens_locked();
+        return state;
     }
-    persist_pending_tokens_locked();
-    return accepted;
 }
 
 std::string OcppAdapter::clamp_id_token(const std::string& raw) const {
@@ -1248,6 +1265,15 @@ void OcppAdapter::apply_power_plan() {
             g.fsm_state = GunFsmState::EvDetected;
         } else {
             g.fsm_state = GunFsmState::Idle;
+        }
+        // EVSE limit watchdog: if we have offered limits recently but PLC hasn't ACKed, constrain power.
+        if (st.last_evse_limit_ack.time_since_epoch().count() > 0) {
+            const auto age = now - st.last_evse_limit_ack;
+            if (age > std::chrono::milliseconds(1000) && ready_for_power) {
+                power_constrained_[c.id] = true;
+                EVLOG_warning << "Connector " << c.id << " EVSE limit ACK stale (" << age.count()
+                              << "ms); constraining power";
+            }
         }
         guns.push_back(g);
         gun_lookup[g.id] = g;
@@ -1618,7 +1644,14 @@ void OcppAdapter::apply_power_plan() {
         last_requested_power_kw_[c.id] = dispatch.p_set_kw;
         last_module_alloc_[c.id] = cmd.module_count;
         last_module_mask_cmd_[c.id] = cmd.module_mask;
+        EvseLimits limits{};
+        if (dispatch.voltage_set_v > 0.0) {
+            limits.max_voltage_v = dispatch.voltage_set_v;
+        }
+        limits.max_current_a = cmd.current_limit_a;
+        limits.max_power_kw = cmd.power_kw;
         hardware_->apply_power_command(cmd);
+        hardware_->set_evse_limits(c.id, limits);
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
         last_gc_state_[slot->gc_id] = cmd.gc_closed ? ContactorState::Closed : ContactorState::Open;
 
@@ -1703,6 +1736,11 @@ void OcppAdapter::apply_zero_power_plan() {
         last_module_alloc_[c.id] = 0;
         last_module_mask_cmd_[c.id] = 0;
         hardware_->apply_power_command(cmd);
+        EvseLimits limits{};
+        limits.max_voltage_v = cmd.voltage_set_v;
+        limits.max_current_a = 0.0;
+        limits.max_power_kw = 0.0;
+        hardware_->set_evse_limits(c.id, limits);
         if (charge_point_) {
             charge_point_->on_max_current_offered(c.id, 0);
             charge_point_->on_max_power_offered(c.id, 0);
@@ -1845,6 +1883,65 @@ AuthTokenSource OcppAdapter::token_source_from_string(const std::string& s) {
     if (s == "autocharge") return AuthTokenSource::Autocharge;
     if (s == "remotestart") return AuthTokenSource::RemoteStart;
     return AuthTokenSource::RFID;
+}
+
+void OcppAdapter::set_auth_state(std::int32_t connector, AuthorizationState state) {
+    AuthorizationState prev = AuthorizationState::Unknown;
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        prev = auth_state_cache_[connector];
+        if (prev == state) {
+            return;
+        }
+        auth_state_cache_[connector] = state;
+    }
+    hardware_->set_authorization_state(connector, state);
+}
+
+ocpp::v16::RemoteStartStopStatus
+OcppAdapter::evaluate_remote_start_acceptance(const std::string& /*id_token*/,
+                                              const std::vector<std::int32_t>& referenced_connectors) {
+    std::vector<int> candidates;
+    if (!referenced_connectors.empty()) {
+        for (auto c : referenced_connectors) {
+            if (c > 0) candidates.push_back(static_cast<int>(c));
+        }
+    }
+    if (candidates.empty()) {
+        for (const auto& cfgc : cfg_.connectors) {
+            candidates.push_back(cfgc.id);
+        }
+    }
+    auto is_disabled_or_reserved = [&](int cid) {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        const bool disabled = evse_disabled_.count(cid) ? evse_disabled_[cid] : false;
+        const bool reserved = reserved_connectors_.count(cid) ? reserved_connectors_[cid] : false;
+        return disabled || reserved;
+    };
+    auto is_faulted = [&](int cid) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return connector_faulted_.count(cid) ? connector_faulted_[cid] : false;
+    };
+
+    for (int cid : candidates) {
+        if (is_disabled_or_reserved(cid) || is_faulted(cid)) {
+            continue;
+        }
+        const auto cfg_it = std::find_if(cfg_.connectors.begin(), cfg_.connectors.end(),
+                                         [&](const ConnectorConfig& c) { return c.id == cid; });
+        const bool lock_required = cfg_it != cfg_.connectors.end() ? cfg_it->require_lock : true;
+        const auto st = hardware_->get_status(cid);
+        const bool healthy_modules = (static_cast<uint8_t>(st.module_healthy_mask &
+                                                           static_cast<uint8_t>(~st.module_fault_mask)) != 0);
+        const bool safe = st.safety_ok && !st.estop && !st.earth_fault && !st.comm_fault && !st.cp_fault &&
+            !st.hlc_charge_complete && !st.isolation_fault && !st.overtemp_fault && !st.overcurrent_fault &&
+            !st.meter_stale && !st.gc_welded && !st.mc_welded && healthy_modules;
+        const bool lock_ok = !lock_required || st.lock_engaged;
+        if (st.plugged_in && safe && lock_ok) {
+            return ocpp::v16::RemoteStartStopStatus::Accepted;
+        }
+    }
+    return ocpp::v16::RemoteStartStopStatus::Rejected;
 }
 
 void OcppAdapter::persist_pending_tokens() {

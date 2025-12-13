@@ -40,7 +40,7 @@ int main() {
     sess1.connected_at = now;
     auto pending1 = adapter.pop_next_pending_token(1, now);
     assert(pending1.has_value());
-    assert(adapter.try_authorize_with_token(1, sess1, *pending1));
+    assert(adapter.try_authorize_with_token(1, sess1, *pending1) == AuthorizationState::Granted);
     assert(sess1.authorized);
     assert(sess1.id_token.value() == "REMOTE1");
 
@@ -59,7 +59,7 @@ int main() {
     auto pending2 = adapter.pop_next_pending_token(2, now + std::chrono::seconds(2));
     assert(pending2.has_value());
     assert(pending2->token.id_token == "REMOTE2");
-    assert(adapter.try_authorize_with_token(2, sess2, *pending2));
+    assert(adapter.try_authorize_with_token(2, sess2, *pending2) == AuthorizationState::Granted);
 
     // Autocharge rejected (not prevalidated) then RFID succeeds
     AuthToken autochg;
@@ -75,7 +75,8 @@ int main() {
     auto first = adapter.pop_next_pending_token(1, now + std::chrono::seconds(1));
     assert(first.has_value());
     // Autocharge not prevalidated and no CSMS => reject
-    assert(!adapter.try_authorize_with_token(1, sess3, *first));
+    auto state_auto = adapter.try_authorize_with_token(1, sess3, *first);
+    assert(state_auto == AuthorizationState::Pending);
     assert(!sess3.authorized);
     AuthToken rfid;
     rfid.id_token = "RFIDTAG";
@@ -87,7 +88,7 @@ int main() {
     auto second = adapter.pop_next_pending_token(1, now + std::chrono::seconds(2));
     assert(second.has_value());
     assert(second->token.source == AuthTokenSource::RFID);
-    assert(adapter.try_authorize_with_token(1, sess3, *second));
+    assert(adapter.try_authorize_with_token(1, sess3, *second) == AuthorizationState::Granted);
     assert(sess3.authorized);
 
     // Timeout handling drops expired tokens

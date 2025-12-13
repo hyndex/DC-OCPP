@@ -58,8 +58,10 @@ public:
     ocpp::Measurement sample_meter(std::int32_t connector) override;
     GunStatus get_status(std::int32_t connector) override;
     void set_authorization_state(std::int32_t connector, bool authorized) override;
+    void set_authorization_state(std::int32_t connector, AuthorizationState state) override;
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
+    void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
 
@@ -85,7 +87,9 @@ private:
         bool request_power{false};
         bool lock_engaged{true};
         bool authorized{false};
+        AuthorizationState auth_state{AuthorizationState::Unknown};
         std::chrono::steady_clock::time_point last_update;
+        EvseLimits evse_limits;
     };
 
     std::mutex mutex_;

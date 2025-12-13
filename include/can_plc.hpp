@@ -101,11 +101,13 @@ struct PlcStatus {
     double max_voltage_v{0.0};
     double max_current_a{0.0};
     double max_power_kw{0.0};
+    uint32_t limit_ack_count{0};
+    std::chrono::steady_clock::time_point last_limit_ack{};
     std::chrono::steady_clock::time_point last_meter_rx{};
     std::chrono::steady_clock::time_point last_relay_status{};
     std::chrono::steady_clock::time_point last_safety_status{};
     std::chrono::steady_clock::time_point last_any_rx{};
-};
+  };
 
 /// \brief PLC/CAN-backed implementation of HardwareInterface using the DBC in Ref/Basic/docs/CAN_DBC.dbc.
 class PlcHardware : public HardwareInterface {
@@ -141,9 +143,11 @@ public:
     ocpp::Measurement sample_meter(std::int32_t connector) override;
     GunStatus get_status(std::int32_t connector) override;
     void set_authorization_state(std::int32_t connector, bool authorized) override;
+    void set_authorization_state(std::int32_t connector, AuthorizationState state) override;
     void apply_power_command(const PowerCommand& cmd) override;
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
+    void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
 
 private:
     struct SegmentBuffer {
@@ -188,10 +192,16 @@ private:
         bool crc_mode_mismatch_logged{false};
         bool crc_fault_logged{false};
         bool authorization_granted{false};
+        double last_limit_voltage_v{0.0};
+        double last_limit_current_a{0.0};
+        double last_limit_power_kw{0.0};
+        uint64_t limit_tx_count{0};
+        uint64_t limit_tx_fail{0};
         std::map<uint8_t, SegmentBuffer> rfid_events;
         SegmentBuffer evccid;
         SegmentBuffer emaid0;
         SegmentBuffer emaid1;
+        SegmentBuffer evmac;
     };
 
     std::map<std::int32_t, Node> nodes_; // keyed by connector id; one node per CAN iface (enforced in config)
@@ -225,6 +235,7 @@ private:
     void handle_identity_segment(Node& node, SegmentBuffer& buffer, AuthTokenSource source, const uint8_t* data,
                                  size_t len);
     void prune_segment_buffers(Node& node, const std::chrono::steady_clock::time_point& now);
+    void send_evse_limits(Node& node, const EvseLimits& limits);
     bool send_config_command(Node& node, uint8_t param_id, uint32_t value);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);
