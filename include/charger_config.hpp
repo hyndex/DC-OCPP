@@ -30,6 +30,12 @@ struct ConnectorConfig {
 struct ModuleConfig {
     std::string id;
     std::string mn_id;
+    std::string type;           // e.g. "maxwell-mxr"
+    std::string can_interface;  // optional override for module CAN bus
+    int address{-1};            // module address on the bus (0-63 for Maxwell)
+    int group{0};               // optional module group number
+    double rated_power_kw{0.0}; // optional per-module power rating
+    double rated_current_a{0.0}; // optional per-module current rating
 };
 
 struct SlotMapping {
@@ -63,6 +69,7 @@ struct ChargerConfig {
     bool simulation_mode{false}; // If true, suppress comm faults and run purely simulated hardware
     bool plc_backend_available{false}; // Set at runtime when PLC backend actually initialized
     bool plc_use_crc8{false};
+    bool plc_module_relays_enabled{true}; // Allow PLC module relay control; disable when external module drivers used
     bool require_https_uploads{true};
     double module_power_kw{30.0};
     double grid_limit_kw{1000.0};

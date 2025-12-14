@@ -294,52 +294,44 @@ bool crc_expected(uint32_t can_id) {
 }
 } // namespace
 
-PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8),
-                                                     require_https_uploads_(cfg.require_https_uploads),
-                                                     upload_max_bytes_(cfg.upload_max_bytes),
-                                                     upload_connect_timeout_s_(cfg.upload_connect_timeout_s),
-                                                     upload_transfer_timeout_s_(cfg.upload_transfer_timeout_s),
-                                                     upload_allow_file_targets_(cfg.upload_allow_file_targets) {
-    iface_ = cfg.can_interface.empty() ? "can0" : cfg.can_interface;
-    for (const auto& c : cfg.connectors) {
-        if (plc_to_connector_.count(c.plc_id)) {
-            throw std::runtime_error("Duplicate plc_id " + std::to_string(c.plc_id) + " in PLC driver init");
-        }
-        Node node{};
-        node.cfg = c;
-        node.lock_engaged = !c.require_lock;
-        node.lock_feedback_engaged = !c.require_lock;
-        nodes_.emplace(c.id, node);
-        plc_to_connector_[c.plc_id] = c.id;
-    }
-
+bool PlcHardware::open_socket() {
 #ifdef __linux__
+    if (sock_ >= 0) {
+        ::close(sock_);
+        sock_ = -1;
+    }
     sock_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (sock_ < 0) {
-        throw std::runtime_error("Failed to open CAN socket");
+        EVLOG_error << "Failed to open CAN socket on " << iface_ << ": " << std::strerror(errno);
+        return false;
     }
     struct ifreq ifr {};
     std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface_.c_str());
     if (ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) {
-        close(sock_);
-        throw std::runtime_error("CAN interface not found: " + iface_);
+        EVLOG_error << "CAN interface not found: " << iface_;
+        ::close(sock_);
+        sock_ = -1;
+        return false;
     }
 
     sockaddr_can addr {};
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
     if (bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(sock_);
-        throw std::runtime_error("Failed to bind CAN socket");
+        EVLOG_error << "Failed to bind CAN socket on " << iface_ << ": " << std::strerror(errno);
+        ::close(sock_);
+        sock_ = -1;
+        return false;
     }
 
     const can_err_mask_t err_mask = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED | CAN_ERR_CRTL;
     if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &err_mask, sizeof(err_mask)) < 0) {
-        close(sock_);
-        throw std::runtime_error("Failed to set CAN error filter");
+        EVLOG_error << "Failed to set CAN error filter: " << std::strerror(errno);
+        ::close(sock_);
+        sock_ = -1;
+        return false;
     }
 
-    // Install RX filters for each PLC TX base with specific plc_id nibble (extended frames only)
     std::vector<can_filter> filters;
     for (const auto& kv : plc_to_connector_) {
         const int plc_id = kv.first & 0x0F;
@@ -402,15 +394,70 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg) : use_crc8_(cfg.plc_use_crc8)
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
                        sizeof(can_filter) * filters.size()) < 0) {
-            close(sock_);
-            throw std::runtime_error("Failed to set CAN filters");
+            EVLOG_error << "Failed to set CAN filters: " << std::strerror(errno);
+            ::close(sock_);
+            sock_ = -1;
+            return false;
         }
     }
-
-    running_ = true;
-    rx_thread_ = std::thread([this]() { rx_loop(); });
+    return true;
 #else
-    throw std::runtime_error("CAN PLC driver requires Linux socketcan support");
+    (void)iface_;
+    return false;
+#endif
+}
+
+void PlcHardware::restart_can() {
+#ifdef __linux__
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!running_) return;
+    if (open_socket()) {
+        restart_requested_ = false;
+        EVLOG_warning << "CAN socket reopened on " << iface_;
+    } else {
+        EVLOG_error << "Failed to reopen CAN socket on " << iface_;
+    }
+#endif
+}
+
+void PlcHardware::ingest_can_frame(uint32_t can_id, const uint8_t* data, size_t len) {
+    handle_frame(can_id, data, len);
+}
+
+PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cfg.plc_use_crc8),
+                                                     module_relays_enabled_(cfg.plc_module_relays_enabled),
+                                                     require_https_uploads_(cfg.require_https_uploads),
+                                                     upload_max_bytes_(cfg.upload_max_bytes),
+                                                     upload_connect_timeout_s_(cfg.upload_connect_timeout_s),
+                                                     upload_transfer_timeout_s_(cfg.upload_transfer_timeout_s),
+                                                     upload_allow_file_targets_(cfg.upload_allow_file_targets) {
+    iface_ = cfg.can_interface.empty() ? "can0" : cfg.can_interface;
+    for (const auto& c : cfg.connectors) {
+        if (plc_to_connector_.count(c.plc_id)) {
+            throw std::runtime_error("Duplicate plc_id " + std::to_string(c.plc_id) + " in PLC driver init");
+        }
+        Node node{};
+        node.cfg = c;
+        node.lock_engaged = !c.require_lock;
+        node.lock_feedback_engaged = !c.require_lock;
+        nodes_.emplace(c.id, node);
+        plc_to_connector_[c.plc_id] = c.id;
+    }
+
+#ifdef __linux__
+    if (open_can) {
+        if (!open_socket()) {
+            throw std::runtime_error("Failed to open CAN socket");
+        }
+        running_ = true;
+        rx_thread_ = std::thread([this]() { rx_loop(); });
+    } else {
+        running_ = false;
+    }
+#else
+    if (open_can) {
+        throw std::runtime_error("CAN PLC driver requires Linux socketcan support");
+    }
 #endif
 }
 
@@ -490,16 +537,21 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
         return;
     }
     uint8_t mask = 0x00;
-    // module_mask bit0 -> module0, map to RLY2 (bit1)
-    if (cmd.module_mask & 0x01) {
-        mask |= 0x02;
-    }
-    if (cmd.module_mask & 0x02) {
-        mask |= 0x04;
-    }
-    if (cmd.module_mask & 0xFC) {
-        EVLOG_warning << "PLC command module mask uses unsupported bits: 0x" << std::hex
-                      << static_cast<int>(cmd.module_mask) << std::dec << " (only two modules supported by PLC relays)";
+    if (module_relays_enabled_) {
+        // module_mask bit0 -> module0, map to RLY2 (bit1)
+        if (cmd.module_mask & 0x01) {
+            mask |= 0x02;
+        }
+        if (cmd.module_mask & 0x02) {
+            mask |= 0x04;
+        }
+        if (cmd.module_mask & 0xFC) {
+            EVLOG_warning << "PLC command module mask uses unsupported bits: 0x" << std::hex
+                          << static_cast<int>(cmd.module_mask) << std::dec << " (only two modules supported by PLC relays)";
+        }
+    } else if (!module_relays_disabled_logged_) {
+        EVLOG_info << "PLC module relays disabled by config; ignoring module_mask and driving GC only";
+        module_relays_disabled_logged_ = true;
     }
     if (cmd.module_count > 0 && cmd.gc_closed) {
         mask |= 0x01;
@@ -519,11 +571,16 @@ void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
         return;
     }
     uint8_t mask = 0x00;
-    if (modules >= 1) {
-        mask |= 0x02; // module 1
-    }
-    if (modules >= 2) {
-        mask |= 0x04; // module 2
+    if (module_relays_enabled_) {
+        if (modules >= 1) {
+            mask |= 0x02; // module 1
+        }
+        if (modules >= 2) {
+            mask |= 0x04; // module 2
+        }
+    } else if (!module_relays_disabled_logged_) {
+        EVLOG_info << "PLC module relays disabled by config; ignoring module allocation";
+        module_relays_disabled_logged_ = true;
     }
     // keep gun relay in sync with module availability
     if (modules > 0) {
@@ -1000,6 +1057,14 @@ bool PlcHardware::send_frame(uint32_t can_id, const uint8_t* data, size_t len) {
 void PlcHardware::rx_loop() {
 #ifdef __linux__
     while (running_) {
+        if (restart_requested_) {
+            restart_can();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (sock_ < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         struct can_frame frame {};
         const auto nbytes = read(sock_, &frame, sizeof(frame));
         if (nbytes != sizeof(frame)) {
@@ -1119,6 +1184,11 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
                 node->status.limit_ack_count = value;
                 node->status.last_limit_ack = rx_time;
             }
+        }
+    } else {
+        if (unknown_can_ids_.insert(can_id).second) {
+            EVLOG_debug << "Unhandled PLC CAN frame id=0x" << std::hex << can_id << std::dec
+                        << " len=" << static_cast<int>(len);
         }
     }
 }
@@ -1388,6 +1458,9 @@ void PlcHardware::handle_hw_status(Node& node, const uint8_t* data, size_t len) 
         node.bus_off_logged = false;
     }
     node.status.last_any_rx = std::chrono::steady_clock::now();
+    if (bus_off) {
+        restart_requested_ = true;
+    }
 }
 
 void PlcHardware::handle_debug_info(Node& node, const uint8_t* data, size_t len) {

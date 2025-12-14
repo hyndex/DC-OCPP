@@ -63,6 +63,12 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             ModuleConfig mc;
             mc.id = m.value("id", "");
             mc.mn_id = m.value("mn", "");
+            mc.type = m.value("type", "");
+            mc.can_interface = m.value("canInterface", "");
+            mc.address = m.value("address", -1);
+            mc.group = m.value("group", 0);
+            mc.rated_power_kw = m.value("ratedPowerKW", 0.0);
+            mc.rated_current_a = m.value("ratedCurrentA", 0.0);
             slot.modules.push_back(mc);
         }
     }
@@ -110,6 +116,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", false);
+    cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
     cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
     const auto uploads = json.value("uploads", nlohmann::json::object());
     cfg.upload_max_bytes = uploads.value("maxBytes", cfg.upload_max_bytes);
@@ -252,6 +259,43 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             ModuleConfig m1{"M" + std::to_string(conn.id) + "_1", "MN_" + std::to_string(conn.id) + "_1"};
             sm.modules = {m0, m1};
             cfg.slots.push_back(sm);
+        }
+    }
+
+    // Normalize and validate module metadata for plugin drivers.
+    {
+        std::set<std::tuple<std::string, int, int>> seen_addresses;
+        for (auto& slot : cfg.slots) {
+            for (auto& m : slot.modules) {
+                if (m.can_interface.empty()) {
+                    m.can_interface = cfg.can_interface;
+                }
+                if (m.group < 0) {
+                    m.group = 0;
+                }
+                if (m.group > 60) {
+                    m.group = 60;
+                }
+                if (!m.type.empty()) {
+                    std::transform(m.type.begin(), m.type.end(), m.type.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (m.address < 0 || m.address > 63) {
+                        throw std::runtime_error("Module " + m.id + " has invalid address (expected 0-63)");
+                    }
+                    if (m.rated_power_kw <= 0.0) {
+                        m.rated_power_kw = cfg.module_power_kw;
+                    }
+                    if (m.rated_current_a < 0.0) {
+                        m.rated_current_a = 0.0;
+                    }
+                    const auto key = std::make_tuple(m.can_interface, m.group, m.address);
+                    if (!seen_addresses.insert(key).second) {
+                        throw std::runtime_error("Duplicate module CAN address " + std::to_string(m.address) +
+                                                 " on interface " + m.can_interface + " group " +
+                                                 std::to_string(m.group));
+                    }
+                }
+            }
         }
     }
 

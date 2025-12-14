@@ -371,6 +371,7 @@ add_executable(dc_ocpp
   src/charger_config.cpp
   src/ocpp_adapter.cpp
   src/hardware_sim.cpp
+  src/power_module_controller.cpp
   src/can_plc.cpp
   src/power_manager.cpp
 )
@@ -548,3 +549,25 @@ add_executable(island_manager_tests
 )
 target_include_directories(island_manager_tests PRIVATE include)
 target_link_libraries(island_manager_tests PRIVATE pthread)
+
+add_executable(can_conformance_harness
+  tests/can_conformance_harness.cpp
+  src/charger_config.cpp
+  src/can_plc.cpp
+)
+target_include_directories(can_conformance_harness PRIVATE include)
+target_link_libraries(can_conformance_harness PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_JSON_SCHEMA_DEP}
+  ${_EVSE_SECURITY_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)

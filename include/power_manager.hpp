@@ -30,6 +30,13 @@ struct ModuleState {
     std::string id;
     int slot_id{0};
     std::string mn_id;
+    int slot_index{0};
+    std::string type;
+    std::string can_interface;
+    int address{-1};
+    int group{0};
+    double rated_power_kw{0.0};
+    double rated_current_a{0.0};
     bool healthy{true};
     bool enabled{false};
     double temperature_c{0.0};

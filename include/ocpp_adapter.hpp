@@ -4,6 +4,7 @@
 #include "charger_config.hpp"
 #include "hardware_interface.hpp"
 #include "power_manager.hpp"
+#include "power_module_controller.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -66,6 +67,7 @@ private:
     PlannerConfig planner_cfg_{};
     PowerManager power_manager_;
     std::vector<Slot> slots_;
+    std::unique_ptr<PowerModuleController> module_controller_;
 
     std::atomic<bool> running_{false};
     std::filesystem::path pending_token_store_;

@@ -160,16 +160,22 @@ Configuration notes
 -------------------
 - `configs/charger.json` fields:
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
-  - `plc` block: `useCRC8` (enable host-side CRC8 generation/verification on all PLC frames) and
-    `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles).
-  - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
-    `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
-    `meterSource` (`plc` or `shunt`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
-  - `slots[]` (optional explicit ring topology): `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`, and `modules[]` each with
-    `id` and `mn` contactor id. If omitted, slots/modules are auto-generated per connector.
+- `plc` block: `useCRC8` (enable host-side CRC8 generation/verification on all PLC frames) and
+  `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles), `moduleRelaysEnabled`
+  (drive PLC module relays; set false when external module CAN drivers manage power modules directly).
+- `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
+  `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
+  `meterSource` (`plc` or `shunt`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
+- `slots[]` (optional explicit ring topology): `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`, and `modules[]` each with
+    `id` and `mn` contactor id. Modules can also carry a `type` (e.g. `"maxwell-mxr"`), `address` (0–63),
+    `group`, optional per-module `canInterface`, and optional `ratedPowerKW`/`ratedCurrentA` to drive vendor-specific
+    CAN drivers. If omitted, slots/modules are auto-generated per connector.
   - `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
-    allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
-  - `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
+  allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
+  - Sample config maps 24 Maxwell MXR modules on `can0`, group `0`, addresses `0`–`23` (two per slot).
+  - Module config validation: when `type` is set, `address` must be 0–63 and unique per `canInterface`+`group`; `group`
+    is clamped to 0–60; `ratedPowerKW` defaults to `modulePowerKW` when omitted.
+- `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
 - PLC constraints: unique `plcId` per connector; a single CAN interface is enforced by the host driver.
 
 Planner/allocator overview

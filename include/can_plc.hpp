@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -123,7 +124,7 @@ struct PlcStatus {
 /// \brief PLC/CAN-backed implementation of HardwareInterface using the DBC in Ref/Basic/docs/CAN_DBC.dbc.
 class PlcHardware : public HardwareInterface {
 public:
-    explicit PlcHardware(const ChargerConfig& cfg);
+    explicit PlcHardware(const ChargerConfig& cfg, bool open_can = true);
     ~PlcHardware() override;
 
     bool enable(std::int32_t connector) override;
@@ -159,6 +160,11 @@ public:
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
     void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
+    /// \brief Inject a CAN frame directly (bypasses socket RX) for replay/testing.
+    void ingest_can_frame(uint32_t can_id, const uint8_t* data, size_t len);
+    void ingest_can_frame(uint32_t can_id, const std::vector<uint8_t>& data) {
+        ingest_can_frame(can_id, data.data(), data.size());
+    }
 
 private:
     struct SegmentBuffer {
@@ -221,17 +227,23 @@ private:
     std::map<int, std::int32_t> plc_to_connector_;
     std::string iface_;
     bool use_crc8_{false};
+    bool module_relays_enabled_{true};
     bool require_https_uploads_{true};
     std::size_t upload_max_bytes_{100 * 1024 * 1024};
     int upload_connect_timeout_s_{10};
     int upload_transfer_timeout_s_{60};
     bool upload_allow_file_targets_{true};
     int sock_{-1};
+    std::atomic<bool> restart_requested_{false};
     std::atomic<bool> running_{false};
     std::thread rx_thread_;
     std::mutex mtx_;
     std::vector<AuthToken> auth_events_;
+    std::set<uint32_t> unknown_can_ids_;
+    bool module_relays_disabled_logged_{false};
 
+    bool open_socket();
+    void restart_can();
     void rx_loop();
     void handle_frame(uint32_t can_id, const uint8_t* data, size_t len);
     void handle_relay_status(Node& node, const uint8_t* data, size_t len);

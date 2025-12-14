@@ -267,12 +267,20 @@ void OcppAdapter::initialize_slots() {
             s.mc_id = sm.mc_id.empty() ? "MC_" + std::to_string(sm.id) : sm.mc_id;
             s.cw_id = sm.cw_id;
             s.ccw_id = sm.ccw_id;
+            int mod_idx = 0;
             for (const auto& m : sm.modules) {
                 s.modules.push_back(m.id);
                 ModuleState ms;
                 ms.id = m.id;
                 ms.slot_id = sm.id;
                 ms.mn_id = m.mn_id.empty() ? "MN_" + std::to_string(sm.id) + "_0" : m.mn_id;
+                ms.slot_index = mod_idx++;
+                ms.type = m.type;
+                ms.can_interface = !m.can_interface.empty() ? m.can_interface : cfg_.can_interface;
+                ms.address = m.address;
+                ms.group = m.group;
+                ms.rated_power_kw = m.rated_power_kw;
+                ms.rated_current_a = m.rated_current_a;
                 module_states_.push_back(ms);
             }
             slots.push_back(s);
@@ -295,18 +303,44 @@ void OcppAdapter::initialize_slots() {
             m0.id = s.modules[0];
             m0.slot_id = s.id;
             m0.mn_id = "MN_" + std::to_string(s.id) + "_0";
+            m0.can_interface = cfg_.can_interface;
+            m0.slot_index = 0;
             module_states_.push_back(m0);
 
             ModuleState m1;
             m1.id = s.modules[1];
             m1.slot_id = s.id;
             m1.mn_id = "MN_" + std::to_string(s.id) + "_1";
+            m1.can_interface = cfg_.can_interface;
+            m1.slot_index = 1;
             module_states_.push_back(m1);
         }
     }
 
     slots_ = slots;
     power_manager_.set_slots(slots);
+
+    std::vector<ModuleSpec> module_specs;
+    for (const auto& ms : module_states_) {
+        if (ms.type.empty()) {
+            continue;
+        }
+        ModuleSpec spec;
+        spec.id = ms.id;
+        spec.slot_id = ms.slot_id;
+        spec.slot_index = ms.slot_index;
+        spec.type = ms.type;
+        spec.can_interface = !ms.can_interface.empty() ? ms.can_interface : cfg_.can_interface;
+        spec.address = ms.address;
+        spec.group = ms.group;
+        spec.rated_power_kw = ms.rated_power_kw > 0.0 ? ms.rated_power_kw : cfg_.module_power_kw;
+        spec.rated_current_a = ms.rated_current_a;
+        module_specs.push_back(spec);
+    }
+    if (!module_specs.empty()) {
+        module_controller_ = std::make_unique<PowerModuleController>(module_specs);
+    }
+
     slots_initialized_ = true;
 }
 
@@ -1478,6 +1512,9 @@ bool OcppAdapter::has_active_session(std::int32_t connector) {
 void OcppAdapter::apply_power_plan() {
     std::lock_guard<std::mutex> plan_lock(plan_mutex_);
     const auto now = std::chrono::steady_clock::now();
+    if (module_controller_) {
+        module_controller_->poll();
+    }
     auto enforce_hold = [&](const std::string& id, ContactorState desired,
                             std::map<std::string, ContactorState>& last_state,
                             std::map<std::string, std::chrono::steady_clock::time_point>& last_change,
@@ -1527,6 +1564,16 @@ void OcppAdapter::apply_power_plan() {
     for (const auto& c : cfg_.connectors) {
         GunStatus st = hardware_->get_status(c.id);
         const Slot* slot_for_conn = find_slot_for_gun(c.id);
+        if (module_controller_ && slot_for_conn) {
+            auto snap = module_controller_->snapshot_for_slot(slot_for_conn->id);
+            if (snap.valid) {
+                st.module_healthy_mask = snap.healthy_mask;
+                st.module_fault_mask = snap.fault_mask;
+                for (std::size_t i = 0; i < snap.temperatures_c.size() && i < st.module_temp_c.size(); ++i) {
+                    st.module_temp_c[i] = snap.temperatures_c[i];
+                }
+            }
+        }
         if (safety_trip_needed(st)) {
             trip_global = true;
             if (global_reason.empty()) {
@@ -2083,6 +2130,17 @@ void OcppAdapter::apply_power_plan() {
                     cmd.module_mask = last_module_mask_cmd_[c.id];
                 }
             }
+        }
+
+        if (module_controller_ && slot) {
+            ModuleCommandRequest mreq;
+            mreq.slot_id = slot->id;
+            mreq.mask = slot_mask_cmd;
+            mreq.enable = modules_allowed;
+            mreq.voltage_v = dispatch.voltage_set_v;
+            mreq.current_a = dispatch.current_limit_a;
+            mreq.power_kw = dispatch.p_set_kw;
+            module_controller_->apply_command(mreq);
         }
 
         last_current_limit_a_[c.id] = cmd.current_limit_a;
