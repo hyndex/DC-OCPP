@@ -28,6 +28,7 @@
 
 #include <curl/curl.h>
 #include <everest/logging.hpp>
+#include "can_contract.hpp"
 
 namespace charger {
 
@@ -63,16 +64,19 @@ constexpr uint32_t RTTLOG_BASE = 0x400;
 constexpr uint32_t SOFTWARE_INFO_BASE = 0x110;
 constexpr uint32_t ERROR_CODES_BASE = 0x120;
 constexpr uint32_t HW_CONFIG_BASE = 0x306;
-constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = 90;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
+constexpr std::chrono::milliseconds PROTO_VERSION_RETRY_MS(1000);
 constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
 constexpr std::chrono::seconds SEGMENT_TTL(5);
-constexpr uint8_t CONFIG_PARAM_AUTH_STATE = 20;
-constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = 21;
+constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = can_contract::kConfigParamEvseLimitAck;
+constexpr uint8_t CONFIG_PARAM_PROTO_VERSION = can_contract::kConfigParamProtoVersion;
+constexpr uint32_t CAN_PROTOCOL_VERSION = can_contract::kProtoVersion;
+constexpr uint8_t CONFIG_PARAM_AUTH_STATE = can_contract::kConfigParamAuthState;
+constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = can_contract::kConfigParamAuthPending;
 constexpr std::chrono::milliseconds AUTH_REFRESH_INTERVAL_MS(1000);
 
 uint16_t le_u16(const uint8_t* p) {
@@ -449,6 +453,10 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cf
         nodes_.emplace(c.id, node);
         plc_to_connector_[c.plc_id] = c.id;
     }
+    if (!cfg.plc_use_crc8) {
+        EVLOG_warning << "Ignoring plc_use_crc8=false; enforcing CRC8 on safety-critical PLC frames";
+        use_crc8_ = true;
+    }
     EVLOG_info << "PLC gun relay ownership: " << (gun_relay_owned_by_plc_ ? "PLC" : "controller");
 
 #ifdef __linux__
@@ -667,7 +675,7 @@ ocpp::v16::GetLogResponse PlcHardware::upload_logs(const ocpp::v16::GetLogReques
     return resp;
 }
 
-void PlcHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
+bool PlcHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
     const bool ok = fetch_firmware(request.location, upload_max_bytes_, require_https_uploads_,
                                    upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
     if (!ok) {
@@ -676,6 +684,7 @@ void PlcHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& reques
         EVLOG_info << "PLC firmware downloaded from " << request.location << " scheduled at "
                    << request.retrieveDate.to_rfc3339();
     }
+    return ok;
 }
 
 ocpp::v16::UpdateFirmwareStatusEnumType
@@ -686,14 +695,30 @@ PlcHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest
               : ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
 }
 
-void PlcHardware::set_connection_timeout(std::int32_t /*seconds*/) {
+void PlcHardware::set_connection_timeout(std::int32_t seconds) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    connection_timeout_s_ = std::max<std::int32_t>(0, seconds);
+    EVLOG_info << "Updated PLC connection timeout to " << connection_timeout_s_ << "s";
 }
 
-bool PlcHardware::is_reset_allowed(const ocpp::v16::ResetType& /*reset_type*/) {
-    return true;
+bool PlcHardware::is_reset_allowed(const ocpp::v16::ResetType& reset_type) {
+    // Only soft resets are supported; hard resets require out-of-band control of the host.
+    return reset_type == ocpp::v16::ResetType::Soft;
 }
 
-void PlcHardware::reset(const ocpp::v16::ResetType& /*reset_type*/) {
+void PlcHardware::reset(const ocpp::v16::ResetType& reset_type) {
+    if (reset_type != ocpp::v16::ResetType::Soft) {
+        EVLOG_warning << "Hard reset requested but not supported by PLC backend";
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+    restart_requested_ = true;
+    for (auto& kv : nodes_) {
+        kv.second.awaiting_ack = false;
+        kv.second.mc_closed_cmd = false;
+        kv.second.gc_closed_cmd = false;
+    }
+    EVLOG_info << "Soft reset requested; reopening CAN interface and clearing pending relay commands";
 }
 
 void PlcHardware::on_remote_start_token(const std::string& /*id_token*/,
@@ -731,16 +756,23 @@ ocpp::Measurement PlcHardware::sample_meter(std::int32_t connector) {
     }
 
     const bool meter_ok = !prefer_shunt && meter.ok && !meter.stale;
+    const double fallback_voltage = node->status.present_voltage_v > 0.0 ? node->status.present_voltage_v : meter.voltage_v;
+    const double fallback_current = node->status.present_current_a > 0.0 ? node->status.present_current_a : meter.current_a;
+    double fallback_power_w = node->status.present_power_w;
+    if (fallback_power_w <= 0.0 && fallback_voltage > 0.0 && fallback_current > 0.0) {
+        fallback_power_w = fallback_voltage * fallback_current;
+    }
+
     double energy_wh = node->energy_fallback_Wh;
     const double power_for_energy_raw = meter_ok ? meter.power_w
-        : (prefer_shunt ? meter.power_w : node->status.present_power_w);
+        : (prefer_shunt ? meter.power_w : fallback_power_w);
     if (meter_ok) {
         node->meter_fallback_active = false;
         energy_wh = meter.energy_Wh;
         node->energy_fallback_Wh = energy_wh;
         node->last_energy_update = now;
     } else {
-        node->meter_fallback_active = true;
+        node->meter_fallback_active = (power_for_energy_raw > 0.0);
         if (node->last_energy_update.time_since_epoch().count() == 0) {
             node->last_energy_update = now;
         }
@@ -757,8 +789,8 @@ ocpp::Measurement PlcHardware::sample_meter(std::int32_t connector) {
 
     // Apply calibration scaling
     double power_raw = power_for_energy_raw;
-    if (!meter_ok && !prefer_shunt && node->status.present_power_w > 0.0) {
-        power_raw = node->status.present_power_w;
+    if (!meter_ok && !prefer_shunt && fallback_power_w > 0.0) {
+        power_raw = fallback_power_w;
     }
     const double power_scaled = power_raw * node->cfg.meter_scale;
     const double current_scaled = meter.current_a * node->cfg.meter_scale;
@@ -784,6 +816,7 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     if (!node) return st;
     const auto now = std::chrono::steady_clock::now();
     refresh_authorization_locked(*node, now, false);
+    ensure_protocol_version(*node, now);
     // Timeout detections
     if (node->status.last_relay_status.time_since_epoch().count() &&
         (now - node->status.last_relay_status) > RELAY_TIMEOUT_MS) {
@@ -829,7 +862,10 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.earth_fault = node->status.safety.earth_fault;
     st.comm_fault = node->status.safety.comm_fault;
     st.relay_closed = node->status.relay_closed;
-    st.meter_stale = node->meter_fallback_active || (node->status.meter.stale && !node->meter_fallback_active);
+    const bool fallback_stale = node->meter_fallback_active &&
+        node->last_energy_update.time_since_epoch().count() != 0 &&
+        (std::chrono::duration_cast<std::chrono::milliseconds>(now - node->last_energy_update) > METER_TIMEOUT_MS);
+    st.meter_stale = (!node->meter_fallback_active && node->status.meter.stale) || fallback_stale;
     st.plugged_in = plugged;
     st.cp_fault = cp_stale;
     st.cp_state = node->status.cp.state_char;
@@ -1007,6 +1043,37 @@ bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t val
     (void)param_id;
     (void)value;
     return false;
+#endif
+}
+
+void PlcHardware::ensure_protocol_version(Node& node, const std::chrono::steady_clock::time_point& now) {
+#ifdef __linux__
+    if (sock_ < 0) {
+        return;
+    }
+    if (node.protocol_version_mismatch) {
+        node.status.safety.comm_fault = true;
+        node.status.safety.safety_ok = false;
+        node.status.pending_safety = node.status.safety;
+        node.status.pending_safety_since = now;
+        return;
+    }
+    if (node.protocol_version_ok) {
+        return;
+    }
+    if (node.last_proto_version_sent.time_since_epoch().count() &&
+        (now - node.last_proto_version_sent) < PROTO_VERSION_RETRY_MS) {
+        return;
+    }
+    const bool sent = send_config_command(node, CONFIG_PARAM_PROTO_VERSION, CAN_PROTOCOL_VERSION);
+    node.last_proto_version_sent = now;
+    if (!sent && !node.protocol_version_fault_logged) {
+        EVLOG_warning << "Failed to send protocol version handshake to PLC " << node.cfg.plc_id;
+        node.protocol_version_fault_logged = true;
+    }
+#else
+    (void)node;
+    (void)now;
 #endif
 }
 
@@ -1249,12 +1316,13 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         }
     };
 
+    const bool crc_frame = crc_expected(can_id);
+    if (crc_frame && len != 8) {
+        mark_crc_mismatch("expected CRC8-protected frame with dlc=8");
+        return;
+    }
     // CRC check based on DBC (only specific frames carry CRC).
-    if (use_crc8_ && crc_expected(can_id)) {
-        if (len < 8) {
-            mark_crc_mismatch("expected CRC8 byte but frame shorter than 8 bytes");
-            return;
-        }
+    if (use_crc8_ && crc_frame) {
         const uint8_t expected = plc_crc8(data, 7);
         if (expected != data[7]) {
             mark_crc_fault("CRC8 verification failed");
@@ -1320,6 +1388,26 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
             if (status == 0 && param_id == CONFIG_PARAM_EVSE_LIMIT_ACK) {
                 node->status.limit_ack_count = value;
                 node->status.last_limit_ack = rx_time;
+            } else if (param_id == CONFIG_PARAM_PROTO_VERSION) {
+                if (status == 0 && value == CAN_PROTOCOL_VERSION) {
+                    node->protocol_version_ok = true;
+                    node->protocol_version_mismatch = false;
+                    node->protocol_version_fault_logged = false;
+                    node->last_proto_ack = rx_time;
+                } else {
+                    node->protocol_version_ok = false;
+                    node->protocol_version_mismatch = true;
+                    node->status.safety.comm_fault = true;
+                    node->status.safety.safety_ok = false;
+                    node->status.pending_safety = node->status.safety;
+                    node->status.pending_safety_since = rx_time;
+                    if (!node->protocol_version_fault_logged) {
+                        EVLOG_error << "PLC " << node->cfg.plc_id << " protocol version mismatch: expected "
+                                    << CAN_PROTOCOL_VERSION << " got " << value << " status="
+                                    << static_cast<int>(status);
+                        node->protocol_version_fault_logged = true;
+                    }
+                }
             }
         }
     } else {
@@ -1338,7 +1426,8 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
     s.safety_ok = (data[2] & 0x10) != 0;    // bit20
     s.earth_fault = (data[2] & 0x20) != 0;  // bit21
     s.estop = (data[2] & 0x80) != 0;        // bit23
-    node.status.last_cmd_seq = data[1];
+    node.status.last_cmd_seq_applied = data[1];
+    node.status.last_cmd_seq_received = data[1];
     s.comm_fault = (data[0] & 0x80) != 0;   // bit7
     s.remote_force_off = false;
     const uint8_t fault_reason = data[3];
@@ -1361,7 +1450,7 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
     // Update pending safety to debounce
     node.status.pending_safety = s;
     node.status.pending_safety_since = std::chrono::steady_clock::now();
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }
@@ -1562,15 +1651,16 @@ void PlcHardware::handle_gcmc_status(Node& node, const uint8_t* data, size_t len
     }
     node.status.last_fault_reason = fault_reason;
     node.status.pending_safety = s;
-    node.status.pending_safety_since = std::chrono::steady_clock::now();
-    node.status.last_cmd_seq = last_applied;
-    node.expected_cmd_seq = cmd_seq_rx;
+    const auto now = std::chrono::steady_clock::now();
+    node.status.pending_safety_since = now;
+    node.status.last_cmd_seq_applied = last_applied;
+    node.status.last_cmd_seq_received = cmd_seq_rx;
     node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_rx));
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }
-    node.status.last_any_rx = std::chrono::steady_clock::now();
+    node.status.last_any_rx = now;
     (void)cmd_bits;
 }
 
@@ -1610,9 +1700,10 @@ void PlcHardware::handle_debug_info(Node& node, const uint8_t* data, size_t len)
         node.status.safety.comm_fault = true;
         node.status.safety.safety_ok = false;
     }
-    node.status.last_cmd_seq = last_applied;
+    node.status.last_cmd_seq_applied = last_applied;
+    node.status.last_cmd_seq_received = cmd_seq_tx;
     node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_tx));
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }

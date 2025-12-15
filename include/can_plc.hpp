@@ -82,7 +82,8 @@ struct PlcCpStatus {
 struct PlcStatus {
     bool relay_closed{false};
     bool sys_enabled{false};
-    uint8_t last_cmd_seq{0};
+    uint8_t last_cmd_seq_applied{0};
+    uint8_t last_cmd_seq_received{0};
     uint8_t relay_state_mask{0};
     uint8_t last_fault_reason{0};
     uint8_t hlc_stage{0};
@@ -141,7 +142,7 @@ public:
 
     ocpp::v16::GetLogResponse upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) override;
     ocpp::v16::GetLogResponse upload_logs(const ocpp::v16::GetLogRequest& request) override;
-    void update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) override;
+    bool update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) override;
     ocpp::v16::UpdateFirmwareStatusEnumType
     update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) override;
 
@@ -211,6 +212,9 @@ private:
         bool crc_mode_mismatch{false};
         bool crc_mode_mismatch_logged{false};
         bool crc_fault_logged{false};
+        bool protocol_version_ok{false};
+        bool protocol_version_mismatch{false};
+        bool protocol_version_fault_logged{false};
         bool bus_off_logged{false};
         bool authorization_granted{false};
         uint8_t gcmc_cmd_seq{0};
@@ -226,6 +230,8 @@ private:
         std::chrono::steady_clock::time_point last_fault_update{};
         std::chrono::steady_clock::time_point last_evse_present_tx{};
         std::chrono::steady_clock::time_point last_evse_limits_tx{};
+        std::chrono::steady_clock::time_point last_proto_version_sent{};
+        std::chrono::steady_clock::time_point last_proto_ack{};
         uint64_t present_stale_events{0};
         uint64_t limit_stale_events{0};
         uint64_t relay_conflict_count{0};
@@ -249,6 +255,7 @@ private:
     int upload_connect_timeout_s_{10};
     int upload_transfer_timeout_s_{60};
     bool upload_allow_file_targets_{true};
+    int connection_timeout_s_{0};
     int sock_{-1};
     std::atomic<bool> restart_requested_{false};
     std::atomic<bool> running_{false};
@@ -292,6 +299,7 @@ private:
     void refresh_authorization_locked(Node& node, const std::chrono::steady_clock::time_point& now, bool force);
     void update_fault_bits(Node& node, uint8_t fault_bits, const std::chrono::steady_clock::time_point& now);
     bool send_config_command(Node& node, uint8_t param_id, uint32_t value);
+    void ensure_protocol_version(Node& node, const std::chrono::steady_clock::time_point& now);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);
 #endif

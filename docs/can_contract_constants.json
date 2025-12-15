@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "config_params": {
+    "auth_state": 20,
+    "auth_pending": 21,
+    "lock_cmd": 30,
+    "evse_limit_ack": 90,
+    "proto_version": 91
+  }
+}

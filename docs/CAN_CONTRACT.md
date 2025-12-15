@@ -26,6 +26,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
   - `0x310 + plc_id` EVSE_DC_PRESENT_CMD: EVSE present V/I/P + flags. **Cadence: ≥10 Hz**
     - byte6 bits: b0=output_enabled, b1=regulating, b2..b7=fault_bits[0..5] (see below)
   - `0x330 + plc_id` CONFIG_CMD: runtime config (auth pending/granted etc.)
+    - param 91: PROTO_VERSION (value must equal `1`); PLC returns NOT_ALLOWED on mismatch.
     - param 20: AUTH_STATE (0/1 = denied/granted)
     - param 21: AUTH_PENDING (0/1)
   - `0x340 + plc_id` RELAY_CMD: module/gun relay drive (used only when controller owns GC)
@@ -37,6 +38,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
   - Controller will not set GC bits in `RELAY_CMD` when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
 - Module relays (RLY2/RLY3) may be driven by PLC when `plc.moduleRelaysEnabled=true` else controller/hardware driver manages modules directly.
+- When both RELAY_CMD and mirrored GCMC_CMD are present, PLC gives priority to RELAY_CMD updates received within 50 ms; GCMC_CMD is used only as a legacy fallback when no fresh RELAY_CMD is seen.
 
 ## Fault propagation (controller → PLC)
 
@@ -56,6 +58,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 - EVSE_DC_PRESENT_CMD (`0x310+id`): send every 100 ms nominal; **warn at > presentWarnMs (default 1000 ms)**, controller will flag comm fault and constrain power on staleness.
 - EVSE_DC_MAX_LIMITS_CMD (`0x300+id`): send every 1 s nominal and whenever derates change; **warn at > limitsWarnMs (default 1500 ms)**, controller will constrain power on staleness.
 - PLC must ACK EVSE limits via CONFIG_ACK param 90. Controller will constrain power if ACK is stale (`evseLimitAckTimeoutMs`).
+- PROTO_VERSION (param 91) handshake is mandatory; the controller expects value `1` and treats mismatches as a comm fault. Frames that carry CRC8 must use DLC=8; shorter frames are rejected as CRC mode mismatches.
 - Authorization state must be refreshed by controller every ~1 s; PLC must treat AUTH_PENDING as valid until controller clears it.
 
 ## Identity / Autocharge

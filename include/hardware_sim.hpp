@@ -47,7 +47,7 @@ public:
     bool cancel_reservation(std::int32_t reservation_id) override;
     ocpp::v16::GetLogResponse upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) override;
     ocpp::v16::GetLogResponse upload_logs(const ocpp::v16::GetLogRequest& request) override;
-    void update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) override;
+    bool update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) override;
     ocpp::v16::UpdateFirmwareStatusEnumType
     update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) override;
     void set_connection_timeout(std::int32_t seconds) override;
@@ -102,6 +102,7 @@ private:
     int upload_connect_timeout_s_{10};
     int upload_transfer_timeout_s_{60};
     bool upload_allow_file_targets_{true};
+    int connection_timeout_s_{0};
     std::map<std::int32_t, FaultOverride> fault_overrides_;
     std::vector<AuthToken> auth_events_;
     std::map<std::int32_t, std::optional<GunStatus>> status_override_;

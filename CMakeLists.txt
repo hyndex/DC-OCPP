@@ -449,6 +449,26 @@ add_executable(can_crc_filter_tests
 target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
 target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
 
+add_executable(can_protocol_vectors_tests
+  tests/can_protocol_vectors_tests.cpp
+  src/can_plc.cpp
+)
+target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
+target_link_libraries(can_protocol_vectors_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)
+
 add_executable(auth_flow_tests
   tests/auth_flow_tests.cpp
   src/ocpp_adapter.cpp

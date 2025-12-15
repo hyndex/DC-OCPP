@@ -113,7 +113,7 @@ public:
 
     virtual ocpp::v16::GetLogResponse upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) = 0;
     virtual ocpp::v16::GetLogResponse upload_logs(const ocpp::v16::GetLogRequest& request) = 0;
-    virtual void update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) = 0;
+    virtual bool update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) = 0;
     virtual ocpp::v16::UpdateFirmwareStatusEnumType
     update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) = 0;
 

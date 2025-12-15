@@ -363,7 +363,7 @@ ocpp::v16::GetLogResponse SimulatedHardware::upload_logs(const ocpp::v16::GetLog
     return response;
 }
 
-void SimulatedHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
+bool SimulatedHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
     const bool ok = fetch_firmware(request.location, upload_max_bytes_, require_https_uploads_,
                                    upload_connect_timeout_s_, upload_transfer_timeout_s_, upload_allow_file_targets_);
     if (!ok) {
@@ -372,6 +372,7 @@ void SimulatedHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& 
         EVLOG_info << "Simulated firmware downloaded from " << request.location << " scheduled at "
                    << request.retrieveDate.to_rfc3339();
     }
+    return ok;
 }
 
 ocpp::v16::UpdateFirmwareStatusEnumType
@@ -383,7 +384,9 @@ SimulatedHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareR
 }
 
 void SimulatedHardware::set_connection_timeout(std::int32_t seconds) {
-    EVLOG_debug << "Connection timeout set to " << seconds << " seconds";
+    std::lock_guard<std::mutex> lock(mutex_);
+    connection_timeout_s_ = std::max<std::int32_t>(0, seconds);
+    EVLOG_debug << "Connection timeout set to " << connection_timeout_s_ << " seconds";
 }
 
 bool SimulatedHardware::is_reset_allowed(const ocpp::v16::ResetType& /*reset_type*/) {

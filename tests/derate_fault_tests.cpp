@@ -44,7 +44,7 @@ public:
     bool cancel_reservation(std::int32_t) override { return true; }
     ocpp::v16::GetLogResponse upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest&) override { return {}; }
     ocpp::v16::GetLogResponse upload_logs(const ocpp::v16::GetLogRequest&) override { return {}; }
-    void update_firmware(const ocpp::v16::UpdateFirmwareRequest&) override {}
+    bool update_firmware(const ocpp::v16::UpdateFirmwareRequest&) override { return true; }
     ocpp::v16::UpdateFirmwareStatusEnumType
     update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest&) override {
         return ocpp::v16::UpdateFirmwareStatusEnumType::Accepted;
