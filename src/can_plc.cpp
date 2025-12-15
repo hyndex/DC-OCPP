@@ -51,6 +51,7 @@ constexpr uint32_t EMAID0_BASE = 0x260;
 constexpr uint32_t EMAID1_BASE = 0x270;
 constexpr uint32_t EVMAC_BASE = 0x240;
 constexpr uint32_t EVSE_DC_MAX_LIMITS_CMD_BASE = 0x300;
+constexpr uint32_t EVSE_DC_PRESENT_CMD_BASE = 0x310;
 constexpr uint32_t GCMC_STATUS_BASE = 0x150;
 constexpr uint32_t HW_STATUS_BASE = 0x130;
 constexpr uint32_t DEBUG_INFO_BASE = 0x1B0;
@@ -72,6 +73,7 @@ constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
 constexpr std::chrono::seconds SEGMENT_TTL(5);
 constexpr uint8_t CONFIG_PARAM_AUTH_STATE = 20;
 constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = 21;
+constexpr std::chrono::milliseconds AUTH_REFRESH_INTERVAL_MS(1000);
 
 uint16_t le_u16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -426,6 +428,9 @@ void PlcHardware::ingest_can_frame(uint32_t can_id, const uint8_t* data, size_t 
 
 PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cfg.plc_use_crc8),
                                                      module_relays_enabled_(cfg.plc_module_relays_enabled),
+                                                     gun_relay_owned_by_plc_(cfg.plc_owns_gun_relay),
+                                                     present_warn_ms_(cfg.plc_present_warn_ms),
+                                                     limits_warn_ms_(cfg.plc_limits_warn_ms),
                                                      require_https_uploads_(cfg.require_https_uploads),
                                                      upload_max_bytes_(cfg.upload_max_bytes),
                                                      upload_connect_timeout_s_(cfg.upload_connect_timeout_s),
@@ -440,9 +445,11 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cf
         node.cfg = c;
         node.lock_engaged = !c.require_lock;
         node.lock_feedback_engaged = !c.require_lock;
+        node.module_mask = 0x00;
         nodes_.emplace(c.id, node);
         plc_to_connector_[c.plc_id] = c.id;
     }
+    EVLOG_info << "PLC gun relay ownership: " << (gun_relay_owned_by_plc_ ? "PLC" : "controller");
 
 #ifdef __linux__
     if (open_can) {
@@ -525,12 +532,15 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
     auto* node = find_node(cmd.connector);
     if (!node) return;
     if (!node->authorization_granted) {
+        node->mc_closed_cmd = false;
+        node->gc_closed_cmd = false;
         node->module_mask = 0x00;
         send_relay_command(*node, false, true);
         return;
     }
     node->mc_closed_cmd = cmd.mc_closed;
     node->gc_closed_cmd = cmd.gc_closed;
+    const bool gc_cmd_allowed = !gun_relay_owned_by_plc_;
     if (!cmd.mc_closed) {
         node->module_mask = 0x00;
         send_relay_command(*node, false, true);
@@ -550,15 +560,17 @@ void PlcHardware::apply_power_command(const PowerCommand& cmd) {
                           << static_cast<int>(cmd.module_mask) << std::dec << " (only two modules supported by PLC relays)";
         }
     } else if (!module_relays_disabled_logged_) {
-        EVLOG_info << "PLC module relays disabled by config; ignoring module_mask and driving GC only";
+        EVLOG_info << "PLC module relays disabled by config; ignoring module_mask updates";
         module_relays_disabled_logged_ = true;
     }
-    if (cmd.module_count > 0 && cmd.gc_closed) {
+    if (gc_cmd_allowed && cmd.module_count > 0 && cmd.gc_closed) {
         mask |= 0x01;
     }
     node->module_mask = mask;
     const bool any_relay_cmd = (mask & 0x07) != 0;
-    send_relay_command(*node, any_relay_cmd, !any_relay_cmd);
+    const bool expect_plc_gc = gun_relay_owned_by_plc_ && cmd.module_count > 0 && cmd.gc_closed;
+    const bool force_all_off = !any_relay_cmd && !expect_plc_gc;
+    send_relay_command(*node, any_relay_cmd, force_all_off);
 }
 
 void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
@@ -566,10 +578,13 @@ void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
     auto* node = find_node(connector);
     if (!node) return;
     if (!node->authorization_granted) {
+        node->mc_closed_cmd = false;
+        node->gc_closed_cmd = false;
         node->module_mask = 0x00;
         send_relay_command(*node, false, true);
         return;
     }
+    const bool gc_cmd_allowed = !gun_relay_owned_by_plc_;
     uint8_t mask = 0x00;
     if (module_relays_enabled_) {
         if (modules >= 1) {
@@ -583,12 +598,14 @@ void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
         module_relays_disabled_logged_ = true;
     }
     // keep gun relay in sync with module availability
-    if (modules > 0) {
+    if (gc_cmd_allowed && modules > 0) {
         mask |= 0x01;
     }
     node->module_mask = mask;
-    const bool close = modules > 0;
-    send_relay_command(*node, close, !close);
+    const bool close = (mask & 0x07) != 0;
+    const bool expect_plc_gc = gun_relay_owned_by_plc_ && modules > 0;
+    const bool force_all_off = !close && !expect_plc_gc;
+    send_relay_command(*node, close, force_all_off);
 }
 
 ocpp::v16::UnlockStatus PlcHardware::unlock(std::int32_t /*connector*/) {
@@ -766,6 +783,7 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     auto* node = find_node(connector);
     if (!node) return st;
     const auto now = std::chrono::steady_clock::now();
+    refresh_authorization_locked(*node, now, false);
     // Timeout detections
     if (node->status.last_relay_status.time_since_epoch().count() &&
         (now - node->status.last_relay_status) > RELAY_TIMEOUT_MS) {
@@ -851,16 +869,22 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     st.evse_max_power_kw = choose_limit(st.evse_max_power_kw, node->last_limit_power_kw, cfg_power_kw);
     st.evse_limit_ack_count = node->status.limit_ack_count;
     st.last_evse_limit_ack = node->status.last_limit_ack;
+    st.present_stale_events = node->present_stale_events;
+    st.limit_stale_events = node->limit_stale_events;
+    st.auth_push_count = node->auth_push_count;
     st.last_telemetry = node->status.last_any_rx;
     uint8_t healthy_mask = node->crc_mode_mismatch ? 0x00 : 0x03; // two modules default healthy
     uint8_t fault_mask = node->crc_mode_mismatch ? 0xFF : 0x00;
     if (!node->crc_mode_mismatch) {
         const uint8_t commanded_mask = node->module_mask & 0x06;
         const uint8_t actual_mask = node->status.relay_state_mask & 0x06;
-        const bool gun_cmd = (node->module_mask & 0x01) != 0;
+        const bool gun_cmd = gun_relay_owned_by_plc_
+                                 ? node->gc_closed_cmd
+                                 : ((node->module_mask & 0x01) != 0);
         const bool gun_actual = (node->status.relay_state_mask & 0x01) != 0;
-        st.gc_welded = (!gun_cmd && gun_actual);
+        st.gc_welded = (!gun_relay_owned_by_plc_ && !gun_cmd && gun_actual);
         st.mc_welded = false;
+        bool relay_conflict = false;
         if (st.comm_fault || !st.safety_ok || node->status.safety.remote_force_off) {
             healthy_mask = 0x00;
         } else {
@@ -871,17 +895,26 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
                 if (commanded_on && !actual_on) {
                     healthy_mask &= static_cast<uint8_t>(~(1U << idx));
                     fault_mask |= static_cast<uint8_t>(1U << idx);
+                    relay_conflict = true;
                 } else if (!commanded_on && actual_on) {
                     st.mc_welded = true;
                     healthy_mask &= static_cast<uint8_t>(~(1U << idx));
                     fault_mask |= static_cast<uint8_t>(1U << idx);
+                    relay_conflict = true;
                 }
             }
+        }
+        if (relay_conflict) {
+            node->relay_conflict_count++;
         }
     }
     st.relay_closed = st.relay_closed && !node->crc_mode_mismatch;
     st.module_healthy_mask = healthy_mask;
     st.module_fault_mask = fault_mask;
+    st.present_stale_events = node->present_stale_events;
+    st.limit_stale_events = node->limit_stale_events;
+    st.auth_push_count = node->auth_push_count;
+    st.relay_conflict_count = node->relay_conflict_count;
     return st;
 }
 
@@ -892,11 +925,11 @@ void PlcHardware::set_authorization_state(std::int32_t connector, bool authorize
 void PlcHardware::set_authorization_state(std::int32_t connector, AuthorizationState state) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (auto* node = find_node(connector)) {
+        node->authorization_state = state;
         node->authorization_granted = (state == AuthorizationState::Granted);
         node->status.hlc_power_ready = derive_hlc_power_ready(node->status, node->authorization_granted);
-        send_config_command(*node, CONFIG_PARAM_AUTH_STATE, node->authorization_granted ? 1U : 0U);
-        const bool pending = (state == AuthorizationState::Pending);
-        send_config_command(*node, CONFIG_PARAM_AUTH_PENDING, pending ? 1U : 0U);
+        const auto now = std::chrono::steady_clock::now();
+        refresh_authorization_locked(*node, now, true);
     }
 }
 
@@ -912,6 +945,46 @@ void PlcHardware::set_evse_limits(std::int32_t connector, const EvseLimits& limi
     if (auto* node = find_node(connector)) {
         send_evse_limits(*node, limits);
     }
+}
+
+void PlcHardware::publish_evse_present(std::int32_t connector, double voltage_v, double current_a,
+                                       double power_kw, bool output_enabled, bool regulating) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (auto* node = find_node(connector)) {
+        send_evse_present(*node, voltage_v, current_a, power_kw, output_enabled, regulating);
+    }
+}
+
+void PlcHardware::publish_fault_state(std::int32_t connector, uint8_t fault_bits) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (auto* node = find_node(connector)) {
+        const auto now = std::chrono::steady_clock::now();
+        update_fault_bits(*node, fault_bits, now);
+    }
+}
+
+void PlcHardware::update_fault_bits(Node& node, uint8_t fault_bits,
+                                    const std::chrono::steady_clock::time_point& now) {
+    node.fault_bits = static_cast<uint8_t>(fault_bits & 0x3F); // 6 bits packed into EVSE_PRESENT flags
+    node.last_fault_update = now;
+}
+
+void PlcHardware::refresh_authorization_locked(Node& node,
+                                               const std::chrono::steady_clock::time_point& now,
+                                               bool force) {
+    if (node.authorization_state == AuthorizationState::Unknown) {
+        return;
+    }
+    if (!force && node.last_auth_push.time_since_epoch().count() &&
+        (now - node.last_auth_push) < AUTH_REFRESH_INTERVAL_MS) {
+        return;
+    }
+    const bool granted = node.authorization_state == AuthorizationState::Granted;
+    const bool pending = node.authorization_state == AuthorizationState::Pending;
+    send_config_command(node, CONFIG_PARAM_AUTH_STATE, granted ? 1U : 0U);
+    send_config_command(node, CONFIG_PARAM_AUTH_PENDING, pending ? 1U : 0U);
+    node.last_auth_push = now;
+    node.auth_push_count++;
 }
 
 bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t value) {
@@ -939,6 +1012,7 @@ bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t val
 
 void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
 #ifdef __linux__
+    const auto now = std::chrono::steady_clock::now();
     const double cfg_v = node.cfg.max_voltage_v > 0.0 ? node.cfg.max_voltage_v : 0.0;
     const double cfg_i = node.cfg.max_current_a > 0.0 ? node.cfg.max_current_a : 0.0;
     const double cfg_p = node.cfg.max_power_w > 0.0 ? node.cfg.max_power_w / 1000.0 : 0.0;
@@ -958,6 +1032,9 @@ void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
     data[4] = static_cast<uint8_t>(p_decik & 0xFF);
     data[5] = static_cast<uint8_t>((p_decik >> 8) & 0xFF);
     data[6] = 0;
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
     const uint32_t can_id = EVSE_DC_MAX_LIMITS_CMD_BASE | static_cast<uint32_t>(node.cfg.plc_id & 0x0F);
     const bool ok = send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
     if (ok) {
@@ -968,6 +1045,17 @@ void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
         node.status.max_voltage_v = node.last_limit_voltage_v;
         node.status.max_current_a = node.last_limit_current_a;
         node.status.max_power_kw = node.last_limit_power_kw;
+        if (node.last_evse_limits_tx.time_since_epoch().count()) {
+            const auto gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - node.last_evse_limits_tx).count();
+            if (gap_ms > limits_warn_ms_) {
+                node.limit_stale_events++;
+                if (!cadence_warn_logged_) {
+                    EVLOG_warning << "EVSE limit publish gap " << gap_ms << "ms to PLC " << node.cfg.plc_id;
+                    cadence_warn_logged_ = true;
+                }
+            }
+        }
+        node.last_evse_limits_tx = now;
     } else {
         node.limit_tx_fail++;
         EVLOG_warning << "Failed to send EVSE limits to PLC " << node.cfg.plc_id
@@ -976,6 +1064,55 @@ void PlcHardware::send_evse_limits(Node& node, const EvseLimits& limits) {
 #else
     (void)node;
     (void)limits;
+#endif
+}
+
+void PlcHardware::send_evse_present(Node& node, double voltage_v, double current_a, double power_kw,
+                                    bool output_enabled, bool regulating) {
+#ifdef __linux__
+    const auto now = std::chrono::steady_clock::now();
+    uint8_t data[8] = {};
+    const uint16_t v_deciv = clamp_to_deciv(voltage_v);
+    const uint16_t i_deciv = clamp_to_deciv(current_a);
+    const uint16_t p_decik = clamp_to_deciv(power_kw);
+    data[0] = static_cast<uint8_t>(v_deciv & 0xFF);
+    data[1] = static_cast<uint8_t>((v_deciv >> 8) & 0xFF);
+    data[2] = static_cast<uint8_t>(i_deciv & 0xFF);
+    data[3] = static_cast<uint8_t>((i_deciv >> 8) & 0xFF);
+    data[4] = static_cast<uint8_t>(p_decik & 0xFF);
+    data[5] = static_cast<uint8_t>((p_decik >> 8) & 0xFF);
+    uint8_t flags = 0;
+    if (output_enabled) flags |= 0x01;
+    if (regulating) flags |= 0x02;
+    const uint8_t faults = static_cast<uint8_t>(node.fault_bits & 0x3F);
+    flags |= static_cast<uint8_t>(faults << 2);
+    data[6] = flags;
+    if (use_crc8_) {
+        data[7] = plc_crc8(data, 7);
+    }
+    const uint32_t can_id = EVSE_DC_PRESENT_CMD_BASE | static_cast<uint32_t>(node.cfg.plc_id & 0x0F);
+    (void)send_frame(can_id | CAN_EFF_FLAG, data, sizeof(data));
+    node.status.present_voltage_v = voltage_v;
+    node.status.present_current_a = current_a;
+    node.status.present_power_w = power_kw * 1000.0;
+    if (node.last_evse_present_tx.time_since_epoch().count()) {
+        const auto gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - node.last_evse_present_tx).count();
+        if (gap_ms > present_warn_ms_) {
+            node.present_stale_events++;
+            if (!cadence_warn_logged_) {
+                EVLOG_warning << "EVSE present publish gap " << gap_ms << "ms to PLC " << node.cfg.plc_id;
+                cadence_warn_logged_ = true;
+            }
+        }
+    }
+    node.last_evse_present_tx = now;
+#else
+    (void)node;
+    (void)voltage_v;
+    (void)current_a;
+    (void)power_kw;
+    (void)output_enabled;
+    (void)regulating;
 #endif
 }
 

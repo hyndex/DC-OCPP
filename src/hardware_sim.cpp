@@ -425,6 +425,9 @@ ocpp::Measurement SimulatedHardware::sample_meter(std::int32_t connector) {
 
 GunStatus SimulatedHardware::get_status(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (status_override_.count(connector) && status_override_[connector].has_value()) {
+        return status_override_[connector].value();
+    }
     auto& state = get_state(connector);
     const auto fault_it = fault_overrides_.find(connector);
     const FaultOverride* fault = fault_it != fault_overrides_.end() ? &fault_it->second : nullptr;
@@ -593,6 +596,11 @@ void SimulatedHardware::set_evse_limits(std::int32_t connector, const EvseLimits
     state.evse_limits = limits;
 }
 
+void SimulatedHardware::publish_fault_state(std::int32_t connector, uint8_t fault_bits) {
+    (void)connector;
+    (void)fault_bits;
+}
+
 std::vector<AuthToken> SimulatedHardware::poll_auth_tokens() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<AuthToken> tokens;
@@ -605,6 +613,16 @@ void SimulatedHardware::inject_auth_token(const AuthToken& token) {
     AuthToken t = token;
     t.received_at = std::chrono::steady_clock::now();
     auth_events_.push_back(std::move(t));
+}
+
+void SimulatedHardware::set_status_override(std::int32_t connector, const GunStatus& status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_override_[connector] = status;
+}
+
+void SimulatedHardware::clear_status_override(std::int32_t connector) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_override_.erase(connector);
 }
 
 bool SimulatedHardware::supports_cross_slot_islands() const {

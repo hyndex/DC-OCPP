@@ -62,6 +62,7 @@ public:
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
     void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
+    void publish_fault_state(std::int32_t connector, uint8_t fault_bits) override;
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
 
@@ -73,6 +74,8 @@ public:
     void set_plugged_in(std::int32_t connector, bool plugged, bool lock_engaged = true);
     void set_ev_power_request(std::int32_t connector, bool request);
     void inject_auth_token(const AuthToken& token);
+    void set_status_override(std::int32_t connector, const GunStatus& status);
+    void clear_status_override(std::int32_t connector);
 
 private:
     struct ConnectorState {
@@ -101,6 +104,7 @@ private:
     bool upload_allow_file_targets_{true};
     std::map<std::int32_t, FaultOverride> fault_overrides_;
     std::vector<AuthToken> auth_events_;
+    std::map<std::int32_t, std::optional<GunStatus>> status_override_;
 
     ConnectorState& get_state(std::int32_t connector);
     void update_energy(ConnectorState& state);

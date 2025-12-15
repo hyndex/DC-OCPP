@@ -281,6 +281,8 @@ void OcppAdapter::initialize_slots() {
                 ms.group = m.group;
                 ms.rated_power_kw = m.rated_power_kw;
                 ms.rated_current_a = m.rated_current_a;
+                ms.poll_interval_ms = m.poll_interval_ms;
+                ms.cmd_interval_ms = m.cmd_interval_ms;
                 module_states_.push_back(ms);
             }
             slots.push_back(s);
@@ -335,6 +337,8 @@ void OcppAdapter::initialize_slots() {
         spec.group = ms.group;
         spec.rated_power_kw = ms.rated_power_kw > 0.0 ? ms.rated_power_kw : cfg_.module_power_kw;
         spec.rated_current_a = ms.rated_current_a;
+        spec.poll_interval_ms = ms.poll_interval_ms;
+        spec.cmd_interval_ms = ms.cmd_interval_ms;
         module_specs.push_back(spec);
     }
     if (!module_specs.empty()) {
@@ -1563,6 +1567,29 @@ void OcppAdapter::apply_power_plan() {
 
     for (const auto& c : cfg_.connectors) {
         GunStatus st = hardware_->get_status(c.id);
+        const uint64_t prev_present_stale = last_present_stale_counts_[c.id];
+        const uint64_t prev_limit_stale = last_limit_stale_counts_[c.id];
+        if (st.present_stale_events > prev_present_stale) {
+            EVLOG_warning << "Connector " << c.id << " EVSE_PRESENT cadence stale events observed ("
+                          << st.present_stale_events << "); treating as comm fault";
+            st.comm_fault = true;
+            power_constrained_[c.id] = true;
+            last_present_stale_counts_[c.id] = st.present_stale_events;
+        }
+        if (st.limit_stale_events > prev_limit_stale) {
+            EVLOG_warning << "Connector " << c.id << " EVSE_LIMIT cadence stale events observed ("
+                          << st.limit_stale_events << "); constraining power";
+            power_constrained_[c.id] = true;
+            last_limit_stale_counts_[c.id] = st.limit_stale_events;
+        }
+        static std::map<int, uint64_t> last_relay_conflict;
+        const uint64_t prev_relay_conflict = last_relay_conflict[c.id];
+        if (st.relay_conflict_count > prev_relay_conflict) {
+            last_relay_conflict[c.id] = st.relay_conflict_count;
+            EVLOG_error << "Connector " << c.id << " relay conflict/weld detected; halting charging";
+            st.comm_fault = true;
+            power_constrained_[c.id] = true;
+        }
         const Slot* slot_for_conn = find_slot_for_gun(c.id);
         if (module_controller_ && slot_for_conn) {
             auto snap = module_controller_->snapshot_for_slot(slot_for_conn->id);
@@ -1666,6 +1693,27 @@ void OcppAdapter::apply_power_plan() {
                                : (last_power_w_[c.id] > 0 ? last_power_w_[c.id] / 1000.0 : 0.0);
         if (st.present_power_w) {
             last_power_w_[c.id] = st.present_power_w.value();
+        }
+        const bool welded = st.gc_welded || st.mc_welded;
+        const bool isolation_fault = st.isolation_fault || st.earth_fault || st.estop;
+        const bool comm_fault = st.comm_fault;
+        const bool thermal_fault = st.overtemp_fault;
+        const bool overcurrent_fault = st.overcurrent_fault;
+        const bool general_fault = !st.safety_ok || st.cp_fault || st.meter_stale || welded || isolation_fault ||
+                                   thermal_fault || overcurrent_fault || comm_fault;
+        uint8_t fault_bits = 0;
+        if (general_fault) fault_bits |= 0x01;
+        if (comm_fault) fault_bits |= 0x02;
+        if (isolation_fault) fault_bits |= 0x04;
+        if (thermal_fault) fault_bits |= 0x08;
+        if (overcurrent_fault) fault_bits |= 0x10;
+        if (welded) fault_bits |= 0x20;
+        if (hardware_) {
+            const bool output_enabled = st.relay_closed;
+            const bool regulating = power_ready;
+            hardware_->publish_fault_state(c.id, fault_bits);
+            hardware_->publish_evse_present(c.id, measured_v, measured_i, measured_power_kw, output_enabled,
+                                            regulating);
         }
 
         const uint8_t healthy_mask = st.module_healthy_mask;
@@ -2158,7 +2206,7 @@ void OcppAdapter::apply_power_plan() {
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
         last_gc_state_[slot->gc_id] = cmd.gc_closed ? ContactorState::Closed : ContactorState::Open;
 
-        if (is_home) {
+        if (is_home && charge_point_) {
             charge_point_->on_max_current_offered(c.id, static_cast<std::int32_t>(std::round(cmd.current_limit_a)));
             charge_point_->on_max_power_offered(
                 c.id, static_cast<std::int32_t>(std::round(cmd.power_kw * 1000.0)));

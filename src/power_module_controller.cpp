@@ -61,8 +61,31 @@ struct ModuleTelemetryState {
     double voltage_v{0.0};
     double current_a{0.0};
     uint32_t alarms{0};
+    uint8_t healthy_mask{0};
+    uint8_t fault_mask{0};
     std::chrono::steady_clock::time_point last_update{};
 };
+
+void map_maxwell_alarms(uint32_t alarms, uint8_t& healthy_mask, uint8_t& fault_mask) {
+    if (alarms == 0) {
+        healthy_mask = 0x03;
+        fault_mask = 0x00;
+        return;
+    }
+    // Severe faults that should mark modules unusable
+    constexpr uint32_t SEVERE_MASK =
+        (1u << 0) |  (1u << 1) |  (1u << 3) |  (1u << 4) |  (1u << 5) |
+        (1u << 7) |  (1u << 8) |  (1u << 9) |  (1u << 14) | (1u << 16) |
+        (1u << 17) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 30) |
+        (1u << 31);
+    if ((alarms & SEVERE_MASK) != 0) {
+        healthy_mask = 0x00;
+        fault_mask = 0x03; // both modules in slot
+    } else {
+        healthy_mask = 0x03;
+        fault_mask = 0x00;
+    }
+}
 
 int popcount(uint8_t v) {
     int count = 0;
@@ -199,11 +222,12 @@ public:
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
+        const auto cmd_interval = std::chrono::milliseconds(std::max(100, spec_.cmd_interval_ms));
         const bool state_change = (sp.enable != last_sent_.enable) ||
                                   (std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5) ||
                                   (std::fabs(sp.current_a - last_sent_.current_a) > 0.5) ||
                                   (std::fabs(sp.power_kw - last_sent_.power_kw) > 0.5);
-        const bool periodic = (now - last_tx_) >= MAXWELL_PERIODIC_TX;
+        const bool periodic = (now - last_tx_) >= cmd_interval;
         if (!state_change && !periodic) {
             return;
         }
@@ -218,25 +242,26 @@ public:
                                    ? static_cast<float>(std::clamp(sp.current_a / rated_current, 0.0, 1.0))
                                    : 1.0f;
             send_set_float(0x0022, frac);
-            if (spec_.rated_power_kw > 0.0 && sp.power_kw > 0.0) {
-                const float p_frac =
-                    static_cast<float>(std::clamp(sp.power_kw / spec_.rated_power_kw, 0.0, 1.0));
-                send_set_float(0x0020, p_frac);
-            }
-            send_set_int(0x0030, 0x00000000); // startup
-        } else {
-            send_set_int(0x0030, 0x00010000); // shutdown
+        if (spec_.rated_power_kw > 0.0 && sp.power_kw > 0.0) {
+            const float p_frac =
+                static_cast<float>(std::clamp(sp.power_kw / spec_.rated_power_kw, 0.0, 1.0));
+            send_set_float(0x0020, p_frac);
         }
-        last_sent_ = sp;
-        last_tx_ = now;
+        send_set_int(0x0030, 0x00000000); // startup
+    } else {
+        send_set_int(0x0030, 0x00010000); // shutdown
     }
+    last_sent_ = sp;
+    last_tx_ = now;
+}
 
     void poll() override {
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        if ((now - last_poll_) >= MAXWELL_POLL_PERIOD) {
+        const auto poll_interval = std::chrono::milliseconds(std::max(100, spec_.poll_interval_ms));
+        if (!spec_.broadcast && (now - last_poll_) >= poll_interval) {
             send_read(0x0001); // voltage
             send_read(0x0002); // current
             send_read(0x0004); // DC board temperature
@@ -254,7 +279,16 @@ private:
         uint32_t id = 0;
         id |= (static_cast<uint32_t>(MAXWELL_PROT_NO & 0x1FF) << 20);
         id |= (1U << 19); // PTP
-        id |= (static_cast<uint32_t>(spec_.address & 0xFF) << 11);
+        uint32_t dst = static_cast<uint32_t>(spec_.address & 0xFF);
+        if (spec_.broadcast) {
+            if (spec_.group <= 7) {
+                dst = 0xFE;
+            } else {
+                const int ext_group = std::min(60, std::max(0, spec_.group));
+                dst = static_cast<uint32_t>(0xFD - ext_group);
+            }
+        }
+        id |= (dst << 11);
         id |= (static_cast<uint32_t>(MAXWELL_CONTROLLER_ADDR) << 3);
         id |= (static_cast<uint32_t>(spec_.group & 0x07));
         return id | CAN_EFF_FLAG;
@@ -340,9 +374,17 @@ private:
             if (reg == 0x0040) {
                 telemetry_.alarms = val;
                 telemetry_.fault = val != 0;
+                uint8_t healthy_mask = 0x00;
+                uint8_t fault_mask = 0x00;
+                map_maxwell_alarms(val, healthy_mask, fault_mask);
+                telemetry_.healthy_mask = healthy_mask;
+                telemetry_.fault_mask = fault_mask;
             }
         }
         telemetry_.last_update = now;
+        if (telemetry_.fault_mask != 0) {
+            telemetry_.fault = true;
+        }
         telemetry_.healthy = !telemetry_.fault;
     }
 
@@ -438,12 +480,20 @@ public:
             const auto& telem = mod.driver ? mod.driver->telemetry() : ModuleTelemetryState{};
             const bool fresh = telem.last_update.time_since_epoch().count() > 0 &&
                                (now - telem.last_update) <= TELEMETRY_STALE;
-            const bool healthy = fresh && !telem.fault && telem.alarms == 0;
+            const bool healthy = fresh && !telem.fault && telem.fault_mask == 0 && telem.alarms == 0;
             const uint8_t bit = static_cast<uint8_t>(1U << mod.spec.slot_index);
             if (healthy) {
-                snap.healthy_mask |= bit;
+                if (telem.healthy_mask) {
+                    snap.healthy_mask |= telem.healthy_mask;
+                } else {
+                    snap.healthy_mask |= bit;
+                }
             } else {
-                snap.fault_mask |= bit;
+                if (telem.fault_mask) {
+                    snap.fault_mask |= telem.fault_mask;
+                } else {
+                    snap.fault_mask |= bit;
+                }
             }
             if (mod.spec.slot_index < static_cast<int>(snap.temperatures_c.size())) {
                 snap.temperatures_c[mod.spec.slot_index] = telem.temperature_c;

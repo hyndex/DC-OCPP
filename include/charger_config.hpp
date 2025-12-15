@@ -36,6 +36,9 @@ struct ModuleConfig {
     int group{0};               // optional module group number
     double rated_power_kw{0.0}; // optional per-module power rating
     double rated_current_a{0.0}; // optional per-module current rating
+    int poll_interval_ms{500};
+    int cmd_interval_ms{500};
+    bool broadcast{false};
 };
 
 struct SlotMapping {
@@ -68,7 +71,8 @@ struct ChargerConfig {
     bool use_plc{false};
     bool simulation_mode{false}; // If true, suppress comm faults and run purely simulated hardware
     bool plc_backend_available{false}; // Set at runtime when PLC backend actually initialized
-    bool plc_use_crc8{false};
+    bool plc_use_crc8{true};
+    bool plc_owns_gun_relay{true}; // When true, controller will not command GC relay; PLC owns it
     bool plc_module_relays_enabled{true}; // Allow PLC module relay control; disable when external module drivers used
     bool require_https_uploads{true};
     double module_power_kw{30.0};
@@ -93,6 +97,8 @@ struct ChargerConfig {
     int power_request_timeout_s{60};
     int evse_limit_ack_timeout_ms{1500};
     int telemetry_timeout_ms{2000};
+    int plc_present_warn_ms{1000};
+    int plc_limits_warn_ms{1500};
     int minimum_status_duration_s{0};
     int meter_keepalive_s{300};
     std::string ocpp_config_inline; // Preferred inline OCPP base config JSON (single source)

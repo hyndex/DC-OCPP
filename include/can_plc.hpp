@@ -160,6 +160,9 @@ public:
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
     void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
+    void publish_evse_present(std::int32_t connector, double voltage_v, double current_a,
+                              double power_kw, bool output_enabled, bool regulating) override;
+    void publish_fault_state(std::int32_t connector, uint8_t fault_bits) override;
     /// \brief Inject a CAN frame directly (bypasses socket RX) for replay/testing.
     void ingest_can_frame(uint32_t can_id, const uint8_t* data, size_t len);
     void ingest_can_frame(uint32_t can_id, const std::vector<uint8_t>& data) {
@@ -199,7 +202,7 @@ private:
         bool last_force_all_off{false};
         bool mc_closed_cmd{true};
         bool gc_closed_cmd{false};
-        uint8_t module_mask{0x01}; // bit0: gun, bit1: module1, bit2: module2
+        uint8_t module_mask{0x00}; // bit0: gun, bit1: module1, bit2: module2
         double energy_fallback_Wh{0.0};
         std::chrono::steady_clock::time_point last_energy_update{};
         bool meter_fallback_active{false};
@@ -216,6 +219,16 @@ private:
         double last_limit_power_kw{0.0};
         uint64_t limit_tx_count{0};
         uint64_t limit_tx_fail{0};
+        AuthorizationState authorization_state{AuthorizationState::Unknown};
+        std::chrono::steady_clock::time_point last_auth_push{};
+        uint64_t auth_push_count{0};
+        uint8_t fault_bits{0};
+        std::chrono::steady_clock::time_point last_fault_update{};
+        std::chrono::steady_clock::time_point last_evse_present_tx{};
+        std::chrono::steady_clock::time_point last_evse_limits_tx{};
+        uint64_t present_stale_events{0};
+        uint64_t limit_stale_events{0};
+        uint64_t relay_conflict_count{0};
         std::map<uint8_t, SegmentBuffer> rfid_events;
         SegmentBuffer evccid;
         SegmentBuffer emaid0;
@@ -228,6 +241,9 @@ private:
     std::string iface_;
     bool use_crc8_{false};
     bool module_relays_enabled_{true};
+    bool gun_relay_owned_by_plc_{true};
+    int present_warn_ms_{1000};
+    int limits_warn_ms_{1500};
     bool require_https_uploads_{true};
     std::size_t upload_max_bytes_{100 * 1024 * 1024};
     int upload_connect_timeout_s_{10};
@@ -241,6 +257,7 @@ private:
     std::vector<AuthToken> auth_events_;
     std::set<uint32_t> unknown_can_ids_;
     bool module_relays_disabled_logged_{false};
+    bool cadence_warn_logged_{false};
 
     bool open_socket();
     void restart_can();
@@ -270,6 +287,10 @@ private:
                                  size_t len);
     void prune_segment_buffers(Node& node, const std::chrono::steady_clock::time_point& now);
     void send_evse_limits(Node& node, const EvseLimits& limits);
+    void send_evse_present(Node& node, double voltage_v, double current_a, double power_kw,
+                           bool output_enabled, bool regulating);
+    void refresh_authorization_locked(Node& node, const std::chrono::steady_clock::time_point& now, bool force);
+    void update_fault_bits(Node& node, uint8_t fault_bits, const std::chrono::steady_clock::time_point& now);
     bool send_config_command(Node& node, uint8_t param_id, uint32_t value);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);

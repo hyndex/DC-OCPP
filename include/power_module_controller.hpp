@@ -19,6 +19,9 @@ struct ModuleSpec {
     int group{0};
     double rated_power_kw{0.0};
     double rated_current_a{0.0};
+    int poll_interval_ms{500};
+    int cmd_interval_ms{500};
+    bool broadcast{false}; // send via broadcast DST (0xFE or extended)
 };
 
 struct ModuleCommandRequest {

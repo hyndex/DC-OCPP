@@ -456,6 +456,7 @@ add_executable(auth_flow_tests
   src/charger_config.cpp
   src/hardware_sim.cpp
   src/can_plc.cpp
+  src/power_module_controller.cpp
 )
 target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
 target_link_libraries(auth_flow_tests PRIVATE
@@ -480,6 +481,7 @@ add_executable(deterministic_vectors_tests
   src/charger_config.cpp
   src/hardware_sim.cpp
   src/can_plc.cpp
+  src/power_module_controller.cpp
 )
 target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
 target_link_libraries(deterministic_vectors_tests PRIVATE
@@ -504,6 +506,7 @@ add_executable(pending_token_persistence_tests
   src/charger_config.cpp
   src/hardware_sim.cpp
   src/can_plc.cpp
+  src/power_module_controller.cpp
 )
 target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
 target_link_libraries(pending_token_persistence_tests PRIVATE
@@ -526,9 +529,37 @@ add_executable(derate_fault_tests
   src/ocpp_adapter.cpp
   src/power_manager.cpp
   src/charger_config.cpp
+  src/hardware_sim.cpp
+  src/can_plc.cpp
+  src/power_module_controller.cpp
 )
 target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
 target_link_libraries(derate_fault_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)
+
+add_executable(limit_fallback_tests
+  tests/limit_fallback_tests.cpp
+  src/ocpp_adapter.cpp
+  src/power_manager.cpp
+  src/charger_config.cpp
+  src/hardware_sim.cpp
+  src/can_plc.cpp
+  src/power_module_controller.cpp
+)
+target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
+target_link_libraries(limit_fallback_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl

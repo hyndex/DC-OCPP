@@ -71,6 +71,10 @@ struct GunStatus {
     std::array<double, 2> module_temp_c{{0.0, 0.0}};
     uint32_t evse_limit_ack_count{0};
     std::chrono::steady_clock::time_point last_evse_limit_ack{};
+    uint64_t present_stale_events{0};
+    uint64_t limit_stale_events{0};
+    uint64_t auth_push_count{0};
+    uint64_t relay_conflict_count{0};
 };
 
 /// \brief Planner dispatch toward hardware (per connector).
@@ -159,6 +163,25 @@ public:
     virtual void set_evse_limits(std::int32_t connector, const EvseLimits& limits) {
         (void)connector;
         (void)limits;
+    }
+
+    /// \brief Publish measured/present EVSE output to the communications front-end (e.g., PLC).
+    /// Default is a no-op for hardware that does not support feeding measurements back to the PLC.
+    virtual void publish_evse_present(std::int32_t connector, double voltage_v, double current_a,
+                                      double power_kw, bool output_enabled, bool regulating) {
+        (void)connector;
+        (void)voltage_v;
+        (void)current_a;
+        (void)power_kw;
+        (void)output_enabled;
+        (void)regulating;
+    }
+
+    /// \brief Publish EVSE-side fault bitmask toward the communications front-end.
+    /// Bits are transport-specific; default is a no-op for hardware that does not forward faults.
+    virtual void publish_fault_state(std::int32_t connector, uint8_t fault_bits) {
+        (void)connector;
+        (void)fault_bits;
     }
 
     /// \brief Drain any auth tokens (RFID/Autocharge/etc.) detected by the hardware since the last poll.

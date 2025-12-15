@@ -37,6 +37,8 @@ struct ModuleState {
     int group{0};
     double rated_power_kw{0.0};
     double rated_current_a{0.0};
+    int poll_interval_ms{500};
+    int cmd_interval_ms{500};
     bool healthy{true};
     bool enabled{false};
     double temperature_c{0.0};

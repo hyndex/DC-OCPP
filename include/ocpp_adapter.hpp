@@ -117,6 +117,8 @@ private:
     std::map<int, double> last_meter_sent_wh_;
     std::map<int, std::chrono::steady_clock::time_point> last_meter_sent_time_;
     std::map<int, std::chrono::steady_clock::time_point> cp_fault_since_;
+    std::map<int, uint64_t> last_present_stale_counts_;
+    std::map<int, uint64_t> last_limit_stale_counts_;
     std::map<std::string, std::chrono::steady_clock::time_point> local_auth_cache_;
     std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
     std::atomic<bool> global_fault_latched_{false};

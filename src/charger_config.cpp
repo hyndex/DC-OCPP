@@ -69,6 +69,9 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             mc.group = m.value("group", 0);
             mc.rated_power_kw = m.value("ratedPowerKW", 0.0);
             mc.rated_current_a = m.value("ratedCurrentA", 0.0);
+            mc.poll_interval_ms = m.value("pollMs", 500);
+            mc.cmd_interval_ms = m.value("cmdIntervalMs", 500);
+            mc.broadcast = m.value("broadcast", false);
             slot.modules.push_back(mc);
         }
     }
@@ -115,7 +118,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.simulation_mode = cp.value("simulationMode", false);
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
-    cfg.plc_use_crc8 = plc_cfg.value("useCRC8", false);
+    cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
+    cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", true);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
     cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
     const auto uploads = json.value("uploads", nlohmann::json::object());
@@ -140,6 +144,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
     cfg.evse_limit_ack_timeout_ms = timeouts.value("evseLimitAckMs", cfg.evse_limit_ack_timeout_ms);
     cfg.telemetry_timeout_ms = timeouts.value("telemetryTimeoutMs", cfg.telemetry_timeout_ms);
+    cfg.plc_present_warn_ms = timeouts.value("plcPresentWarnMs", cfg.plc_present_warn_ms);
+    cfg.plc_limits_warn_ms = timeouts.value("plcLimitsWarnMs", cfg.plc_limits_warn_ms);
     cfg.allow_cross_slot_islands = planner_value("allowCrossSlotIslands", cfg.allow_cross_slot_islands);
     cfg.max_modules_per_gun = planner_value("maxModulesPerGun", cfg.max_modules_per_gun);
     cfg.min_modules_per_active_gun = planner_value("minModulesPerActiveGun", cfg.min_modules_per_active_gun);
@@ -279,8 +285,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                 if (!m.type.empty()) {
                     std::transform(m.type.begin(), m.type.end(), m.type.begin(),
                                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                    if (m.address < 0 || m.address > 63) {
-                        throw std::runtime_error("Module " + m.id + " has invalid address (expected 0-63)");
+                    if (!m.broadcast) {
+                        if (m.address < 0 || m.address > 63) {
+                            throw std::runtime_error("Module " + m.id + " has invalid address (expected 0-63)");
+                        }
+                    } else {
+                        // Broadcast allows 0xFE (group broadcast) or 0xFF (global)
+                        if (m.address < 0) m.address = 0xFE;
                     }
                     if (m.rated_power_kw <= 0.0) {
                         m.rated_power_kw = cfg.module_power_kw;
@@ -288,11 +299,15 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                     if (m.rated_current_a < 0.0) {
                         m.rated_current_a = 0.0;
                     }
+                    m.poll_interval_ms = std::max(100, m.poll_interval_ms);
+                    m.cmd_interval_ms = std::max(100, m.cmd_interval_ms);
                     const auto key = std::make_tuple(m.can_interface, m.group, m.address);
-                    if (!seen_addresses.insert(key).second) {
-                        throw std::runtime_error("Duplicate module CAN address " + std::to_string(m.address) +
-                                                 " on interface " + m.can_interface + " group " +
-                                                 std::to_string(m.group));
+                    if (!m.broadcast) {
+                        if (!seen_addresses.insert(key).second) {
+                            throw std::runtime_error("Duplicate module CAN address " + std::to_string(m.address) +
+                                                     " on interface " + m.can_interface + " group " +
+                                                     std::to_string(m.group));
+                        }
                     }
                 }
             }
