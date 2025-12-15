@@ -88,6 +88,23 @@ Stop
   pkill -f "dc_ocpp --config configs/charger.json"
   ```
 
+Config editor web UI
+--------------------
+- A lightweight C++/WebKit editor (`config_webui` target) mirrors the config-guardian layout so you can view, validate, and save `configs/charger.json` with automatic backups under `configs/backups/`.
+- Build the helper:
+  ```bash
+  cmake --build build -j --target config_webui
+  ```
+- Launch (opens a WebKit window; use `--headless` to keep only the local server):
+  ```bash
+  ./build/config_webui --config configs/charger.json --assets webui --port 8844 --host 0.0.0.0
+  ```
+- The UI validates before save, keeps automatic backups under `configs/backups/`, and can restore any backup from the JSON/Backups tab.
+- Dependencies: macOS uses system WebKit; Linux requires `pkg-config` plus `webkit2gtk` + `gtk3` development packages for the webview backend.
+- mDNS: if `dns_sd.h`/`libdns_sd` (Bonjour/Avahi compat) are available, the server advertises `_http._tcp` using your `chargePoint.id` (e.g., `jyotisman.local`). Disable with `--no-mdns` or override labels with `--mdns-name` / `--mdns-host`.
+- To reach via `<chargePoint.id>.local`, ensure mDNS is enabled on your LAN (Bonjour/Avahi); the server binds to `--host` (default `0.0.0.0`) so other devices can reach it on the advertised port.
+- Flags: `--host`/`--bind` override the bind address, `--port` sets the HTTP port, `--headless` skips opening a window, `--assets` points to a static dir, `--config` sets the target JSON path.
+
 PLC/CAN notes
 -------------
 - For real PLC/CAN hardware, set `"usePLC": true`, configure `"canInterface"`, and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.

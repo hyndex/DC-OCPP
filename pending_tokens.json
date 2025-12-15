@@ -1,13 +1,3 @@
 {
-  "tokens": [
-    {
-      "connector": 1,
-      "connectorHint": 1,
-      "expiresAt": 1765589050,
-      "idToken": "EXPIRED",
-      "prevalidated": true,
-      "receivedAt": 1765587250,
-      "source": "rfid"
-    }
-  ]
+  "tokens": []
 }

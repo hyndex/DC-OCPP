@@ -1,3 +1,16 @@
+=== include/can_contract.hpp ===
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+namespace can_contract {
+inline constexpr uint8_t kProtoVersion = 1;
+inline constexpr uint8_t kConfigParamAuthState = 20;
+inline constexpr uint8_t kConfigParamAuthPending = 21;
+inline constexpr uint8_t kConfigParamLockCmd = 30;
+inline constexpr uint8_t kConfigParamEvseLimitAck = 90;
+inline constexpr uint8_t kConfigParamProtoVersion = 91;
+} // namespace can_contract
+
+
 === include/can_plc.hpp ===
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
@@ -83,7 +96,8 @@ struct PlcCpStatus {
 struct PlcStatus {
     bool relay_closed{false};
     bool sys_enabled{false};
-    uint8_t last_cmd_seq{0};
+    uint8_t last_cmd_seq_applied{0};
+    uint8_t last_cmd_seq_received{0};
     uint8_t relay_state_mask{0};
     uint8_t last_fault_reason{0};
     uint8_t hlc_stage{0};
@@ -212,6 +226,9 @@ private:
         bool crc_mode_mismatch{false};
         bool crc_mode_mismatch_logged{false};
         bool crc_fault_logged{false};
+        bool protocol_version_ok{false};
+        bool protocol_version_mismatch{false};
+        bool protocol_version_fault_logged{false};
         bool bus_off_logged{false};
         bool authorization_granted{false};
         uint8_t gcmc_cmd_seq{0};
@@ -227,6 +244,8 @@ private:
         std::chrono::steady_clock::time_point last_fault_update{};
         std::chrono::steady_clock::time_point last_evse_present_tx{};
         std::chrono::steady_clock::time_point last_evse_limits_tx{};
+        std::chrono::steady_clock::time_point last_proto_version_sent{};
+        std::chrono::steady_clock::time_point last_proto_ack{};
         uint64_t present_stale_events{0};
         uint64_t limit_stale_events{0};
         uint64_t relay_conflict_count{0};
@@ -294,6 +313,7 @@ private:
     void refresh_authorization_locked(Node& node, const std::chrono::steady_clock::time_point& now, bool force);
     void update_fault_bits(Node& node, uint8_t fault_bits, const std::chrono::steady_clock::time_point& now);
     bool send_config_command(Node& node, uint8_t param_id, uint32_t value);
+    void ensure_protocol_version(Node& node, const std::chrono::steady_clock::time_point& now);
 #ifdef __linux__
     void handle_error_frame(const struct can_frame& frame);
 #endif
@@ -1257,6 +1277,7 @@ private:
 
 #include <curl/curl.h>
 #include <everest/logging.hpp>
+#include "can_contract.hpp"
 
 namespace charger {
 
@@ -1292,16 +1313,19 @@ constexpr uint32_t RTTLOG_BASE = 0x400;
 constexpr uint32_t SOFTWARE_INFO_BASE = 0x110;
 constexpr uint32_t ERROR_CODES_BASE = 0x120;
 constexpr uint32_t HW_CONFIG_BASE = 0x306;
-constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = 90;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
+constexpr std::chrono::milliseconds PROTO_VERSION_RETRY_MS(1000);
 constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
 constexpr std::chrono::seconds SEGMENT_TTL(5);
-constexpr uint8_t CONFIG_PARAM_AUTH_STATE = 20;
-constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = 21;
+constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = can_contract::kConfigParamEvseLimitAck;
+constexpr uint8_t CONFIG_PARAM_PROTO_VERSION = can_contract::kConfigParamProtoVersion;
+constexpr uint32_t CAN_PROTOCOL_VERSION = can_contract::kProtoVersion;
+constexpr uint8_t CONFIG_PARAM_AUTH_STATE = can_contract::kConfigParamAuthState;
+constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = can_contract::kConfigParamAuthPending;
 constexpr std::chrono::milliseconds AUTH_REFRESH_INTERVAL_MS(1000);
 
 uint16_t le_u16(const uint8_t* p) {
@@ -1678,6 +1702,10 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cf
         nodes_.emplace(c.id, node);
         plc_to_connector_[c.plc_id] = c.id;
     }
+    if (!cfg.plc_use_crc8) {
+        EVLOG_warning << "Ignoring plc_use_crc8=false; enforcing CRC8 on safety-critical PLC frames";
+        use_crc8_ = true;
+    }
     EVLOG_info << "PLC gun relay ownership: " << (gun_relay_owned_by_plc_ ? "PLC" : "controller");
 
 #ifdef __linux__
@@ -2037,6 +2065,7 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
     if (!node) return st;
     const auto now = std::chrono::steady_clock::now();
     refresh_authorization_locked(*node, now, false);
+    ensure_protocol_version(*node, now);
     // Timeout detections
     if (node->status.last_relay_status.time_since_epoch().count() &&
         (now - node->status.last_relay_status) > RELAY_TIMEOUT_MS) {
@@ -2263,6 +2292,37 @@ bool PlcHardware::send_config_command(Node& node, uint8_t param_id, uint32_t val
     (void)param_id;
     (void)value;
     return false;
+#endif
+}
+
+void PlcHardware::ensure_protocol_version(Node& node, const std::chrono::steady_clock::time_point& now) {
+#ifdef __linux__
+    if (sock_ < 0) {
+        return;
+    }
+    if (node.protocol_version_mismatch) {
+        node.status.safety.comm_fault = true;
+        node.status.safety.safety_ok = false;
+        node.status.pending_safety = node.status.safety;
+        node.status.pending_safety_since = now;
+        return;
+    }
+    if (node.protocol_version_ok) {
+        return;
+    }
+    if (node.last_proto_version_sent.time_since_epoch().count() &&
+        (now - node.last_proto_version_sent) < PROTO_VERSION_RETRY_MS) {
+        return;
+    }
+    const bool sent = send_config_command(node, CONFIG_PARAM_PROTO_VERSION, CAN_PROTOCOL_VERSION);
+    node.last_proto_version_sent = now;
+    if (!sent && !node.protocol_version_fault_logged) {
+        EVLOG_warning << "Failed to send protocol version handshake to PLC " << node.cfg.plc_id;
+        node.protocol_version_fault_logged = true;
+    }
+#else
+    (void)node;
+    (void)now;
 #endif
 }
 
@@ -2505,12 +2565,13 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         }
     };
 
+    const bool crc_frame = crc_expected(can_id);
+    if (crc_frame && len != 8) {
+        mark_crc_mismatch("expected CRC8-protected frame with dlc=8");
+        return;
+    }
     // CRC check based on DBC (only specific frames carry CRC).
-    if (use_crc8_ && crc_expected(can_id)) {
-        if (len < 8) {
-            mark_crc_mismatch("expected CRC8 byte but frame shorter than 8 bytes");
-            return;
-        }
+    if (use_crc8_ && crc_frame) {
         const uint8_t expected = plc_crc8(data, 7);
         if (expected != data[7]) {
             mark_crc_fault("CRC8 verification failed");
@@ -2576,6 +2637,26 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
             if (status == 0 && param_id == CONFIG_PARAM_EVSE_LIMIT_ACK) {
                 node->status.limit_ack_count = value;
                 node->status.last_limit_ack = rx_time;
+            } else if (param_id == CONFIG_PARAM_PROTO_VERSION) {
+                if (status == 0 && value == CAN_PROTOCOL_VERSION) {
+                    node->protocol_version_ok = true;
+                    node->protocol_version_mismatch = false;
+                    node->protocol_version_fault_logged = false;
+                    node->last_proto_ack = rx_time;
+                } else {
+                    node->protocol_version_ok = false;
+                    node->protocol_version_mismatch = true;
+                    node->status.safety.comm_fault = true;
+                    node->status.safety.safety_ok = false;
+                    node->status.pending_safety = node->status.safety;
+                    node->status.pending_safety_since = rx_time;
+                    if (!node->protocol_version_fault_logged) {
+                        EVLOG_error << "PLC " << node->cfg.plc_id << " protocol version mismatch: expected "
+                                    << CAN_PROTOCOL_VERSION << " got " << value << " status="
+                                    << static_cast<int>(status);
+                        node->protocol_version_fault_logged = true;
+                    }
+                }
             }
         }
     } else {
@@ -2594,7 +2675,8 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
     s.safety_ok = (data[2] & 0x10) != 0;    // bit20
     s.earth_fault = (data[2] & 0x20) != 0;  // bit21
     s.estop = (data[2] & 0x80) != 0;        // bit23
-    node.status.last_cmd_seq = data[1];
+    node.status.last_cmd_seq_applied = data[1];
+    node.status.last_cmd_seq_received = data[1];
     s.comm_fault = (data[0] & 0x80) != 0;   // bit7
     s.remote_force_off = false;
     const uint8_t fault_reason = data[3];
@@ -2617,7 +2699,7 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
     // Update pending safety to debounce
     node.status.pending_safety = s;
     node.status.pending_safety_since = std::chrono::steady_clock::now();
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }
@@ -2818,15 +2900,16 @@ void PlcHardware::handle_gcmc_status(Node& node, const uint8_t* data, size_t len
     }
     node.status.last_fault_reason = fault_reason;
     node.status.pending_safety = s;
-    node.status.pending_safety_since = std::chrono::steady_clock::now();
-    node.status.last_cmd_seq = last_applied;
-    node.expected_cmd_seq = cmd_seq_rx;
+    const auto now = std::chrono::steady_clock::now();
+    node.status.pending_safety_since = now;
+    node.status.last_cmd_seq_applied = last_applied;
+    node.status.last_cmd_seq_received = cmd_seq_rx;
     node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_rx));
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }
-    node.status.last_any_rx = std::chrono::steady_clock::now();
+    node.status.last_any_rx = now;
     (void)cmd_bits;
 }
 
@@ -2866,9 +2949,10 @@ void PlcHardware::handle_debug_info(Node& node, const uint8_t* data, size_t len)
         node.status.safety.comm_fault = true;
         node.status.safety.safety_ok = false;
     }
-    node.status.last_cmd_seq = last_applied;
+    node.status.last_cmd_seq_applied = last_applied;
+    node.status.last_cmd_seq_received = cmd_seq_tx;
     node.status.rx_count = std::max<uint32_t>(node.status.rx_count, static_cast<uint32_t>(cmd_seq_tx));
-    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq) {
+    if (node.awaiting_ack && node.expected_cmd_seq == node.status.last_cmd_seq_applied) {
         node.awaiting_ack = false;
         node.retry_count = 0;
     }

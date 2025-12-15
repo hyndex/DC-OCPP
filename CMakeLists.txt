@@ -429,6 +429,91 @@ target_link_libraries(dc_ocpp PRIVATE
   Threads::Threads
 )
 
+option(BUILD_CONFIG_WEB_UI "Build the webview-powered config editor" ON)
+
+if(BUILD_CONFIG_WEB_UI)
+  set(_CAN_BUILD_WEBUI TRUE)
+  set(_WEBKIT_LIBS "")
+  set(_WEBKIT_INCLUDES "")
+  set(_USE_OBJCXX FALSE)
+  set(WEBKIT_FOUND FALSE)
+  set(GTK3_FOUND FALSE)
+  set(DNSSD_FOUND FALSE)
+
+  if(APPLE)
+    find_library(COCOA_FRAMEWORK Cocoa)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(WEBKIT_FRAMEWORK WebKit)
+    if(COCOA_FRAMEWORK AND FOUNDATION_FRAMEWORK AND WEBKIT_FRAMEWORK)
+      list(APPEND _WEBKIT_LIBS ${COCOA_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${WEBKIT_FRAMEWORK})
+      set(_USE_OBJCXX TRUE)
+    else()
+      set(_CAN_BUILD_WEBUI FALSE)
+      message(WARNING "Config web UI disabled: WebKit/Cocoa frameworks not found")
+    endif()
+  elseif(UNIX)
+    find_package(PkgConfig)
+    if(PKG_CONFIG_FOUND)
+      set(_WEBKIT_PKGS webkit2gtk-4.1 webkit2gtk-4.0)
+      foreach(_pkg ${_WEBKIT_PKGS})
+        pkg_check_modules(WEBKIT QUIET ${_pkg})
+        if(WEBKIT_FOUND)
+          break()
+        endif()
+      endforeach()
+      pkg_check_modules(GTK3 QUIET gtk+-3.0)
+      if(WEBKIT_FOUND AND GTK3_FOUND)
+        list(APPEND _WEBKIT_INCLUDES ${WEBKIT_INCLUDE_DIRS} ${GTK3_INCLUDE_DIRS})
+        list(APPEND _WEBKIT_LIBS ${WEBKIT_LIBRARIES} ${GTK3_LIBRARIES})
+      else()
+        set(_CAN_BUILD_WEBUI FALSE)
+        message(WARNING "Config web UI disabled: webkit2gtk or gtk3 dev packages not found")
+      endif()
+    else()
+      set(_CAN_BUILD_WEBUI FALSE)
+      message(WARNING "Config web UI disabled: pkg-config not available")
+    endif()
+  elseif(WIN32)
+    list(APPEND _WEBKIT_LIBS ole32 version shlwapi)
+  endif()
+
+  find_path(DNSSD_INCLUDE_DIR dns_sd.h)
+  find_library(DNSSD_LIBRARY dns_sd)
+  if(DNSSD_INCLUDE_DIR AND DNSSD_LIBRARY)
+    set(DNSSD_FOUND TRUE)
+  endif()
+
+  if(_CAN_BUILD_WEBUI)
+    if(APPLE AND _USE_OBJCXX)
+      enable_language(OBJCXX)
+    endif()
+    add_executable(config_webui
+      src/config_webui.cpp
+      src/charger_config.cpp
+    )
+    target_include_directories(config_webui PRIVATE include third_party/webview/include third_party third_party/webview ${_WEBKIT_INCLUDES} ${DNSSD_INCLUDE_DIR})
+    target_link_libraries(config_webui PRIVATE Threads::Threads ${_WEBKIT_LIBS} nlohmann_json::nlohmann_json)
+    if(DNSSD_FOUND)
+      target_link_libraries(config_webui PRIVATE ${DNSSD_LIBRARY})
+      target_compile_definitions(config_webui PRIVATE HAVE_DNSSD)
+    else()
+      message(WARNING "mDNS (dns_sd.h) not found; --mdns disabled")
+    endif()
+    if(WIN32)
+      target_link_libraries(config_webui PRIVATE ws2_32)
+    endif()
+    target_compile_definitions(config_webui PRIVATE
+      CONFIG_WEBUI_ASSET_DIR="${CMAKE_SOURCE_DIR}/webui"
+      CONFIG_WEBUI_DEFAULT_CONFIG="${CMAKE_SOURCE_DIR}/configs/charger.json"
+    )
+    if(APPLE AND _USE_OBJCXX)
+      set_source_files_properties(src/config_webui.cpp PROPERTIES LANGUAGE OBJCXX)
+    endif()
+  else()
+    set(BUILD_CONFIG_WEB_UI OFF CACHE BOOL "Build the webview-powered config editor" FORCE)
+  endif()
+endif()
+
 add_executable(power_manager_tests
   tests/power_manager_tests.cpp
   src/power_manager.cpp
@@ -455,6 +540,27 @@ add_executable(can_protocol_vectors_tests
 )
 target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
 target_link_libraries(can_protocol_vectors_tests PRIVATE
+  everest::ocpp
+  date::date-tz
+  CURL::libcurl
+  ${_JSON_SCHEMA_DEP}
+  ${_EVEREST_SQLITE_DEP}
+  Boost::log
+  Boost::log_setup
+  Boost::filesystem
+  Boost::thread
+  Boost::regex
+  Boost::date_time
+  Threads::Threads
+)
+
+add_executable(can_end_to_end_sim_tests
+  tests/can_end_to_end_sim_tests.cpp
+  src/can_plc.cpp
+  Ref/Basic/src/firmware/util/crc8.cpp
+)
+target_include_directories(can_end_to_end_sim_tests PRIVATE include libocpp/include Ref/Basic/src/firmware/util)
+target_link_libraries(can_end_to_end_sim_tests PRIVATE
   everest::ocpp
   date::date-tz
   CURL::libcurl
