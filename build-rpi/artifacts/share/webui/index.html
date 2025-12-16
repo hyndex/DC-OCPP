@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Config Guardian | Charger UI</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">Config Guardian</div>
+      <div class="nav">
+        <button class="active" data-target="overview">Overview</button>
+        <button data-target="connectors">Connectors</button>
+        <button data-target="slots">Slots & Modules</button>
+        <button data-target="limits">Limits</button>
+        <button data-target="ocpp">OCPP</button>
+        <button data-target="security">Security</button>
+        <button data-target="raw">JSON & Backups</button>
+      </div>
+      <div class="sidebar-meta">
+        <div id="dirty-indicator" class="pill success">Synced</div>
+        <div style="margin-top: 10px;">Edits save directly to configs/charger.json with automatic backups.</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <p class="eyebrow">Joulepoint OCPP</p>
+          <h1>Charger configuration workbench</h1>
+          <p class="muted">Powered by WebKit (webview) with the layout inspired by config-guardian.</p>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="reload-btn">Reload</button>
+          <button class="ghost" id="backup-btn">Backup</button>
+          <button class="ghost" id="validate-btn">Validate</button>
+          <button class="primary" id="save-btn">Save</button>
+        </div>
+      </div>
+
+      <section id="section-overview" class="section"></section>
+      <section id="section-connectors" class="section hidden"></section>
+      <section id="section-slots" class="section hidden"></section>
+      <section id="section-limits" class="section hidden"></section>
+      <section id="section-ocpp" class="section hidden"></section>
+      <section id="section-security" class="section hidden"></section>
+      <section id="section-raw" class="section hidden"></section>
+    </main>
+  </div>
+  <div id="toast" class="toast">Saved</div>
+  <script src="app.js"></script>
+</body>
+</html>

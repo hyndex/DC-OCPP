@@ -34,7 +34,9 @@ list(APPEND CMAKE_PREFIX_PATH ${everest-cmake_SOURCE_DIR})
 set("everest-cmake_DIR" "${everest-cmake_SOURCE_DIR}" CACHE PATH "everest-cmake dir" FORCE)
 set(everest_cmake_DIR "${everest-cmake_SOURCE_DIR}" CACHE PATH "everest-cmake dir (underscore)" FORCE)
 
-cmake_policy(SET CMP0167 OLD)
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
 set(Boost_NO_BOOST_CMAKE ON)
 set(Boost_NO_WARN_NEW_VERSIONS ON)
 
@@ -353,8 +355,9 @@ find_package(CURL REQUIRED)
 set(LIBOCPP_ENABLE_V16 ON CACHE BOOL "" FORCE)
 set(LIBOCPP_ENABLE_V2 OFF CACHE BOOL "" FORCE)
 set(LIBOCPP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(LIBOCPP16_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+option(BUILD_TESTING "Enable CTest and downstream test targets" OFF)
+option(BUILD_APP_TESTS "Build dc_ocpp/unit test executables" ${BUILD_TESTING})
 
 add_subdirectory(libocpp)
 
@@ -414,7 +417,12 @@ elseif(TARGET everest-sqlite)
   set(_EVEREST_SQLITE_DEP everest-sqlite)
 endif()
 
-target_link_libraries(dc_ocpp PRIVATE
+set(_PLATFORM_LIBS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm" AND NOT APPLE)
+  list(APPEND _PLATFORM_LIBS atomic)
+endif()
+
+set(_OCPP_APP_LIBS
   everest::ocpp
   date::date-tz
   CURL::libcurl
@@ -427,7 +435,10 @@ target_link_libraries(dc_ocpp PRIVATE
   Boost::regex
   Boost::date_time
   Threads::Threads
+  ${_PLATFORM_LIBS}
 )
+
+target_link_libraries(dc_ocpp PRIVATE ${_OCPP_APP_LIBS})
 
 option(BUILD_CONFIG_WEB_UI "Build the webview-powered config editor" ON)
 
@@ -514,217 +525,114 @@ if(BUILD_CONFIG_WEB_UI)
   endif()
 endif()
 
-add_executable(power_manager_tests
-  tests/power_manager_tests.cpp
-  src/power_manager.cpp
-)
-target_include_directories(power_manager_tests PRIVATE include)
-target_link_libraries(power_manager_tests PRIVATE pthread)
+if(BUILD_APP_TESTS)
+  add_executable(power_manager_tests
+    tests/power_manager_tests.cpp
+    src/power_manager.cpp
+  )
+  target_include_directories(power_manager_tests PRIVATE include)
+  target_link_libraries(power_manager_tests PRIVATE pthread)
 
-add_executable(power_manager_invariants_tests
-  tests/power_manager_invariants_tests.cpp
-  src/power_manager.cpp
-)
-target_include_directories(power_manager_invariants_tests PRIVATE include)
-target_link_libraries(power_manager_invariants_tests PRIVATE pthread)
+  add_executable(power_manager_invariants_tests
+    tests/power_manager_invariants_tests.cpp
+    src/power_manager.cpp
+  )
+  target_include_directories(power_manager_invariants_tests PRIVATE include)
+  target_link_libraries(power_manager_invariants_tests PRIVATE pthread)
 
-add_executable(can_crc_filter_tests
-  tests/can_crc_filter_tests.cpp
-)
-target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
-target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
+  add_executable(can_crc_filter_tests
+    tests/can_crc_filter_tests.cpp
+  )
+  target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
+  target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
 
-add_executable(can_protocol_vectors_tests
-  tests/can_protocol_vectors_tests.cpp
-  src/can_plc.cpp
-)
-target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
-target_link_libraries(can_protocol_vectors_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(can_protocol_vectors_tests
+    tests/can_protocol_vectors_tests.cpp
+    src/can_plc.cpp
+  )
+  target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
+  target_link_libraries(can_protocol_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(can_end_to_end_sim_tests
-  tests/can_end_to_end_sim_tests.cpp
-  src/can_plc.cpp
-  Ref/Basic/src/firmware/util/crc8.cpp
-)
-target_include_directories(can_end_to_end_sim_tests PRIVATE include libocpp/include Ref/Basic/src/firmware/util)
-target_link_libraries(can_end_to_end_sim_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(can_end_to_end_sim_tests
+    tests/can_end_to_end_sim_tests.cpp
+    src/can_plc.cpp
+    Ref/Basic/src/firmware/util/crc8.cpp
+  )
+  target_include_directories(can_end_to_end_sim_tests PRIVATE include libocpp/include Ref/Basic/src/firmware/util)
+  target_link_libraries(can_end_to_end_sim_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(auth_flow_tests
-  tests/auth_flow_tests.cpp
-  src/ocpp_adapter.cpp
-  src/power_manager.cpp
-  src/charger_config.cpp
-  src/hardware_sim.cpp
-  src/can_plc.cpp
-  src/power_module_controller.cpp
-)
-target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
-target_link_libraries(auth_flow_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(auth_flow_tests
+    tests/auth_flow_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/hardware_sim.cpp
+    src/can_plc.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
+  target_link_libraries(auth_flow_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(deterministic_vectors_tests
-  tests/deterministic_vectors_tests.cpp
-  src/ocpp_adapter.cpp
-  src/power_manager.cpp
-  src/charger_config.cpp
-  src/hardware_sim.cpp
-  src/can_plc.cpp
-  src/power_module_controller.cpp
-)
-target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
-target_link_libraries(deterministic_vectors_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(deterministic_vectors_tests
+    tests/deterministic_vectors_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/hardware_sim.cpp
+    src/can_plc.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
+  target_link_libraries(deterministic_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(pending_token_persistence_tests
-  tests/pending_token_persistence_tests.cpp
-  src/ocpp_adapter.cpp
-  src/power_manager.cpp
-  src/charger_config.cpp
-  src/hardware_sim.cpp
-  src/can_plc.cpp
-  src/power_module_controller.cpp
-)
-target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
-target_link_libraries(pending_token_persistence_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(pending_token_persistence_tests
+    tests/pending_token_persistence_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/hardware_sim.cpp
+    src/can_plc.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
+  target_link_libraries(pending_token_persistence_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(derate_fault_tests
-  tests/derate_fault_tests.cpp
-  src/ocpp_adapter.cpp
-  src/power_manager.cpp
-  src/charger_config.cpp
-  src/hardware_sim.cpp
-  src/can_plc.cpp
-  src/power_module_controller.cpp
-)
-target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
-target_link_libraries(derate_fault_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(derate_fault_tests
+    tests/derate_fault_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/hardware_sim.cpp
+    src/can_plc.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
+  target_link_libraries(derate_fault_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(limit_fallback_tests
-  tests/limit_fallback_tests.cpp
-  src/ocpp_adapter.cpp
-  src/power_manager.cpp
-  src/charger_config.cpp
-  src/hardware_sim.cpp
-  src/can_plc.cpp
-  src/power_module_controller.cpp
-)
-target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
-target_link_libraries(limit_fallback_tests PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(limit_fallback_tests
+    tests/limit_fallback_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/hardware_sim.cpp
+    src/can_plc.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
+  target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
 
-add_executable(island_manager_tests
-  tests/island_manager_tests.cpp
-  src/island_manager.cpp
-)
-target_include_directories(island_manager_tests PRIVATE include)
-target_link_libraries(island_manager_tests PRIVATE pthread)
+  add_executable(island_manager_tests
+    tests/island_manager_tests.cpp
+    src/island_manager.cpp
+  )
+  target_include_directories(island_manager_tests PRIVATE include)
+  target_link_libraries(island_manager_tests PRIVATE pthread)
 
-add_executable(can_conformance_harness
-  tests/can_conformance_harness.cpp
-  src/charger_config.cpp
-  src/can_plc.cpp
-)
-target_include_directories(can_conformance_harness PRIVATE include)
-target_link_libraries(can_conformance_harness PRIVATE
-  everest::ocpp
-  date::date-tz
-  CURL::libcurl
-  ${_JSON_SCHEMA_DEP}
-  ${_EVSE_SECURITY_DEP}
-  ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
-  Boost::filesystem
-  Boost::thread
-  Boost::regex
-  Boost::date_time
-  Threads::Threads
-)
+  add_executable(can_conformance_harness
+    tests/can_conformance_harness.cpp
+    src/charger_config.cpp
+    src/can_plc.cpp
+  )
+  target_include_directories(can_conformance_harness PRIVATE include)
+  target_link_libraries(can_conformance_harness PRIVATE ${_OCPP_APP_LIBS} ${_EVSE_SECURITY_DEP})
+endif()

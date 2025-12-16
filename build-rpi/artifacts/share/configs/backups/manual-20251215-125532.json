@@ -1,0 +1,200 @@
+{
+  "chargePoint": {
+    "id": "jyotisman",
+    "vendor": "JoulePoint",
+    "model": "Joulepoint-DC",
+    "firmwareVersion": "0.0.1",
+    "centralSystemURI": "ws://ocpp.joulepoint.com:80",
+    "usePLC": true,
+    "canInterface": "can0"
+  },
+  "plc": {
+    "useCRC8": true,
+    "moduleRelaysEnabled": false,
+    "requireHttpsUploads": true
+  },
+  "uploads": {
+    "maxBytes": 104857600,
+    "connectTimeoutSeconds": 10,
+    "transferTimeoutSeconds": 60,
+    "allowFileTargets": true
+  },
+  "planner": {
+    "prechargeVoltageToleranceV": 50,
+    "prechargeTimeoutMs": 2000,
+    "allowCrossSlotIslands": true
+  },
+  "timeouts": {
+    "authorizationSeconds": 1800,
+    "powerRequestSeconds": 60
+  },
+  "modulePowerKW": 30,
+  "gridLimitKW": 720,
+  "defaultVoltageV": 800,
+  "slots": [
+    { "id": 1, "gunId": 1, "gc": "GC_1", "mc": "MC_1", "cw": 2, "ccw": 12,
+      "modules": [
+        { "id": "M1_0", "mn": "MN_1_0", "type": "maxwell-mxr", "address": 0, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M1_1", "mn": "MN_1_1", "type": "maxwell-mxr", "address": 1, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 2, "gunId": 2, "gc": "GC_2", "mc": "MC_2", "cw": 3, "ccw": 1,
+      "modules": [
+        { "id": "M2_0", "mn": "MN_2_0", "type": "maxwell-mxr", "address": 2, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M2_1", "mn": "MN_2_1", "type": "maxwell-mxr", "address": 3, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 3, "gunId": 3, "gc": "GC_3", "mc": "MC_3", "cw": 4, "ccw": 2,
+      "modules": [
+        { "id": "M3_0", "mn": "MN_3_0", "type": "maxwell-mxr", "address": 4, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M3_1", "mn": "MN_3_1", "type": "maxwell-mxr", "address": 5, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 4, "gunId": 4, "gc": "GC_4", "mc": "MC_4", "cw": 5, "ccw": 3,
+      "modules": [
+        { "id": "M4_0", "mn": "MN_4_0", "type": "maxwell-mxr", "address": 6, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M4_1", "mn": "MN_4_1", "type": "maxwell-mxr", "address": 7, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 5, "gunId": 5, "gc": "GC_5", "mc": "MC_5", "cw": 6, "ccw": 4,
+      "modules": [
+        { "id": "M5_0", "mn": "MN_5_0", "type": "maxwell-mxr", "address": 8, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M5_1", "mn": "MN_5_1", "type": "maxwell-mxr", "address": 9, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 6, "gunId": 6, "gc": "GC_6", "mc": "MC_6", "cw": 7, "ccw": 5,
+      "modules": [
+        { "id": "M6_0", "mn": "MN_6_0", "type": "maxwell-mxr", "address": 10, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M6_1", "mn": "MN_6_1", "type": "maxwell-mxr", "address": 11, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 7, "gunId": 7, "gc": "GC_7", "mc": "MC_7", "cw": 8, "ccw": 6,
+      "modules": [
+        { "id": "M7_0", "mn": "MN_7_0", "type": "maxwell-mxr", "address": 12, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M7_1", "mn": "MN_7_1", "type": "maxwell-mxr", "address": 13, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 8, "gunId": 8, "gc": "GC_8", "mc": "MC_8", "cw": 9, "ccw": 7,
+      "modules": [
+        { "id": "M8_0", "mn": "MN_8_0", "type": "maxwell-mxr", "address": 14, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M8_1", "mn": "MN_8_1", "type": "maxwell-mxr", "address": 15, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 9, "gunId": 9, "gc": "GC_9", "mc": "MC_9", "cw": 10, "ccw": 8,
+      "modules": [
+        { "id": "M9_0", "mn": "MN_9_0", "type": "maxwell-mxr", "address": 16, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M9_1", "mn": "MN_9_1", "type": "maxwell-mxr", "address": 17, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 10, "gunId": 10, "gc": "GC_10", "mc": "MC_10", "cw": 11, "ccw": 9,
+      "modules": [
+        { "id": "M10_0", "mn": "MN_10_0", "type": "maxwell-mxr", "address": 18, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M10_1", "mn": "MN_10_1", "type": "maxwell-mxr", "address": 19, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 11, "gunId": 11, "gc": "GC_11", "mc": "MC_11", "cw": 12, "ccw": 10,
+      "modules": [
+        { "id": "M11_0", "mn": "MN_11_0", "type": "maxwell-mxr", "address": 20, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M11_1", "mn": "MN_11_1", "type": "maxwell-mxr", "address": 21, "group": 0, "ratedPowerKW": 30 }
+      ] },
+    { "id": 12, "gunId": 12, "gc": "GC_12", "mc": "MC_12", "cw": 1, "ccw": 11,
+      "modules": [
+        { "id": "M12_0", "mn": "MN_12_0", "type": "maxwell-mxr", "address": 22, "group": 0, "ratedPowerKW": 30 },
+        { "id": "M12_1", "mn": "MN_12_1", "type": "maxwell-mxr", "address": 23, "group": 0, "ratedPowerKW": 30 }
+      ] }
+  ],
+  "ocpp": {
+    "Internal": {
+      "ChargePointId": "jyotisman",
+      "CentralSystemURI": "ws://ocpp.joulepoint.com:80",
+      "ChargeBoxSerialNumber": "jyotisman",
+      "ChargePointModel": "Joulepoint-DC",
+      "ChargePointVendor": "JoulePoint",
+      "FirmwareVersion": "0.0.1",
+      "LogMessages": true,
+      "LogMessagesFormat": ["log","console_detailed"]
+    },
+    "Core": {
+      "AuthorizeRemoteTxRequests": true,
+      "ClockAlignedDataInterval": 900,
+      "ConnectionTimeOut": 10,
+      "ConnectorPhaseRotation": "0.RST,1.RST,2.RST,3.RST,4.RST,5.RST,6.RST,7.RST,8.RST,9.RST,10.RST,11.RST,12.RST",
+      "AuthorizationCacheEnabled": true,
+      "MinimumStatusDuration": 5,
+      "GetConfigurationMaxKeys": 100,
+      "HeartbeatInterval": 300,
+      "LocalAuthorizeOffline": false,
+      "LocalPreAuthorize": false,
+      "MeterValuesAlignedData": "Energy.Active.Import.Register",
+      "MeterValuesSampledData": "Energy.Active.Import.Register",
+      "MeterValueSampleInterval": 30,
+      "NumberOfConnectors": 12,
+      "ResetRetries": 1,
+      "StopTransactionOnEVSideDisconnect": true,
+      "StopTransactionOnInvalidId": true,
+      "StopTxnAlignedData": "Energy.Active.Import.Register",
+      "StopTxnSampledData": "Energy.Active.Import.Register",
+      "SupportedFeatureProfiles": "Core,FirmwareManagement,RemoteTrigger,Reservation,LocalAuthListManagement,SmartCharging",
+      "TransactionMessageAttempts": 1,
+      "TransactionMessageRetryInterval": 10,
+      "UnlockConnectorOnEVSideDisconnect": true
+    },
+    "FirmwareManagement": {
+      "SupportedFileTransferProtocols": "HTTPS"
+    },
+    "LocalAuthListManagement": {
+      "LocalAuthListEnabled": true,
+      "LocalAuthListMaxLength": 42,
+      "SendLocalListMaxLength": 42
+    },
+    "SmartCharging": {
+      "ChargeProfileMaxStackLevel": 42,
+      "ChargingScheduleAllowedChargingRateUnit": "Current",
+      "ChargingScheduleMaxPeriods": 42,
+      "MaxChargingProfilesInstalled": 42
+    },
+    "Security": {
+      "SecurityProfile": 0
+    },
+    "PnC": {
+      "ISO15118CertificateManagementEnabled": false,
+      "ISO15118PnCEnabled": false,
+      "ContractValidationOffline": false
+    },
+    "CostAndPrice": {
+      "CustomDisplayCostAndPrice": false
+    }
+  },
+  "sharePath": "../libocpp/config/v16",
+  "userConfig": "../data/user_config.json",
+  "databaseDir": "../data/db",
+  "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
+  "messageLogPath": "../logs",
+  "loggingConfig": "../libocpp/config/logging.ini",
+  "meterSampleIntervalSeconds": 30,
+  "connectors": [
+    { "id": 1, "plcId": 0, "label": "Gun 1", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 2, "plcId": 1, "label": "Gun 2", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 3, "plcId": 2, "label": "Gun 3", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 4, "plcId": 3, "label": "Gun 4", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 5, "plcId": 4, "label": "Gun 5", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 6, "plcId": 5, "label": "Gun 6", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 7, "plcId": 6, "label": "Gun 7", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 8, "plcId": 7, "label": "Gun 8", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 9, "plcId": 8, "label": "Gun 9", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 10, "plcId": 9, "label": "Gun 10", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 11, "plcId": 10, "label": "Gun 11", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 },
+    { "id": 12, "plcId": 11, "label": "Gun 12", "maxCurrentA": 200, "maxPowerW": 60000, "maxVoltageV": 1000, "minVoltageV": 200,
+      "requireLock": true, "lockInputSwitch": 3, "meterSource": "plc", "meterScale": 1.0, "meterOffsetWh": 0.0 }
+  ],
+  "security": {
+    "csmsCaBundle": "../data/certs/ca/csms/CSMS_ROOT_CA.pem",
+    "moCaBundle": "../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "v2gCaBundle": "../data/certs/ca/v2g/V2G_ROOT_CA.pem",
+    "clientCertDir": "../data/certs/client/csms",
+    "clientKeyDir": "../data/certs/client/csms",
+    "seccCertDir": "../data/certs/client/cso",
+    "seccKeyDir": "../data/certs/client/cso"
+  }
+}

@@ -52,6 +52,16 @@ cmake --build build -j --target power_manager_tests
 ./build/power_manager_tests
 ```
 
+Raspberry Pi OS (Docker) builds
+-------------------------------
+- Requires Docker Desktop with buildx/qemu enabled (`docker buildx ls` should show `linux/arm64`); no cross toolchain setup needed on the host.
+- Build arm64 artifacts (default): `./docker/build-rpi.sh` → binaries land in `build-rpi/artifacts/bin/` with configs under `build-rpi/artifacts/share/`.
+- 32-bit Pi OS: `PLATFORM=linux/arm/v7 ./docker/build-rpi.sh`.
+- Enable the config web UI (installs WebKit/GTK inside the image): `BUILD_CONFIG_WEB_UI=ON ./docker/build-rpi.sh`.
+- Cross build directly with CMake presets (uses the Raspberry Pi toolchain + Ninja): `cmake --preset rpi-arm64 && cmake --build --preset rpi-arm64 -j` (swap `rpi-armhf` for 32-bit).
+- If you prefer explicit flags, the equivalent manual cross build is: `cmake -S . -B build-rpi -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/raspberrypi.cmake -DRPI_ARCH=armhf -DCMAKE_BUILD_TYPE=Release && cmake --build build-rpi -j`.
+- Copy the `build-rpi/artifacts` directory to your Pi; make sure runtime deps (`libssl-dev`, `libsqlite3-dev`, `libcurl4-openssl-dev`, `libboost-log-dev`, `libwebsockets-dev`) are installed on the target.
+
 Run
 ---
 1. Set CSMS + charger identity in `configs/charger.json`:

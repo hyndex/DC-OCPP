@@ -1,0 +1,57 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "rpi-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-rpi/${presetName}",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/raspberrypi.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_CONFIG_WEB_UI": "OFF",
+        "LIBOCPP_ENABLE_V2": "OFF",
+        "LIBOCPP_ENABLE_V16": "ON",
+        "LIBOCPP_BUILD_TESTING": "OFF",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "rpi-arm64",
+      "displayName": "Raspberry Pi OS (arm64)",
+      "description": "Cross-build for Raspberry Pi OS 64-bit using the provided toolchain file.",
+      "inherits": [
+        "rpi-base"
+      ],
+      "cacheVariables": {
+        "RPI_ARCH": "arm64"
+      }
+    },
+    {
+      "name": "rpi-armhf",
+      "displayName": "Raspberry Pi OS (armhf)",
+      "description": "Cross-build for Raspberry Pi OS 32-bit using the provided toolchain file.",
+      "inherits": [
+        "rpi-base"
+      ],
+      "cacheVariables": {
+        "RPI_ARCH": "armhf"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "rpi-arm64",
+      "configurePreset": "rpi-arm64"
+    },
+    {
+      "name": "rpi-armhf",
+      "configurePreset": "rpi-armhf"
+    }
+  ]
+}
