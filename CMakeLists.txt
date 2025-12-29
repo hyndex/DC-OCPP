@@ -125,9 +125,13 @@ if(NOT nlohmann_json_schema_validator_FOUND
     set(NLOHMANN_JSON_SCHEMA_VALIDATOR_LIBRARY nlohmann_json_schema_validator::nlohmann_json_schema_validator CACHE STRING "json schema validator lib path" FORCE)
   endif()
 endif()
-unset(LIBWEBSOCKETS_LIBRARY CACHE)
-unset(LIBWEBSOCKETS_INCLUDE_DIR CACHE)
+if(DEFINED LIBWEBSOCKETS_LIBRARY AND LIBWEBSOCKETS_LIBRARY MATCHES "\\$<TARGET_FILE:")
+  unset(LIBWEBSOCKETS_LIBRARY CACHE)
+endif()
+find_package(libwebsockets QUIET)
 if(NOT libwebsockets_FOUND)
+  unset(LIBWEBSOCKETS_LIBRARY CACHE)
+  unset(LIBWEBSOCKETS_INCLUDE_DIR CACHE)
   message(STATUS "libwebsockets not found, fetching minimal build")
   FetchContent_Declare(
     libwebsockets
@@ -161,14 +165,8 @@ if(NOT libwebsockets_FOUND)
   if(TARGET websockets AND NOT TARGET websockets_shared)
     add_library(websockets_shared ALIAS websockets)
   endif()
-  if(EXISTS "${libwebsockets_BINARY_DIR}/lib/libwebsockets.a")
-    set(LIBWEBSOCKETS_LIBRARY "${libwebsockets_BINARY_DIR}/lib/libwebsockets.a" CACHE STRING "libwebsockets library" FORCE)
-  elseif(TARGET websockets_shared)
-    set(LIBWEBSOCKETS_LIBRARY "$<TARGET_FILE:websockets_shared>" CACHE STRING "libwebsockets library" FORCE)
-  endif()
-  if(NOT LIBWEBSOCKETS_LIBRARY)
-    set(LIBWEBSOCKETS_LIBRARY "websockets_shared" CACHE STRING "libwebsockets library target" FORCE)
-  endif()
+  set(_lws_lib "${libwebsockets_BINARY_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}websockets${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  set(LIBWEBSOCKETS_LIBRARY "${_lws_lib}" CACHE STRING "libwebsockets library" FORCE)
   if(EXISTS "${libwebsockets_BINARY_DIR}/include")
     set(LIBWEBSOCKETS_INCLUDE_DIR "${libwebsockets_BINARY_DIR}/include" CACHE PATH "libwebsockets include dir" FORCE)
   elseif(TARGET websockets_shared)
@@ -263,6 +261,7 @@ endif()
 if(TARGET everest_log)
   target_compile_options(everest_log PUBLIC -pthread)
   target_link_libraries(everest_log PUBLIC Threads::Threads)
+  target_link_libraries(everest_log PUBLIC Boost::log_setup)
   if(DEFINED Boost_INCLUDE_DIRS)
     target_include_directories(everest_log PUBLIC ${Boost_INCLUDE_DIRS})
   endif()
@@ -358,6 +357,9 @@ set(LIBOCPP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(LIBOCPP16_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 option(BUILD_TESTING "Enable CTest and downstream test targets" OFF)
 option(BUILD_APP_TESTS "Build dc_ocpp/unit test executables" ${BUILD_TESTING})
+if(NOT BUILD_TESTING AND BUILD_APP_TESTS)
+  set(BUILD_APP_TESTS OFF CACHE BOOL "Build dc_ocpp/unit test executables" FORCE)
+endif()
 
 add_subdirectory(libocpp)
 
@@ -428,8 +430,6 @@ set(_OCPP_APP_LIBS
   CURL::libcurl
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
-  Boost::log
-  Boost::log_setup
   Boost::filesystem
   Boost::thread
   Boost::regex
@@ -440,7 +440,7 @@ set(_OCPP_APP_LIBS
 
 target_link_libraries(dc_ocpp PRIVATE ${_OCPP_APP_LIBS})
 
-option(BUILD_CONFIG_WEB_UI "Build the webview-powered config editor" ON)
+option(BUILD_CONFIG_WEB_UI "Build the webview-powered config editor" OFF)
 
 if(BUILD_CONFIG_WEB_UI)
   set(_CAN_BUILD_WEBUI TRUE)

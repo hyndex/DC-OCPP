@@ -36,8 +36,11 @@ find_path(EVEREST_LOG_INCLUDE_DIR
 find_package_handle_standard_args(everest-log DEFAULT_MSG EVEREST_LOG_LIBRARY EVEREST_LOG_INCLUDE_DIR)
 
 if(everest-log_FOUND AND NOT TARGET everest::log)
+    find_package(Boost REQUIRED COMPONENTS log log_setup)
+    find_package(Threads REQUIRED)
     add_library(everest::log UNKNOWN IMPORTED)
     set_target_properties(everest::log PROPERTIES
         IMPORTED_LOCATION "${EVEREST_LOG_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${EVEREST_LOG_INCLUDE_DIR}")
+        INTERFACE_INCLUDE_DIRECTORIES "${EVEREST_LOG_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES "Boost::log;Boost::log_setup;Threads::Threads")
 endif()
