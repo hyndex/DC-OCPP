@@ -119,6 +119,7 @@ PLC/CAN notes
 -------------
 - For real PLC/CAN hardware, set `"usePLC": true`, configure `"canInterface"`, and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.
 - On macOS or other hosts without SocketCAN, the process stays in simulated mode for end-to-end OCPP without field IO.
+- For Waveshare USB-CAN-B adapters (ControlCAN-based), use the provided bridge to expose a SocketCAN interface; see `docs/waveshare_usb_can_b.md`.
 
 Project layout
 --------------
