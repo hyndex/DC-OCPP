@@ -77,6 +77,7 @@ constexpr uint8_t CONFIG_PARAM_PROTO_VERSION = can_contract::kConfigParamProtoVe
 constexpr uint32_t CAN_PROTOCOL_VERSION = can_contract::kProtoVersion;
 constexpr uint8_t CONFIG_PARAM_AUTH_STATE = can_contract::kConfigParamAuthState;
 constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = can_contract::kConfigParamAuthPending;
+constexpr uint8_t CONFIG_PARAM_LOCK_CMD = can_contract::kConfigParamLockCmd;
 constexpr std::chrono::milliseconds AUTH_REFRESH_INTERVAL_MS(1000);
 
 uint16_t le_u16(const uint8_t* p) {
@@ -618,11 +619,25 @@ void PlcHardware::apply_power_allocation(std::int32_t connector, int modules) {
 
 ocpp::v16::UnlockStatus PlcHardware::unlock(std::int32_t /*connector*/) {
     std::lock_guard<std::mutex> lock(mtx_);
-    // For hardware integration, drive lock actuator open here. Default to unlocked state.
+    const bool can_available = (sock_ >= 0);
+    bool failed = false;
     for (auto& kv : nodes_) {
-        kv.second.lock_engaged = false;
+        bool sent = true;
+        if (can_available) {
+            sent = send_config_command(kv.second, CONFIG_PARAM_LOCK_CMD, 0U);
+        }
+        if (sent || !can_available) {
+            kv.second.lock_engaged = false;
+            kv.second.lock_feedback_engaged = false;
+        }
+        if (can_available && !sent) {
+            failed = true;
+        }
     }
-    return ocpp::v16::UnlockStatus::Unlocked;
+    if (!can_available) {
+        return ocpp::v16::UnlockStatus::Unlocked;
+    }
+    return failed ? ocpp::v16::UnlockStatus::UnlockFailed : ocpp::v16::UnlockStatus::Unlocked;
 }
 
 ocpp::v16::ReservationStatus PlcHardware::reserve(std::int32_t /*reservation_id*/, std::int32_t /*connector*/,
@@ -1376,6 +1391,10 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         handle_rfid_event(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (EVCCID_BASE & PLC_TX_MASK)) {
         handle_identity_segment(*node, node->evccid, AuthTokenSource::Autocharge, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (EMAID0_BASE & PLC_TX_MASK)) {
+        handle_identity_segment(*node, node->emaid0, AuthTokenSource::Autocharge, data, len);
+    } else if ((can_id & PLC_TX_MASK) == (EMAID1_BASE & PLC_TX_MASK)) {
+        handle_identity_segment(*node, node->emaid1, AuthTokenSource::Autocharge, data, len);
     } else if ((can_id & PLC_TX_MASK) == (EVMAC_BASE & PLC_TX_MASK)) {
         handle_identity_segment(*node, node->evmac, AuthTokenSource::Autocharge, data, len);
     } else if ((can_id & PLC_TX_MASK) == (CONFIG_ACK_BASE & PLC_TX_MASK)) {

@@ -2,35 +2,37 @@
 
 This document captures the production contract between the PLC firmware (ISO/DIN/V2G stack) and the controller (OCPP + power/module orchestration). It reflects the current implementation and MUST be honored in production deployments.
 
-## ID map (extended IDs, 0x0F low nibble = plc_id)
+## ID map (extended IDs, low nibble = plc_id)
 
 - PLC→Controller
-  - `0x200 + plc_id` CHARGEINFO: HLC stage/flags (auth pending/granted, lock, contactor state)
-  - `0x210 + plc_id` EVDC_TARGETS: EV target V/I + EVSE present V/I (0.1V/0.1A)
-  - `0x220 + plc_id` EVDC_MAX_LIMITS: EV max limits (EV-requested)
-  - `0x230 + plc_id` EVDC_ENERGY_LIMITS: EV energy limits (if used)
-  - `0x250 + plc_id` EVAC_CTRL: SLAC/SDP control
-  - `0x260/0x270 + plc_id` EMAID segments
-  - `0x280 + plc_id` EVCCID segments
-  - `0x240 + plc_id` EVMAC segments (optional)
-  - `0x410 + plc_id` CHARGING_SESSION: HLC session flags
-  - `0x430 + plc_id` CP_LEVELS: CP state/duty/voltages
-  - `0x100 + plc_id` RELAY_STATUS: relay feedback + safety bits
-  - `0x190 + plc_id` SAFETY_STATUS: e-stop/earth/comm faults
-  - `0x170 + plc_id` ENERGY_METER: V/I/P/Energy
-  - `0x1A0 + plc_id` CONFIG_ACK: ACK for EVSE limit/config params (param=90 EVSE_LIMIT_ACK)
-  - `0x1B0 + plc_id` DEBUG_INFO: diag counters
+  - `0x0100|(0x0<<4)|plc_id` CHARGEINFO: HLC stage/flags (auth pending/granted, lock, contactor state)
+  - `0x0200|(0x1<<4)|plc_id` EVDC_TARGETS: EV target V/I + EVSE present V/I (0.1V/0.1A)
+  - `0x0200|(0x0<<4)|plc_id` EVDC_MAX_LIMITS: EV max limits (EV-requested)
+  - `0x0200|(0x3<<4)|plc_id` EVDC_ENERGY_LIMITS: EV energy limits (if used)
+  - `0x0200|(0x5<<4)|plc_id` EVAC_CTRL: SLAC/SDP control
+  - `0x0200|(0x6<<4)|plc_id` EMAID0 segments
+  - `0x0200|(0x7<<4)|plc_id` EMAID1 segments
+  - `0x0200|(0x8<<4)|plc_id` EVCCID segments
+  - `0x0200|(0x4<<4)|plc_id` EVMAC segments (optional)
+  - `0x0400|(0x1<<4)|plc_id` CHARGING_SESSION: HLC session flags
+  - `0x0400|(0x3<<4)|plc_id` CP_LEVELS: CP state/duty/voltages
+  - `0x0100|(0x6<<4)|plc_id` RELAY_STATUS: relay feedback + safety bits
+  - `0x0100|(0x9<<4)|plc_id` SAFETY_STATUS: e-stop/earth/comm faults
+  - `0x0100|(0x7<<4)|plc_id` ENERGY_METER: V/I/P/Energy
+  - `0x0100|(0xA<<4)|plc_id` CONFIG_ACK: ACK for EVSE limit/config params (param=90 EVSE_LIMIT_ACK)
+  - `0x0100|(0xB<<4)|plc_id` DEBUG_INFO: diag counters
 
 - Controller→PLC
-  - `0x300 + plc_id` EVSE_DC_MAX_LIMITS_CMD: EVSE capability (0.1V/0.1A/0.1kW). **Cadence: ≥1 Hz**
-  - `0x310 + plc_id` EVSE_DC_PRESENT_CMD: EVSE present V/I/P + flags. **Cadence: ≥10 Hz**
+  - `0x0300|(0x0<<4)|plc_id` EVSE_DC_MAX_LIMITS_CMD: EVSE capability (0.1V/0.1A/0.1kW). **Cadence: ≥1 Hz**
+  - `0x0300|(0x1<<4)|plc_id` EVSE_DC_PRESENT_CMD (EVSE_DC_REG_LIMITS): EVSE present V/I/P + flags. **Cadence: ≥10 Hz**
     - byte6 bits: b0=output_enabled, b1=regulating, b2..b7=fault_bits[0..5] (see below)
-  - `0x330 + plc_id` CONFIG_CMD: runtime config (auth pending/granted etc.)
+  - `0x0300|(0x8<<4)|plc_id` CONFIG_CMD: runtime config (auth pending/granted etc.)
     - param 91: PROTO_VERSION (value must equal `1`); PLC returns NOT_ALLOWED on mismatch.
     - param 20: AUTH_STATE (0/1 = denied/granted)
     - param 21: AUTH_PENDING (0/1)
-  - `0x340 + plc_id` RELAY_CMD: module/gun relay drive (used only when controller owns GC)
-  - `0x390 + plc_id` GCMC_CMD: mirrored relay command (legacy)
+    - param 30: LOCK_CMD (0=unlock, 1=lock)
+  - `0x0300|(0x4<<4)|plc_id` RELAY_CMD: module/gun relay drive (used only when controller owns GC)
+  - `0x0300|(0x9<<4)|plc_id` GCMC_CMD: mirrored relay command (legacy)
 
 ## Ownership rules
 
@@ -58,7 +60,8 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 - EVSE_DC_PRESENT_CMD (`0x310+id`): send every 100 ms nominal; **warn at > presentWarnMs (default 1000 ms)**, controller will flag comm fault and constrain power on staleness.
 - EVSE_DC_MAX_LIMITS_CMD (`0x300+id`): send every 1 s nominal and whenever derates change; **warn at > limitsWarnMs (default 1500 ms)**, controller will constrain power on staleness.
 - PLC must ACK EVSE limits via CONFIG_ACK param 90. Controller will constrain power if ACK is stale (`evseLimitAckTimeoutMs`).
-- PROTO_VERSION (param 91) handshake is mandatory; the controller expects value `1` and treats mismatches as a comm fault. Frames that carry CRC8 must use DLC=8; shorter frames are rejected as CRC mode mismatches.
+- PROTO_VERSION (param 91) handshake is mandatory; the controller expects value `1` and treats mismatches as a comm fault.
+- CRC8 (poly 0x07, init 0x00) is required on RelayControl/RelayStatus/SafetyStatus/GCMC_Command/GCMC_Status/ConfigCmd/ConfigAck **and** EVSE_DC_MAX_LIMITS/EVSE_DC_PRESENT; frames that carry CRC8 must use DLC=8.
 - Authorization state must be refreshed by controller every ~1 s; PLC must treat AUTH_PENDING as valid until controller clears it.
 
 ## Identity / Autocharge

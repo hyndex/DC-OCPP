@@ -146,7 +146,7 @@ PLC / CAN contract (summary)
 ----------------------------
 Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/Basic/docs/can_dbc_overview.md`. Key points:
 
-- **Bus**: 29-bit extended IDs, 125 kbps. Low nibble encodes `plcId` (0–15) on both TX and RX IDs. App CRC8 (poly 0x07, init 0x00) in byte7 when non-zero.
+- **Bus**: 29-bit extended IDs, 125 kbps. Low nibble encodes `plcId` (0–15) on both TX and RX IDs. CRC8 (poly 0x07, init 0x00) is required on RelayControl/RelayStatus/SafetyStatus/GCMC_Command/GCMC_Status/ConfigCmd/ConfigAck and EVSE_DC_MAX_LIMITS/EVSE_DC_PRESENT (byte7).
 - **RX IDs (host → PLC)**  
   - `RelayControl`: `0x0300 | ((0x4<<4)|plcId)` — safety-critical. Signals: `RLY1_CMD`, `SYS_ENABLE`, `FORCE_ALL_OFF`, `CLEAR_FAULTS`, `CMD_SEQ`, enable mask, mode, pulse_ms, CRC. Timeout ≈300 ms forces relays off and faults.
   - `ConfigCmd`: `0x0300 | ((0x8<<4)|plcId)` — runtime config get/set. Signals: `CFG_PARAM_ID`, `CFG_OP`, `CFG_VALUE`, reserved, CRC.
@@ -164,7 +164,7 @@ Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/
   - ChargeInfo flags include `auth_granted`, `auth_pending`, and `lock_engaged` in addition to HLC stage flags.
 - **Fault semantics**: Relay timeout/bus-off/CRC fail drive `FAULT_REASON` and `COMM_FAULT`, force relays off. Estop/earth faults clear safety_ok. Remote force-off flagged separately. Missing RX beyond timeout sets comm_fault.
 - **Driver behavior (current code)**:
-  - SocketCAN filters per PLC ID, error-frame handling (bus-off/restart), CRC8 verification when present.
+  - SocketCAN filters per PLC ID, error-frame handling (bus-off/restart), CRC8 verification enforced on required frames.
   - Safety debounced; relay commands expect `CMD_SEQ` ack with retry/backoff (3 attempts) then fault.
   - Meter staleness timeout 2 s; comm faults propagate to OCPP faults; ConfigAck logged.
   - Single CAN interface per config (one socket), multiple PLCs allowed via distinct `plcId`.
@@ -188,7 +188,7 @@ Configuration notes
 -------------------
 - `configs/charger.json` fields:
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
-- `plc` block: `useCRC8` (enable host-side CRC8 generation/verification on all PLC frames) and
+- `plc` block: `useCRC8` (retained for compatibility; host enforces CRC8 on required frames) and
   `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles), `moduleRelaysEnabled`
   (drive PLC module relays; set false when external module CAN drivers manage power modules directly).
 - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,

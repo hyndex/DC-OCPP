@@ -3,17 +3,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
-#include <set>
+#include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <thread>
-#include <cmath>
-#include <limits>
 #include <type_traits>
-#include <cstddef>
 #include <nlohmann/json.hpp>
 
 #include <everest/logging.hpp>
@@ -33,6 +35,129 @@ constexpr std::chrono::seconds LOCAL_AUTH_CACHE_TTL(24 * 3600);
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
+
+bool has_nonempty_file(const fs::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) {
+        return false;
+    }
+    const auto size = fs::file_size(path, ec);
+    if (ec) {
+        return false;
+    }
+    return size > 0;
+}
+
+bool should_use_stub_security(const ChargerConfig& cfg) {
+    const char* env = std::getenv("DC_OCPP_STUB_SECURITY");
+    if (env && std::string(env) != "0") {
+        return true;
+    }
+    return !(has_nonempty_file(cfg.security.csms_ca_bundle) &&
+             has_nonempty_file(cfg.security.mo_ca_bundle) &&
+             has_nonempty_file(cfg.security.v2g_ca_bundle));
+}
+
+class NoopEvseSecurity : public ocpp::EvseSecurity {
+public:
+    explicit NoopEvseSecurity(SecurityConfig cfg) : cfg_(std::move(cfg)) {}
+
+    ocpp::InstallCertificateResult install_ca_certificate(const std::string&,
+                                                          const ocpp::CaCertificateType&) override {
+        return ocpp::InstallCertificateResult::Accepted;
+    }
+
+    ocpp::DeleteCertificateResult delete_certificate(const ocpp::CertificateHashDataType&) override {
+        return ocpp::DeleteCertificateResult::Accepted;
+    }
+
+    ocpp::InstallCertificateResult update_leaf_certificate(const std::string&,
+                                                           const ocpp::CertificateSigningUseEnum&) override {
+        return ocpp::InstallCertificateResult::Accepted;
+    }
+
+    ocpp::CertificateValidationResult verify_certificate(const std::string&,
+                                                         const ocpp::LeafCertificateType&) override {
+        return ocpp::CertificateValidationResult::Valid;
+    }
+
+    ocpp::CertificateValidationResult verify_certificate(
+        const std::string&, const std::vector<ocpp::LeafCertificateType>&) override {
+        return ocpp::CertificateValidationResult::Valid;
+    }
+
+    std::vector<ocpp::CertificateHashDataChain>
+    get_installed_certificates(const std::vector<ocpp::CertificateType>&) override {
+        return {};
+    }
+
+    std::vector<ocpp::OCSPRequestData> get_v2g_ocsp_request_data() override {
+        return {};
+    }
+
+    std::vector<ocpp::OCSPRequestData> get_mo_ocsp_request_data(const std::string&) override {
+        return {};
+    }
+
+    void update_ocsp_cache(const ocpp::CertificateHashDataType&, const std::string&) override {}
+
+    bool is_ca_certificate_installed(const ocpp::CaCertificateType& certificate_type) override {
+        return has_nonempty_file(bundle_for_type(certificate_type));
+    }
+
+    ocpp::GetCertificateSignRequestResult generate_certificate_signing_request(
+        const ocpp::CertificateSigningUseEnum&, const std::string&, const std::string&, const std::string&,
+        bool) override {
+        return {ocpp::GetCertificateSignRequestStatus::GenerationError, std::nullopt};
+    }
+
+    ocpp::GetCertificateInfoResult get_leaf_certificate_info(const ocpp::CertificateSigningUseEnum&,
+                                                             bool) override {
+        return {ocpp::GetCertificateInfoStatus::NotFound, std::nullopt};
+    }
+
+    bool update_certificate_links(const ocpp::CertificateSigningUseEnum&) override {
+        return false;
+    }
+
+    std::string get_verify_file(const ocpp::CaCertificateType& certificate_type) override {
+        return bundle_for_type(certificate_type).string();
+    }
+
+    std::string get_verify_location(const ocpp::CaCertificateType& certificate_type) override {
+        const auto path = bundle_for_type(certificate_type);
+        if (path.empty()) {
+            return {};
+        }
+        return path.parent_path().string();
+    }
+
+    int get_leaf_expiry_days_count(const ocpp::CertificateSigningUseEnum&) override {
+        return -1;
+    }
+
+private:
+    fs::path bundle_for_type(const ocpp::CaCertificateType& certificate_type) const {
+        switch (certificate_type) {
+        case ocpp::CaCertificateType::CSMS:
+            return cfg_.csms_ca_bundle;
+        case ocpp::CaCertificateType::MO:
+            return cfg_.mo_ca_bundle;
+        case ocpp::CaCertificateType::V2G:
+            return cfg_.v2g_ca_bundle;
+        case ocpp::CaCertificateType::MF:
+            return cfg_.mo_ca_bundle;
+        case ocpp::CaCertificateType::OEM:
+            return {};
+        }
+        return {};
+    }
+
+    SecurityConfig cfg_;
+};
 
 std::chrono::milliseconds evse_limit_ack_timeout(const ChargerConfig& cfg) {
     return std::chrono::milliseconds(std::max(1, cfg.evse_limit_ack_timeout_ms));
@@ -364,9 +489,19 @@ bool OcppAdapter::start() {
     security_cfg.secc_leaf_cert_directory = cfg_.security.secc_cert_dir;
     security_cfg.secc_leaf_key_directory = cfg_.security.secc_key_dir;
 
-    charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
-                                                             cfg_.database_dir, cfg_.sql_migrations,
-                                                             cfg_.message_log_path, nullptr, security_cfg);
+    std::shared_ptr<ocpp::EvseSecurity> evse_security;
+    if (should_use_stub_security(cfg_)) {
+        EVLOG_warning << "EVSE security bundles missing/empty; using stub security backend. "
+                      << "Set DC_OCPP_STUB_SECURITY=0 after installing CA bundles.";
+        evse_security = std::make_shared<NoopEvseSecurity>(cfg_.security);
+        charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
+                                                                 cfg_.database_dir, cfg_.sql_migrations,
+                                                                 cfg_.message_log_path, evse_security, std::nullopt);
+    } else {
+        charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
+                                                                 cfg_.database_dir, cfg_.sql_migrations,
+                                                                 cfg_.message_log_path, nullptr, security_cfg);
+    }
 
     register_callbacks();
 

@@ -32,6 +32,7 @@ struct Options {
     int timing1{-1};
     int poll_ms{1};
     bool verbose{false};
+    bool listen_only{false};
 };
 
 void print_usage(const char* argv0) {
@@ -44,6 +45,7 @@ void print_usage(const char* argv0) {
         << "  --timing0 <value>   Override Timing0 (hex like 0x03 or decimal)\n"
         << "  --timing1 <value>   Override Timing1 (hex like 0x1C or decimal)\n"
         << "  --poll-ms <ms>      Sleep between polls (default: 1)\n"
+        << "  --listen-only       Listen-only mode (no ACK/Tx on the CAN bus)\n"
         << "  --verbose           Log bridge activity\n"
         << "  --help              Show this help\n";
 }
@@ -70,6 +72,10 @@ bool parse_args(int argc, char* argv[], Options& opts) {
         }
         if (arg == "--verbose") {
             opts.verbose = true;
+            continue;
+        }
+        if (arg == "--listen-only") {
+            opts.listen_only = true;
             continue;
         }
         auto require_value = [&](const char* name) -> std::string {
@@ -161,7 +167,7 @@ bool init_device(const Options& opts, int timing0, int timing1) {
     cfg.Filter = 1;
     cfg.Timing0 = static_cast<UCHAR>(timing0);
     cfg.Timing1 = static_cast<UCHAR>(timing1);
-    cfg.Mode = 0;
+    cfg.Mode = opts.listen_only ? 1 : 0;
 
     if (VCI_InitCAN(VCI_USBCAN2, static_cast<DWORD>(opts.device_index),
                     static_cast<DWORD>(opts.channel_index), &cfg) != STATUS_OK) {
