@@ -604,6 +604,10 @@ void SimulatedHardware::publish_fault_state(std::int32_t connector, uint8_t faul
     (void)fault_bits;
 }
 
+void SimulatedHardware::clear_faults(std::int32_t connector) {
+    clear_fault_override(connector);
+}
+
 std::vector<AuthToken> SimulatedHardware::poll_auth_tokens() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<AuthToken> tokens;

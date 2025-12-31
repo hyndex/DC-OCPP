@@ -1539,6 +1539,9 @@ void OcppAdapter::report_fault(std::int32_t connector, const ocpp::v16::ErrorInf
 }
 
 void OcppAdapter::clear_faults(std::int32_t connector) {
+    if (hardware_) {
+        hardware_->clear_faults(connector);
+    }
     if (charge_point_) {
         charge_point_->on_all_errors_cleared(connector);
     }

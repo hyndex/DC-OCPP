@@ -164,6 +164,7 @@ public:
     void publish_evse_present(std::int32_t connector, double voltage_v, double current_a,
                               double power_kw, bool output_enabled, bool regulating) override;
     void publish_fault_state(std::int32_t connector, uint8_t fault_bits) override;
+    void clear_faults(std::int32_t connector) override;
     /// \brief Inject a CAN frame directly (bypasses socket RX) for replay/testing.
     void ingest_can_frame(uint32_t can_id, const uint8_t* data, size_t len);
     void ingest_can_frame(uint32_t can_id, const std::vector<uint8_t>& data) {
@@ -204,6 +205,8 @@ private:
         bool mc_closed_cmd{true};
         bool gc_closed_cmd{false};
         uint8_t module_mask{0x00}; // bit0: gun, bit1: module1, bit2: module2
+        bool clear_faults_pending{false};
+        uint8_t clear_faults_attempts{0};
         double energy_fallback_Wh{0.0};
         std::chrono::steady_clock::time_point last_energy_update{};
         bool meter_fallback_active{false};
@@ -288,7 +291,6 @@ private:
     void handle_rtt_log(Node& node, const uint8_t* data, size_t len);
     void handle_software_info(Node& node, const uint8_t* data, size_t len);
     void handle_error_codes(Node& node, const uint8_t* data, size_t len);
-    void handle_hw_config(Node& node, const uint8_t* data, size_t len);
     void handle_rfid_event(Node& node, const uint8_t* data, size_t len);
     void handle_identity_segment(Node& node, SegmentBuffer& buffer, AuthTokenSource source, const uint8_t* data,
                                  size_t len);

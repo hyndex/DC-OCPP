@@ -41,6 +41,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
 - Module relays (RLY2/RLY3) may be driven by PLC when `plc.moduleRelaysEnabled=true` else controller/hardware driver manages modules directly.
 - When both RELAY_CMD and mirrored GCMC_CMD are present, PLC gives priority to RELAY_CMD updates received within 50 ms; GCMC_CMD is used only as a legacy fallback when no fresh RELAY_CMD is seen.
+- `CLEAR_FAULTS` in RELAY_CMD/GCMC_CMD is asserted only on explicit operator/service request (no auto-clear on any fault).
 
 ## Fault propagation (controller → PLC)
 

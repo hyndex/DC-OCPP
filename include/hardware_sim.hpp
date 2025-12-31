@@ -63,6 +63,7 @@ public:
     void apply_power_allocation(std::int32_t connector, int modules) override;
     void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
     void publish_fault_state(std::int32_t connector, uint8_t fault_bits) override;
+    void clear_faults(std::int32_t connector) override;
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
 

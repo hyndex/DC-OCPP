@@ -63,7 +63,6 @@ constexpr uint32_t RTEVLOG_BASE = 0x420;
 constexpr uint32_t RTTLOG_BASE = 0x400;
 constexpr uint32_t SOFTWARE_INFO_BASE = 0x110;
 constexpr uint32_t ERROR_CODES_BASE = 0x120;
-constexpr uint32_t HW_CONFIG_BASE = 0x306;
 constexpr std::chrono::milliseconds RELAY_TIMEOUT_MS(300);
 constexpr std::chrono::milliseconds METER_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
@@ -79,6 +78,7 @@ constexpr uint8_t CONFIG_PARAM_AUTH_STATE = can_contract::kConfigParamAuthState;
 constexpr uint8_t CONFIG_PARAM_AUTH_PENDING = can_contract::kConfigParamAuthPending;
 constexpr uint8_t CONFIG_PARAM_LOCK_CMD = can_contract::kConfigParamLockCmd;
 constexpr std::chrono::milliseconds AUTH_REFRESH_INTERVAL_MS(1000);
+constexpr uint8_t CLEAR_FAULTS_MAX_ATTEMPTS = 3;
 
 uint16_t le_u16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -395,8 +395,6 @@ bool PlcHardware::open_socket() {
         f.can_id = sw_info.id; f.can_mask = sw_info.mask; filters.push_back(f);
         const PlcFilterSpec err = make_plc_rx_filter(ERROR_CODES_BASE, plc_id);
         f.can_id = err.id; f.can_mask = err.mask; filters.push_back(f);
-        const PlcFilterSpec hw_cfg = make_plc_rx_filter(HW_CONFIG_BASE, plc_id);
-        f.can_id = hw_cfg.id; f.can_mask = hw_cfg.mask; filters.push_back(f);
     }
     if (!filters.empty()) {
         if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, filters.data(),
@@ -1014,6 +1012,14 @@ void PlcHardware::publish_fault_state(std::int32_t connector, uint8_t fault_bits
     }
 }
 
+void PlcHardware::clear_faults(std::int32_t connector) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (auto* node = find_node(connector)) {
+        node->clear_faults_pending = true;
+        node->clear_faults_attempts = CLEAR_FAULTS_MAX_ATTEMPTS;
+    }
+}
+
 void PlcHardware::update_fault_bits(Node& node, uint8_t fault_bits,
                                     const std::chrono::steady_clock::time_point& now) {
     node.fault_bits = static_cast<uint8_t>(fault_bits & 0x3F); // 6 bits packed into EVSE_PRESENT flags
@@ -1207,7 +1213,7 @@ bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off)
     }
     data[0] |= (1 << 3);                 // SYS_ENABLE
     if (force_all_off) data[0] |= (1 << 4);
-    const bool clear_faults = node.status.last_fault_reason != 0;
+    const bool clear_faults = node.clear_faults_pending && node.clear_faults_attempts > 0;
     if (clear_faults) data[0] |= (1 << 5); // CLEAR_FAULTS
     const uint8_t seq = node.cmd_seq++;
     data[1] = seq;
@@ -1230,6 +1236,15 @@ bool PlcHardware::send_relay_command(Node& node, bool close, bool force_all_off)
         node.retry_count = 0;
         node.last_cmd_close = close;
         node.last_force_all_off = force_all_off;
+        if (clear_faults && node.clear_faults_attempts > 0) {
+            node.clear_faults_attempts--;
+            if (node.clear_faults_attempts == 0) {
+                node.clear_faults_pending = false;
+                EVLOG_warning << "PLC " << node.cfg.plc_id
+                              << " clear-faults attempts exhausted; fault_reason="
+                              << static_cast<int>(node.status.last_fault_reason);
+            }
+        }
         // Mirror command on GCMC path for firmware that consumes it.
         if (!send_gcmc_command(node, seq, close, force_all_off)) {
             EVLOG_warning << "Failed to send GCMC command to PLC " << node.cfg.plc_id;
@@ -1385,8 +1400,6 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
         handle_software_info(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (ERROR_CODES_BASE & PLC_TX_MASK)) {
         handle_error_codes(*node, data, len);
-    } else if ((can_id & PLC_TX_MASK) == (HW_CONFIG_BASE & PLC_TX_MASK)) {
-        handle_hw_config(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (RFID_EVENT_BASE & PLC_TX_MASK)) {
         handle_rfid_event(*node, data, len);
     } else if ((can_id & PLC_TX_MASK) == (EVCCID_BASE & PLC_TX_MASK)) {
@@ -1444,7 +1457,7 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
     PlcSafetyStatus s = node.status.safety;
     s.safety_ok = (data[2] & 0x10) != 0;    // bit20
     s.earth_fault = (data[2] & 0x20) != 0;  // bit21
-    s.estop = (data[2] & 0x80) != 0;        // bit23
+    s.estop = (data[2] & 0x80) != 0 || (data[2] & 0x08) != 0; // bit23 or estop_latched
     node.status.last_cmd_seq_applied = data[1];
     node.status.last_cmd_seq_received = data[1];
     s.comm_fault = (data[0] & 0x80) != 0;   // bit7
@@ -1459,9 +1472,15 @@ void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t le
         if (fault_reason == 7) {
             s.remote_force_off = true;
         }
-        if (fault_reason == 10 || fault_reason == 12) {
+        if (fault_reason == 10) {
             s.earth_fault = true;
         }
+        if (fault_reason == 4 || fault_reason == 12) {
+            s.estop = true;
+        }
+    } else if (node.clear_faults_pending) {
+        node.clear_faults_pending = false;
+        node.clear_faults_attempts = 0;
     }
     const bool lock_input = derive_lock_input(node, data[2], true);
     node.lock_feedback_engaged = lock_input;
@@ -1481,7 +1500,7 @@ void PlcHardware::handle_safety_status(Node& node, const uint8_t* data, size_t l
     PlcSafetyStatus s = node.status.safety;
     s.safety_ok = (data[0] & 0x10) != 0;
     s.earth_fault = (data[0] & 0x20) != 0;
-    s.estop = (data[0] & 0x08) != 0;
+    s.estop = (data[0] & 0x08) != 0 || (data[0] & 0x80) != 0;
     s.comm_fault = false; // explicit status frame indicates comm alive
     const bool lock_input = derive_lock_input(node, data[0], false);
     node.lock_feedback_engaged = lock_input;
@@ -1664,9 +1683,15 @@ void PlcHardware::handle_gcmc_status(Node& node, const uint8_t* data, size_t len
         if (fault_reason == 7) {
             s.remote_force_off = true;
         }
-        if (fault_reason == 10 || fault_reason == 12) {
+        if (fault_reason == 10) {
             s.earth_fault = true;
         }
+        if (fault_reason == 4 || fault_reason == 12) {
+            s.estop = true;
+        }
+    } else if (node.clear_faults_pending) {
+        node.clear_faults_pending = false;
+        node.clear_faults_attempts = 0;
     }
     node.status.last_fault_reason = fault_reason;
     node.status.pending_safety = s;
@@ -1781,12 +1806,6 @@ void PlcHardware::handle_error_codes(Node& node, const uint8_t* data, size_t len
         EVLOG_error << "PLC " << node.cfg.plc_id << " error code " << static_cast<int>(node.status.error_code);
         node.status.safety.safety_ok = false;
     }
-    node.status.last_any_rx = std::chrono::steady_clock::now();
-}
-
-void PlcHardware::handle_hw_config(Node& node, const uint8_t* data, size_t len) {
-    (void)data;
-    (void)len;
     node.status.last_any_rx = std::chrono::steady_clock::now();
 }
 
@@ -2001,7 +2020,7 @@ bool PlcHardware::send_gcmc_command(Node& node, uint8_t seq, bool close, bool fo
     data[6] = 0;
     data[7] = 0;
     if (force_all_off) data[0] |= (1 << 7);
-    const bool clear_faults = node.status.last_fault_reason != 0;
+    const bool clear_faults = node.clear_faults_pending && node.clear_faults_attempts > 0;
     if (clear_faults) data[0] |= (1 << 6);
     if (use_crc8_) {
         data[7] = plc_crc8(data, 7);

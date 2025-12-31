@@ -184,6 +184,9 @@ public:
         (void)fault_bits;
     }
 
+    /// \brief Explicitly request clearing latched hardware faults (no-op if unsupported).
+    virtual void clear_faults(std::int32_t connector) { (void)connector; }
+
     /// \brief Drain any auth tokens (RFID/Autocharge/etc.) detected by the hardware since the last poll.
     /// Default implementation returns an empty list.
     virtual std::vector<AuthToken> poll_auth_tokens() { return {}; }
