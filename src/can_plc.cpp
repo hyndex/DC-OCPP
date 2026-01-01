@@ -69,7 +69,7 @@ constexpr std::chrono::milliseconds SAFETY_DEBOUNCE_MS(50);
 constexpr std::chrono::milliseconds CP_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds BUS_IDLE_TIMEOUT_MS(1000);
 constexpr std::chrono::milliseconds PROTO_VERSION_RETRY_MS(1000);
-constexpr uint8_t HLC_POWER_DELIVERY_STAGE = 4;
+constexpr uint8_t HLC_POWER_DELIVERY_STAGE = can_contract::kHlcStageWaitPowerDelivery; // aligns with PLC HlcStage::HLC_WAIT_POWER_DELIVERY
 constexpr std::chrono::seconds SEGMENT_TTL(5);
 constexpr uint8_t CONFIG_PARAM_EVSE_LIMIT_ACK = can_contract::kConfigParamEvseLimitAck;
 constexpr uint8_t CONFIG_PARAM_PROTO_VERSION = can_contract::kConfigParamProtoVersion;
@@ -312,6 +312,12 @@ bool PlcHardware::open_socket() {
         EVLOG_error << "Failed to open CAN socket on " << iface_ << ": " << std::strerror(errno);
         return false;
     }
+    {
+        const int recv_own = 0;
+        if (setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own)) < 0) {
+            EVLOG_warning << "Failed to disable CAN_RAW_RECV_OWN_MSGS on " << iface_ << ": " << std::strerror(errno);
+        }
+    }
     struct ifreq ifr {};
     std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface_.c_str());
     if (ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) {
@@ -441,6 +447,9 @@ PlcHardware::PlcHardware(const ChargerConfig& cfg, bool open_can) : use_crc8_(cf
                                                      upload_allow_file_targets_(cfg.upload_allow_file_targets) {
     iface_ = cfg.can_interface.empty() ? "can0" : cfg.can_interface;
     for (const auto& c : cfg.connectors) {
+        if (c.plc_id < 0 || c.plc_id > 15) {
+            throw std::runtime_error("Invalid plc_id " + std::to_string(c.plc_id) + " (must be 0..15)");
+        }
         if (plc_to_connector_.count(c.plc_id)) {
             throw std::runtime_error("Duplicate plc_id " + std::to_string(c.plc_id) + " in PLC driver init");
         }
@@ -957,6 +966,26 @@ GunStatus PlcHardware::get_status(std::int32_t connector) {
             node->relay_conflict_count++;
         }
     }
+    if (!node->crc_mode_mismatch) {
+        const uint8_t relay_faults = node->status.relay_fault_mask;
+        if (relay_faults & 0x01) {
+            st.gc_welded = true;
+        }
+        if (relay_faults & 0x02) {
+            st.mc_welded = true;
+            healthy_mask &= static_cast<uint8_t>(~0x01U);
+            fault_mask |= 0x01;
+        }
+        if (relay_faults & 0x04) {
+            st.mc_welded = true;
+            healthy_mask &= static_cast<uint8_t>(~0x02U);
+            fault_mask |= 0x02;
+        }
+        if (gun_relay_owned_by_plc_ && (node->module_mask & 0x06) == 0 &&
+            (node->status.relay_state_mask & 0x01)) {
+            st.gc_welded = true;
+        }
+    }
     st.relay_closed = st.relay_closed && !node->crc_mode_mismatch;
     st.module_healthy_mask = healthy_mask;
     st.module_fault_mask = fault_mask;
@@ -1359,6 +1388,8 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
             return;
         }
     }
+    node->crc_mode_mismatch = false;
+    node->crc_mode_mismatch_logged = false;
     node->crc_fault_logged = false;
     node->status.last_any_rx = rx_time;
     prune_segment_buffers(*node, rx_time);
@@ -1453,11 +1484,14 @@ void PlcHardware::handle_frame(uint32_t can_id, const uint8_t* data, size_t len)
 void PlcHardware::handle_relay_status(Node& node, const uint8_t* data, size_t len) {
     if (len < 6) return;
     node.status.relay_state_mask = data[0] & 0x07;
+    node.status.relay_fault_mask = static_cast<uint8_t>((data[0] >> 3) & 0x07);
     node.status.relay_closed = (data[0] & 0x01) != 0;
     PlcSafetyStatus s = node.status.safety;
     s.safety_ok = (data[2] & 0x10) != 0;    // bit20
     s.earth_fault = (data[2] & 0x20) != 0;  // bit21
-    s.estop = (data[2] & 0x80) != 0 || (data[2] & 0x08) != 0; // bit23 or estop_latched
+    const bool estop_latched = (data[2] & 0x08) != 0;
+    const bool estop_input = (data[2] & 0x80) != 0;
+    s.estop = estop_latched || estop_input;
     node.status.last_cmd_seq_applied = data[1];
     node.status.last_cmd_seq_received = data[1];
     s.comm_fault = (data[0] & 0x80) != 0;   // bit7
@@ -1500,7 +1534,9 @@ void PlcHardware::handle_safety_status(Node& node, const uint8_t* data, size_t l
     PlcSafetyStatus s = node.status.safety;
     s.safety_ok = (data[0] & 0x10) != 0;
     s.earth_fault = (data[0] & 0x20) != 0;
-    s.estop = (data[0] & 0x08) != 0 || (data[0] & 0x80) != 0;
+    const bool estop_latched = (data[0] & 0x08) != 0;
+    const bool estop_input = (data[0] & 0x80) != 0;
+    s.estop = estop_latched || estop_input;
     s.comm_fault = false; // explicit status frame indicates comm alive
     const bool lock_input = derive_lock_input(node, data[0], false);
     node.lock_feedback_engaged = lock_input;
@@ -1929,16 +1965,12 @@ bool PlcHardware::derive_lock_input(const Node& node, uint8_t sw_mask_byte, bool
 }
 
 bool PlcHardware::derive_hlc_power_ready(const PlcStatus& status, bool authorized) const {
-    if (!authorized) {
-        return false;
-    }
-    if (status.hlc_charge_complete) {
-        return false;
-    }
-    if (status.hlc_stage >= HLC_POWER_DELIVERY_STAGE && (status.hlc_cable_check_ok || !status.hlc_precharge_active)) {
-        return true;
-    }
-    return false;
+    if (!authorized) return false;
+    if (status.hlc_charge_complete) return false;
+    if (status.hlc_stage < HLC_POWER_DELIVERY_STAGE) return false;
+    if (!status.hlc_cable_check_ok) return false;
+    if (status.hlc_precharge_active) return false;
+    return true;
 }
 
 void PlcHardware::update_hlc_state(Node& node, uint8_t stage, uint8_t flags) {

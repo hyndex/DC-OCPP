@@ -214,6 +214,7 @@
     "prechargeVoltageToleranceV": 50
   },
   "plc": {
+    "gunRelayOwnedByPlc": false,
     "moduleRelaysEnabled": false,
     "requireHttpsUploads": true,
     "useCRC8": true

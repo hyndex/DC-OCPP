@@ -532,6 +532,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(power_manager_tests PRIVATE include)
   target_link_libraries(power_manager_tests PRIVATE pthread)
+  target_compile_definitions(power_manager_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(power_manager_invariants_tests
     tests/power_manager_invariants_tests.cpp
@@ -539,12 +540,14 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(power_manager_invariants_tests PRIVATE include)
   target_link_libraries(power_manager_invariants_tests PRIVATE pthread)
+  target_compile_definitions(power_manager_invariants_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(can_crc_filter_tests
     tests/can_crc_filter_tests.cpp
   )
   target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
   target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
+  target_compile_definitions(can_crc_filter_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(can_protocol_vectors_tests
     tests/can_protocol_vectors_tests.cpp
@@ -552,6 +555,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
   target_link_libraries(can_protocol_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(can_protocol_vectors_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(can_end_to_end_sim_tests
     tests/can_end_to_end_sim_tests.cpp
@@ -560,6 +564,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(can_end_to_end_sim_tests PRIVATE include libocpp/include Ref/Basic/src/firmware/util)
   target_link_libraries(can_end_to_end_sim_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(can_end_to_end_sim_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(auth_flow_tests
     tests/auth_flow_tests.cpp
@@ -572,6 +577,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
   target_link_libraries(auth_flow_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(auth_flow_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(deterministic_vectors_tests
     tests/deterministic_vectors_tests.cpp
@@ -584,6 +590,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
   target_link_libraries(deterministic_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(deterministic_vectors_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(pending_token_persistence_tests
     tests/pending_token_persistence_tests.cpp
@@ -596,6 +603,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
   target_link_libraries(pending_token_persistence_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(pending_token_persistence_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(derate_fault_tests
     tests/derate_fault_tests.cpp
@@ -608,6 +616,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
   target_link_libraries(derate_fault_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(derate_fault_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(limit_fallback_tests
     tests/limit_fallback_tests.cpp
@@ -620,6 +629,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
   target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(limit_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(island_manager_tests
     tests/island_manager_tests.cpp
@@ -627,6 +637,7 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(island_manager_tests PRIVATE include)
   target_link_libraries(island_manager_tests PRIVATE pthread)
+  target_compile_definitions(island_manager_tests PRIVATE CHARGER_UNIT_TESTS)
 
   add_executable(can_conformance_harness
     tests/can_conformance_harness.cpp
@@ -635,4 +646,5 @@ if(BUILD_APP_TESTS)
   )
   target_include_directories(can_conformance_harness PRIVATE include)
   target_link_libraries(can_conformance_harness PRIVATE ${_OCPP_APP_LIBS} ${_EVSE_SECURITY_DEP})
+  target_compile_definitions(can_conformance_harness PRIVATE CHARGER_UNIT_TESTS)
 endif()

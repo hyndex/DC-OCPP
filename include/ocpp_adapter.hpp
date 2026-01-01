@@ -61,6 +61,51 @@ private:
         std::chrono::steady_clock::time_point expires_at;
     };
 
+#ifdef CHARGER_UNIT_TESTS
+public:
+    struct TestHook {
+        using ActiveSession = OcppAdapter::ActiveSession;
+        using PendingToken = OcppAdapter::PendingToken;
+
+        static void record_presence_state(OcppAdapter& adapter, std::int32_t connector, bool plugged_in,
+                                          const std::chrono::steady_clock::time_point& now) {
+            adapter.record_presence_state(connector, plugged_in, now);
+        }
+
+        static void ingest_auth_tokens(OcppAdapter& adapter, const std::vector<AuthToken>& tokens,
+                                       const std::chrono::steady_clock::time_point& now) {
+            adapter.ingest_auth_tokens(tokens, now);
+        }
+
+        static std::optional<PendingToken>
+        pop_next_pending_token(OcppAdapter& adapter, std::int32_t connector, const std::chrono::steady_clock::time_point& now,
+                               const std::optional<std::string>& required_token = std::nullopt,
+                               const std::optional<std::string>& parent_token = std::nullopt) {
+            return adapter.pop_next_pending_token(connector, now, required_token, parent_token);
+        }
+
+        static AuthorizationState try_authorize_with_token(OcppAdapter& adapter, std::int32_t connector,
+                                                           ActiveSession& session, const PendingToken& pending) {
+            return adapter.try_authorize_with_token(connector, session, pending);
+        }
+
+        static void persist_pending_tokens(OcppAdapter& adapter) { adapter.persist_pending_tokens(); }
+
+        static void set_auth_state(OcppAdapter& adapter, std::int32_t connector, AuthorizationState state) {
+            adapter.set_auth_state(connector, state);
+        }
+
+        static void apply_power_plan(OcppAdapter& adapter) { adapter.apply_power_plan(); }
+
+        static std::mutex& session_mutex(OcppAdapter& adapter) { return adapter.session_mutex_; }
+        static std::map<std::int32_t, ActiveSession>& sessions(OcppAdapter& adapter) { return adapter.sessions_; }
+        static std::map<std::int32_t, bool>& plugged_in_state(OcppAdapter& adapter) { return adapter.plugged_in_state_; }
+        static std::map<int, bool>& power_constrained(OcppAdapter& adapter) { return adapter.power_constrained_; }
+    };
+
+private:
+#endif
+
     ChargerConfig cfg_;
     std::shared_ptr<HardwareInterface> hardware_;
     std::unique_ptr<ocpp::v16::ChargePoint> charge_point_;

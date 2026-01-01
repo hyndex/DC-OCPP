@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#define private public
-#define protected public
 #include "can_plc.hpp"
-#undef private
-#undef protected
 
 #include <cassert>
 #include <chrono>
@@ -38,6 +34,7 @@ uint8_t crc_for(std::initializer_list<uint8_t> bytes) {
 
 int main() {
     auto cfg = make_cfg();
+    const uint32_t plc_id = static_cast<uint32_t>(cfg.connectors.at(0).plc_id & 0x0F);
 
     // Golden CRC vectors for controller->PLC frames (bytes0..6 -> crc in byte7).
     {
@@ -51,48 +48,39 @@ int main() {
     // GCMC status ACK tracking must not clear awaiting_ack on stale status frames.
     {
         PlcHardware plc(cfg, false);
-        auto* node = plc.find_node(1);
-        assert(node != nullptr);
-        node->awaiting_ack = true;
-        node->expected_cmd_seq = 0x0B;
-        node->retry_count = 1;
+        PlcHardware::TestHook::set_ack_state(plc, 1, true, 0x0B, 1);
 
         uint8_t stale[8] = {0x07, 0x03, 0x00, 0x00, 0x00, 0x0A, 0x0A, 0x00};
         stale[7] = plc_crc8(stale, 7);
-        const uint32_t id = 0x150 | (node->cfg.plc_id & 0x0F);
+        const uint32_t id = 0x150 | plc_id;
         plc.ingest_can_frame(id, stale, sizeof(stale));
-        assert(node->awaiting_ack);
-        assert(node->expected_cmd_seq == 0x0B);
-        assert(node->status.last_cmd_seq_applied == 0x0A);
+        assert(PlcHardware::TestHook::awaiting_ack(plc, 1));
+        assert(PlcHardware::TestHook::expected_cmd_seq(plc, 1) == 0x0B);
+        assert(PlcHardware::TestHook::status(plc, 1).last_cmd_seq_applied == 0x0A);
 
         uint8_t ack[8] = {0x07, 0x03, 0x00, 0x00, 0x00, 0x0B, 0x0B, 0x00};
         ack[7] = plc_crc8(ack, 7);
         plc.ingest_can_frame(id, ack, sizeof(ack));
-        assert(!node->awaiting_ack);
-        assert(node->retry_count == 0);
-        assert(node->status.last_cmd_seq_applied == 0x0B);
-        assert(node->expected_cmd_seq == 0x0B);
+        assert(!PlcHardware::TestHook::awaiting_ack(plc, 1));
+        assert(PlcHardware::TestHook::retry_count(plc, 1) == 0);
+        assert(PlcHardware::TestHook::status(plc, 1).last_cmd_seq_applied == 0x0B);
+        assert(PlcHardware::TestHook::expected_cmd_seq(plc, 1) == 0x0B);
     }
 
     // CRC/DLC enforcement for CRC-protected frames (len != 8 must fault).
     {
         PlcHardware plc(cfg, false);
-        auto* node = plc.find_node(1);
-        assert(node != nullptr);
         uint8_t relay_status_bad[7] = {0x03, 0x12, 0x10, 0x00, 0x2A, 0x00, 0x00}; // missing CRC byte
-        const uint32_t id = 0x160 | (node->cfg.plc_id & 0x0F);
+        const uint32_t id = 0x160 | plc_id;
         plc.ingest_can_frame(id, relay_status_bad, sizeof(relay_status_bad));
-        assert(node->crc_mode_mismatch);
-        assert(node->status.safety.comm_fault);
+        assert(PlcHardware::TestHook::crc_mode_mismatch(plc, 1));
+        assert(PlcHardware::TestHook::status(plc, 1).safety.comm_fault);
     }
 
     // Golden PLC->controller parsing vectors (RELAY_STATUS, SAFETY_STATUS, GCMC_STATUS, CONFIG_ACK).
     {
         PlcHardware plc(cfg, false);
-        auto* node = plc.find_node(1);
-        assert(node != nullptr);
-        node->protocol_version_ok = true; // avoid handshake retries in test environment
-        const uint32_t plc_id = node->cfg.plc_id & 0x0F;
+        PlcHardware::TestHook::set_protocol_version_ok(plc, 1, true); // avoid handshake retries in test environment
         uint8_t relay_status[8] = {0x03, 0x12, 0x10, 0x00, 0x2A, 0x00, 0x00, 0x5C};
         uint8_t safety_status[8] = {0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xB1};
         uint8_t gcmc_status[8] = {0x07, 0x03, 0x00, 0x00, 0x00, 0x12, 0x12, 0x6B};
@@ -106,9 +94,48 @@ int main() {
         assert(st.relay_closed);
         assert(st.safety_ok);
         assert(!st.comm_fault);
-        assert(node->status.limit_ack_count == 1);
-        assert(node->status.last_cmd_seq_applied == 0x12);
-        assert(node->status.last_cmd_seq_received == 0x12);
+        const auto internal = PlcHardware::TestHook::status(plc, 1);
+        assert(internal.limit_ack_count == 1);
+        assert(internal.last_cmd_seq_applied == 0x12);
+        assert(internal.last_cmd_seq_received == 0x12);
+    }
+
+    // ESTOP is asserted if either ESTOP_LATCHED (bit3) or ESTOP_INPUT (bit7) is set.
+    {
+        PlcHardware plc(cfg, false);
+        PlcHardware::TestHook::set_protocol_version_ok(plc, 1, true);
+
+        {
+            uint8_t safety_status[8] = {static_cast<uint8_t>(0x80), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            safety_status[7] = plc_crc8(safety_status, 7);
+            plc.ingest_can_frame(0x190 | plc_id, safety_status, sizeof(safety_status));
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            const auto st = plc.get_status(1);
+            assert(st.estop);
+        }
+        {
+            uint8_t safety_status[8] = {static_cast<uint8_t>(0x08), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            safety_status[7] = plc_crc8(safety_status, 7);
+            plc.ingest_can_frame(0x190 | plc_id, safety_status, sizeof(safety_status));
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            const auto st = plc.get_status(1);
+            assert(st.estop);
+        }
+    }
+
+    // FaultReason mapping: ESTOP_INPUT_FAULT must set estop, not earth_fault.
+    {
+        PlcHardware plc(cfg, false);
+        PlcHardware::TestHook::set_protocol_version_ok(plc, 1, true);
+
+        uint8_t relay_status[8] = {0x01, 0x12, 0x10, 0x0C, 0x00, 0x00, 0x00, 0x00}; // fault_reason=12
+        relay_status[7] = plc_crc8(relay_status, 7);
+        plc.ingest_can_frame(0x160 | plc_id, relay_status, sizeof(relay_status));
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        const auto st = plc.get_status(1);
+        assert(st.estop);
+        assert(!st.earth_fault);
     }
 
     std::cout << "can_protocol_vectors_tests passed\n";

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include "can_contract.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -28,7 +29,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr uint8_t HLC_MIN_POWER_STAGE = 4;
+constexpr uint8_t HLC_MIN_POWER_STAGE = can_contract::kHlcStageWaitPowerDelivery; // must match PLC HlcStage::HLC_WAIT_POWER_DELIVERY
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::seconds LOCAL_AUTH_CACHE_TTL(24 * 3600);
@@ -219,20 +220,12 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
         return false;
     }
     const bool cp_ready = status.cp_state == 'C' || status.cp_state == 'D';
-    const bool targets_present =
-        status.target_current_a.has_value() || status.target_voltage_v.has_value();
-    const bool measured_present =
-        status.present_voltage_v.has_value() || status.present_current_a.has_value() ||
-        status.present_power_w.has_value();
-    bool hlc_ready = status.hlc_power_ready;
-    if (!hlc_ready && status.hlc_stage >= HLC_MIN_POWER_STAGE && status.hlc_cable_check_ok &&
-        !status.hlc_charge_complete) {
-        hlc_ready = true;
+    if (!cp_ready) return false;
+    if (!status.hlc_power_ready) {
+        return false;
     }
-    if (!hlc_ready && status.hlc_precharge_active && (targets_present || measured_present)) {
-        hlc_ready = true;
-    }
-    return cp_ready && (hlc_ready || targets_present || measured_present);
+    // By this point the PLC has asserted HLC readiness (stage >= POWER_DELIVERY, cable check ok, precharge complete).
+    return true;
 }
 
 int popcount(uint8_t mask) {

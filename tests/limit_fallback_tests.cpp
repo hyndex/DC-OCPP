@@ -1,11 +1,5 @@
-#define private public
-#define protected public
-
 #include "ocpp_adapter.hpp"
 #include "hardware_sim.hpp"
-
-#undef private
-#undef protected
 
 #include <cassert>
 #include <iostream>
@@ -62,33 +56,33 @@ int main() {
     OcppAdapter adapter(cfg, hw);
 
     // Pending authorization should propagate to hardware stub and keep auth not granted.
-    adapter.set_auth_state(1, AuthorizationState::Pending);
+    OcppAdapter::TestHook::set_auth_state(adapter, 1, AuthorizationState::Pending);
     auto st_pending = hw->get_status(1);
     assert(st_pending.authorization_granted == false);
 
     // Seed an authorized session on connector 1.
-    adapter.plugged_in_state_[1] = true;
-    OcppAdapter::ActiveSession session{};
+    OcppAdapter::TestHook::plugged_in_state(adapter)[1] = true;
+    OcppAdapter::TestHook::ActiveSession session{};
     session.session_id = "s1";
     session.authorized = true;
     session.ev_connected = true;
     session.connected_at = now;
     {
-        std::lock_guard<std::mutex> lock(adapter.session_mutex_);
-        adapter.sessions_[1] = session;
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter));
+        OcppAdapter::TestHook::sessions(adapter)[1] = session;
     }
 
     // Case 1: stale EVSE limit ACK should constrain power.
     GunStatus stale = make_ready_status(now, true, std::chrono::milliseconds(2000));
     hw->set_status_override(1, stale);
-    adapter.apply_power_plan();
-    assert(adapter.power_constrained_[1] == true);
+    OcppAdapter::TestHook::apply_power_plan(adapter);
+    assert(OcppAdapter::TestHook::power_constrained(adapter)[1] == true);
 
     // Case 2: fresh EVSE limit ACK clears constraint.
     GunStatus fresh = make_ready_status(now, true, std::chrono::milliseconds(10));
     hw->set_status_override(1, fresh);
-    adapter.apply_power_plan();
-    assert(adapter.power_constrained_[1] == false);
+    OcppAdapter::TestHook::apply_power_plan(adapter);
+    assert(OcppAdapter::TestHook::power_constrained(adapter)[1] == false);
 
     std::cout << "Limit fallback tests passed\n";
     return 0;

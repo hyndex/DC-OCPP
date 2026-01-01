@@ -34,6 +34,10 @@ ConnectorConfig parse_connector(const nlohmann::json& connector_json, int defaul
     connector.id = connector_json.value("id", 1);
     connector.label = connector_json.value("label", "");
     connector.plc_id = connector_json.value("plcId", connector.id - 1);
+    if (connector.plc_id < 0 || connector.plc_id > 15) {
+        throw std::runtime_error("Connector plcId must be 0..15 (got " + std::to_string(connector.plc_id) +
+                                 ") for connector id=" + std::to_string(connector.id));
+    }
     connector.can_interface = connector_json.value("canInterface", "");
     connector.max_current_a = connector_json.value("maxCurrentA", 0.0);
     connector.max_power_w = connector_json.value("maxPowerW", 0.0);
@@ -119,7 +123,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
-    cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", true);
+    cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
     cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
     const auto uploads = json.value("uploads", nlohmann::json::object());

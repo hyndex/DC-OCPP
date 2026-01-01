@@ -1,11 +1,5 @@
-#define private public
-#define protected public
-
 #include "ocpp_adapter.hpp"
 #include "hardware_sim.hpp"
-
-#undef private
-#undef protected
 
 #include <cassert>
 #include <filesystem>
@@ -50,17 +44,17 @@ int main() {
     t2.source = AuthTokenSource::RFID;
     t2.received_at = now;
 
-    adapter.ingest_auth_tokens({t1, t2}, now);
-    adapter.persist_pending_tokens(); // force flush to disk
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {t1, t2}, now);
+    OcppAdapter::TestHook::persist_pending_tokens(adapter); // force flush to disk
 
     // Reload adapter from disk; tokens should still be available.
     auto hw2 = std::make_shared<SimulatedHardware>(cfg);
     OcppAdapter adapter2(cfg, hw2);
     const auto load_time = now + std::chrono::seconds(5);
-    auto pt1 = adapter2.pop_next_pending_token(1, load_time);
+    auto pt1 = OcppAdapter::TestHook::pop_next_pending_token(adapter2, 1, load_time);
     assert(pt1.has_value());
     assert(pt1->token.id_token == "PERSIST1");
-    auto pt2 = adapter2.pop_next_pending_token(2, load_time);
+    auto pt2 = OcppAdapter::TestHook::pop_next_pending_token(adapter2, 2, load_time);
     assert(pt2.has_value());
     assert(pt2->token.id_token == "PERSIST2");
 
@@ -83,7 +77,7 @@ int main() {
         out << root.dump(2);
     }
     OcppAdapter adapter3(cfg, hw2);
-    auto expired_tok = adapter3.pop_next_pending_token(1, load_time);
+    auto expired_tok = OcppAdapter::TestHook::pop_next_pending_token(adapter3, 1, load_time);
     assert(!expired_tok.has_value());
 
     std::cout << "Pending token persistence tests passed\n";

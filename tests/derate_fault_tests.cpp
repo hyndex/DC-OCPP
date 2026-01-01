@@ -1,11 +1,5 @@
-#define private public
-#define protected public
-
 #include "ocpp_adapter.hpp"
 #include "hardware_interface.hpp"
-
-#undef private
-#undef protected
 
 #include <cassert>
 #include <iostream>
@@ -72,7 +66,7 @@ int main() {
     OcppAdapter adapter(cfg, hw);
 
     // Install an authorized session so planner runs
-    OcppAdapter::ActiveSession session{};
+    OcppAdapter::TestHook::ActiveSession session{};
     session.session_id = "sess";
     session.authorized = true;
     session.id_token = "TOKEN";
@@ -80,19 +74,19 @@ int main() {
     session.transaction_started = true;
     session.connected_at = std::chrono::steady_clock::now();
     {
-        std::lock_guard<std::mutex> lock(adapter.session_mutex_);
-        adapter.sessions_[1] = session;
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter));
+        OcppAdapter::TestHook::sessions(adapter)[1] = session;
     }
 
     // Case 1: temp below trip, should allow power plan (modules > 0)
     hw->status.connector_temp_c = 70.0;
     hw->status.target_current_a = 50.0;
-    adapter.apply_power_plan();
+    OcppAdapter::TestHook::apply_power_plan(adapter);
     assert(hw->last_cmd.module_count >= 0); // not forced off
 
     // Case 2: temp above trip, safety should cut power and open GC
     hw->status.connector_temp_c = 100.0;
-    adapter.apply_power_plan();
+    OcppAdapter::TestHook::apply_power_plan(adapter);
     assert(hw->last_cmd.module_count == 0);
     assert(hw->last_cmd.gc_closed == false);
     std::cout << "Derate/fault tests passed\n";

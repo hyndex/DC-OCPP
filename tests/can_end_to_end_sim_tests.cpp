@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // End-to-end CAN simulation between controller driver (PlcHardware) and a lightweight PLC
 // model to verify CRC alignment and message semantics in both directions.
-#define private public
-#define protected public
 #include "can_plc.hpp"
-#undef private
-#undef protected
 
 #include "can_contract.hpp"
 #include "crc8.h"
@@ -366,13 +362,11 @@ int main() {
         assert(st.present_current_a.value() > 70.0);
     }
     {
-        std::lock_guard<std::mutex> lock(controller.mtx_);
-        auto* node = controller.find_node(c.id);
-        assert(node != nullptr);
-        assert(node->status.limit_ack_count == 1);
-        assert(node->status.last_cmd_seq_applied == relay_seq);
-        assert(!node->crc_mode_mismatch);
-        assert(!node->status.safety.comm_fault);
+        const auto internal = PlcHardware::TestHook::status(controller, c.id);
+        assert(internal.limit_ack_count == 1);
+        assert(internal.last_cmd_seq_applied == relay_seq);
+        assert(!PlcHardware::TestHook::crc_mode_mismatch(controller, c.id));
+        assert(!internal.safety.comm_fault);
     }
 
     std::cout << "can_end_to_end_sim_tests passed\n";

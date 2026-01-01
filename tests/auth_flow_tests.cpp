@@ -1,11 +1,5 @@
-#define private public
-#define protected public
-
 #include "ocpp_adapter.hpp"
 #include "hardware_sim.hpp"
-
-#undef private
-#undef protected
 
 #include <cassert>
 #include <iostream>
@@ -27,20 +21,20 @@ int main() {
     OcppAdapter adapter(cfg, hw);
 
     // Plug-first then late RemoteStart (prevalidated)
-    adapter.record_presence_state(1, true, now);
+    OcppAdapter::TestHook::record_presence_state(adapter, 1, true, now);
     AuthToken remote1;
     remote1.id_token = "REMOTE1";
     remote1.source = AuthTokenSource::RemoteStart;
     remote1.connector_hint = 1;
     remote1.prevalidated = true;
     remote1.received_at = now;
-    adapter.ingest_auth_tokens({remote1}, now);
-    OcppAdapter::ActiveSession sess1{};
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {remote1}, now);
+    OcppAdapter::TestHook::ActiveSession sess1{};
     sess1.session_id = "s1";
     sess1.connected_at = now;
-    auto pending1 = adapter.pop_next_pending_token(1, now);
+    auto pending1 = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now);
     assert(pending1.has_value());
-    assert(adapter.try_authorize_with_token(1, sess1, *pending1) == AuthorizationState::Granted);
+    assert(OcppAdapter::TestHook::try_authorize_with_token(adapter, 1, sess1, *pending1) == AuthorizationState::Granted);
     assert(sess1.authorized);
     assert(sess1.id_token.value() == "REMOTE1");
 
@@ -51,15 +45,15 @@ int main() {
     remote2.connector_hint = 2;
     remote2.prevalidated = true;
     remote2.received_at = now;
-    adapter.ingest_auth_tokens({remote2}, now);
-    adapter.record_presence_state(2, true, now + std::chrono::seconds(1));
-    OcppAdapter::ActiveSession sess2{};
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {remote2}, now);
+    OcppAdapter::TestHook::record_presence_state(adapter, 2, true, now + std::chrono::seconds(1));
+    OcppAdapter::TestHook::ActiveSession sess2{};
     sess2.session_id = "s2";
     sess2.connected_at = now + std::chrono::seconds(1);
-    auto pending2 = adapter.pop_next_pending_token(2, now + std::chrono::seconds(2));
+    auto pending2 = OcppAdapter::TestHook::pop_next_pending_token(adapter, 2, now + std::chrono::seconds(2));
     assert(pending2.has_value());
     assert(pending2->token.id_token == "REMOTE2");
-    assert(adapter.try_authorize_with_token(2, sess2, *pending2) == AuthorizationState::Granted);
+    assert(OcppAdapter::TestHook::try_authorize_with_token(adapter, 2, sess2, *pending2) == AuthorizationState::Granted);
 
     // Autocharge rejected (not prevalidated) then RFID succeeds
     AuthToken autochg;
@@ -68,14 +62,14 @@ int main() {
     autochg.prevalidated = false;
     autochg.connector_hint = 1;
     autochg.received_at = now;
-    adapter.ingest_auth_tokens({autochg}, now);
-    OcppAdapter::ActiveSession sess3{};
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {autochg}, now);
+    OcppAdapter::TestHook::ActiveSession sess3{};
     sess3.session_id = "s3";
     sess3.connected_at = now;
-    auto first = adapter.pop_next_pending_token(1, now + std::chrono::seconds(1));
+    auto first = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now + std::chrono::seconds(1));
     assert(first.has_value());
     // Autocharge not prevalidated and no CSMS => reject
-    auto state_auto = adapter.try_authorize_with_token(1, sess3, *first);
+    auto state_auto = OcppAdapter::TestHook::try_authorize_with_token(adapter, 1, sess3, *first);
     assert(state_auto == AuthorizationState::Pending);
     assert(!sess3.authorized);
     AuthToken rfid;
@@ -84,11 +78,11 @@ int main() {
     rfid.prevalidated = true;
     rfid.connector_hint = 1;
     rfid.received_at = now + std::chrono::seconds(2);
-    adapter.ingest_auth_tokens({rfid}, now + std::chrono::seconds(2));
-    auto second = adapter.pop_next_pending_token(1, now + std::chrono::seconds(2));
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {rfid}, now + std::chrono::seconds(2));
+    auto second = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now + std::chrono::seconds(2));
     assert(second.has_value());
     assert(second->token.source == AuthTokenSource::RFID);
-    assert(adapter.try_authorize_with_token(1, sess3, *second) == AuthorizationState::Granted);
+    assert(OcppAdapter::TestHook::try_authorize_with_token(adapter, 1, sess3, *second) == AuthorizationState::Granted);
     assert(sess3.authorized);
 
     // Timeout handling drops expired tokens
@@ -98,8 +92,8 @@ int main() {
     expired.prevalidated = true;
     expired.connector_hint = 1;
     expired.received_at = now - std::chrono::seconds(cfg.auth_wait_timeout_s + 5);
-    adapter.ingest_auth_tokens({expired}, now);
-    auto none = adapter.pop_next_pending_token(1, now);
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {expired}, now);
+    auto none = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now);
     assert(!none.has_value());
 
     std::cout << "Auth flow tests passed\n";

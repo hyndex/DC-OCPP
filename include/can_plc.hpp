@@ -85,6 +85,7 @@ struct PlcStatus {
     uint8_t last_cmd_seq_applied{0};
     uint8_t last_cmd_seq_received{0};
     uint8_t relay_state_mask{0};
+    uint8_t relay_fault_mask{0};
     uint8_t last_fault_reason{0};
     uint8_t hlc_stage{0};
     bool hlc_charge_complete{false};
@@ -244,6 +245,71 @@ private:
         SegmentBuffer emaid1;
         SegmentBuffer evmac;
     };
+
+#ifdef CHARGER_UNIT_TESTS
+public:
+    struct TestHook {
+        static void set_ack_state(PlcHardware& hw, std::int32_t connector, bool awaiting_ack, uint8_t expected_cmd_seq,
+                                  int retry_count) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                node->awaiting_ack = awaiting_ack;
+                node->expected_cmd_seq = expected_cmd_seq;
+                node->retry_count = retry_count;
+                node->last_cmd_sent = std::chrono::steady_clock::now();
+            }
+        }
+
+        static bool awaiting_ack(PlcHardware& hw, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                return node->awaiting_ack;
+            }
+            return false;
+        }
+
+        static uint8_t expected_cmd_seq(PlcHardware& hw, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                return node->expected_cmd_seq;
+            }
+            return 0;
+        }
+
+        static int retry_count(PlcHardware& hw, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                return node->retry_count;
+            }
+            return 0;
+        }
+
+        static void set_protocol_version_ok(PlcHardware& hw, std::int32_t connector, bool ok) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                node->protocol_version_ok = ok;
+            }
+        }
+
+        static PlcStatus status(PlcHardware& hw, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                return node->status;
+            }
+            return PlcStatus{};
+        }
+
+        static bool crc_mode_mismatch(PlcHardware& hw, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(hw.mtx_);
+            if (auto* node = hw.find_node(connector)) {
+                return node->crc_mode_mismatch;
+            }
+            return false;
+        }
+    };
+
+private:
+#endif
 
     std::map<std::int32_t, Node> nodes_; // keyed by connector id; one node per CAN iface (enforced in config)
     std::map<int, std::int32_t> plc_to_connector_;

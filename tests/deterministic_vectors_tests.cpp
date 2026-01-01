@@ -1,12 +1,6 @@
-#define private public
-#define protected public
-
 #include "ocpp_adapter.hpp"
 #include "hardware_sim.hpp"
 #include "power_manager.hpp"
-
-#undef private
-#undef protected
 
 #include <cassert>
 #include <iostream>
@@ -63,13 +57,13 @@ int main() {
     autochg.prevalidated = false;
     autochg.connector_hint = 1;
     autochg.received_at = now;
-    adapter.ingest_auth_tokens({autochg}, now);
-    OcppAdapter::ActiveSession sess{};
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {autochg}, now);
+    OcppAdapter::TestHook::ActiveSession sess{};
     sess.session_id = "sess";
     sess.connected_at = now;
-    auto pending_auto = adapter.pop_next_pending_token(1, now + std::chrono::seconds(1));
+    auto pending_auto = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now + std::chrono::seconds(1));
     assert(pending_auto.has_value());
-    auto state_auto = adapter.try_authorize_with_token(1, sess, *pending_auto);
+    auto state_auto = OcppAdapter::TestHook::try_authorize_with_token(adapter, 1, sess, *pending_auto);
     assert(state_auto == AuthorizationState::Pending);
     assert(!sess.authorized);
     AuthToken rfid;
@@ -78,10 +72,10 @@ int main() {
     rfid.prevalidated = true;
     rfid.connector_hint = 1;
     rfid.received_at = now + std::chrono::seconds(2);
-    adapter.ingest_auth_tokens({rfid}, now + std::chrono::seconds(2));
-    auto pending_rfid = adapter.pop_next_pending_token(1, now + std::chrono::seconds(2));
+    OcppAdapter::TestHook::ingest_auth_tokens(adapter, {rfid}, now + std::chrono::seconds(2));
+    auto pending_rfid = OcppAdapter::TestHook::pop_next_pending_token(adapter, 1, now + std::chrono::seconds(2));
     assert(pending_rfid.has_value());
-    auto state_rfid = adapter.try_authorize_with_token(1, sess, *pending_rfid);
+    auto state_rfid = OcppAdapter::TestHook::try_authorize_with_token(adapter, 1, sess, *pending_rfid);
     assert(state_rfid == AuthorizationState::Granted);
     assert(sess.authorized);
 
