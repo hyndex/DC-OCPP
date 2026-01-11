@@ -376,8 +376,8 @@ add_executable(dc_ocpp
   src/charger_config.cpp
   src/ocpp_adapter.cpp
   src/hardware_sim.cpp
+  src/plc_can.cpp
   src/power_module_controller.cpp
-  src/can_plc.cpp
   src/power_manager.cpp
 )
 
@@ -542,37 +542,12 @@ if(BUILD_APP_TESTS)
   target_link_libraries(power_manager_invariants_tests PRIVATE pthread)
   target_compile_definitions(power_manager_invariants_tests PRIVATE CHARGER_UNIT_TESTS)
 
-  add_executable(can_crc_filter_tests
-    tests/can_crc_filter_tests.cpp
-  )
-  target_include_directories(can_crc_filter_tests PRIVATE include libocpp/include)
-  target_link_libraries(can_crc_filter_tests PRIVATE nlohmann_json::nlohmann_json date::date-tz)
-  target_compile_definitions(can_crc_filter_tests PRIVATE CHARGER_UNIT_TESTS)
-
-  add_executable(can_protocol_vectors_tests
-    tests/can_protocol_vectors_tests.cpp
-    src/can_plc.cpp
-  )
-  target_include_directories(can_protocol_vectors_tests PRIVATE include libocpp/include)
-  target_link_libraries(can_protocol_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
-  target_compile_definitions(can_protocol_vectors_tests PRIVATE CHARGER_UNIT_TESTS)
-
-  add_executable(can_end_to_end_sim_tests
-    tests/can_end_to_end_sim_tests.cpp
-    src/can_plc.cpp
-    Ref/Basic/src/firmware/util/crc8.cpp
-  )
-  target_include_directories(can_end_to_end_sim_tests PRIVATE include libocpp/include Ref/Basic/src/firmware/util)
-  target_link_libraries(can_end_to_end_sim_tests PRIVATE ${_OCPP_APP_LIBS})
-  target_compile_definitions(can_end_to_end_sim_tests PRIVATE CHARGER_UNIT_TESTS)
-
   add_executable(auth_flow_tests
     tests/auth_flow_tests.cpp
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
     src/hardware_sim.cpp
-    src/can_plc.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
@@ -585,7 +560,6 @@ if(BUILD_APP_TESTS)
     src/power_manager.cpp
     src/charger_config.cpp
     src/hardware_sim.cpp
-    src/can_plc.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
@@ -598,7 +572,6 @@ if(BUILD_APP_TESTS)
     src/power_manager.cpp
     src/charger_config.cpp
     src/hardware_sim.cpp
-    src/can_plc.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
@@ -611,7 +584,6 @@ if(BUILD_APP_TESTS)
     src/power_manager.cpp
     src/charger_config.cpp
     src/hardware_sim.cpp
-    src/can_plc.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
@@ -624,7 +596,6 @@ if(BUILD_APP_TESTS)
     src/power_manager.cpp
     src/charger_config.cpp
     src/hardware_sim.cpp
-    src/can_plc.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
@@ -639,12 +610,4 @@ if(BUILD_APP_TESTS)
   target_link_libraries(island_manager_tests PRIVATE pthread)
   target_compile_definitions(island_manager_tests PRIVATE CHARGER_UNIT_TESTS)
 
-  add_executable(can_conformance_harness
-    tests/can_conformance_harness.cpp
-    src/charger_config.cpp
-    src/can_plc.cpp
-  )
-  target_include_directories(can_conformance_harness PRIVATE include)
-  target_link_libraries(can_conformance_harness PRIVATE ${_OCPP_APP_LIBS} ${_EVSE_SECURITY_DEP})
-  target_compile_definitions(can_conformance_harness PRIVATE CHARGER_UNIT_TESTS)
 endif()

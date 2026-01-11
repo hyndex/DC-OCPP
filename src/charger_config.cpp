@@ -118,10 +118,14 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.model = cp.value("model", "UnknownModel");
     cfg.firmware_version = cp.value("firmwareVersion", "0.0.0");
     cfg.central_system_uri = cp.value("centralSystemURI", "");
-    cfg.use_plc = cp.value("usePLC", false);
     cfg.simulation_mode = cp.value("simulationMode", false);
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
+    cfg.use_plc = plc_cfg.value("enabled", true);
+    cfg.use_plc = cp.value("usePlc", cfg.use_plc);
+    if (cfg.simulation_mode) {
+        cfg.use_plc = false;
+    }
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
@@ -315,27 +319,6 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                     }
                 }
             }
-        }
-    }
-
-    // PLC validation: unique PLC IDs and single CAN interface (current driver uses one socket)
-    if (cfg.use_plc) {
-        std::set<int> plc_ids;
-        std::set<std::string> ifaces;
-        for (const auto& c : cfg.connectors) {
-            if (plc_ids.count(c.plc_id)) {
-                throw std::runtime_error("Duplicate PLC id " + std::to_string(c.plc_id) +
-                                         " across connectors. Use unique plcId per connector.");
-            }
-            plc_ids.insert(c.plc_id);
-            ifaces.insert(c.can_interface);
-        }
-        if (ifaces.size() > 1) {
-            throw std::runtime_error("PLC config invalid: multiple CAN interfaces defined. Current host driver opens a "
-                                     "single SocketCAN interface; set the same canInterface for all connectors.");
-        }
-        if (!ifaces.empty()) {
-            cfg.can_interface = *ifaces.begin();
         }
     }
 

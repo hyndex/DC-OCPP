@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include "can_contract.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -29,7 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr uint8_t HLC_MIN_POWER_STAGE = can_contract::kHlcStageWaitPowerDelivery; // must match PLC HlcStage::HLC_WAIT_POWER_DELIVERY
+constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power delivery readiness
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::seconds LOCAL_AUTH_CACHE_TTL(24 * 3600);

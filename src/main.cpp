@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "charger_config.hpp"
-#include "can_plc.hpp"
 #include "hardware_sim.hpp"
 #include "ocpp_adapter.hpp"
+#include "plc_can.hpp"
 
 #include <atomic>
 #include <csignal>
@@ -41,19 +41,21 @@ int main(int argc, char* argv[]) {
     }
 
     std::shared_ptr<charger::HardwareInterface> hardware;
-    bool plc_available = false;
-    try {
-        if (cfg.use_plc) {
-            hardware = std::make_shared<charger::PlcHardware>(cfg);
-            plc_available = true;
+    if (cfg.use_plc) {
+        auto plc_hw = std::make_shared<charger::PlcCanHardware>(cfg);
+        if (plc_hw->ok()) {
+            cfg.plc_backend_available = true;
+            hardware = plc_hw;
+            std::cerr << "PLC CAN backend initialized on interface " << cfg.can_interface << std::endl;
+        } else {
+            std::cerr << "PLC CAN backend failed init; falling back to simulation" << std::endl;
+            cfg.use_plc = false;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "PLC hardware init failed (" << e.what() << "), falling back to simulation." << std::endl;
     }
     if (!hardware) {
+        cfg.plc_backend_available = false;
         hardware = std::make_shared<charger::SimulatedHardware>(cfg);
     }
-    cfg.plc_backend_available = plc_available;
     charger::OcppAdapter adapter(cfg, hardware);
 
     if (!adapter.start()) {
