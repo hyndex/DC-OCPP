@@ -53,12 +53,16 @@ bool has_nonempty_file(const fs::path& path) {
 
 bool should_use_stub_security(const ChargerConfig& cfg) {
     const char* env = std::getenv("DC_OCPP_STUB_SECURITY");
-    if (env && std::string(env) != "0") {
-        return true;
+    if (!env) {
+        return false;
     }
-    return !(has_nonempty_file(cfg.security.csms_ca_bundle) &&
-             has_nonempty_file(cfg.security.mo_ca_bundle) &&
-             has_nonempty_file(cfg.security.v2g_ca_bundle));
+    return std::string(env) != "0";
+}
+
+bool security_bundles_ready(const ChargerConfig& cfg) {
+    return has_nonempty_file(cfg.security.csms_ca_bundle) &&
+           has_nonempty_file(cfg.security.mo_ca_bundle) &&
+           has_nonempty_file(cfg.security.v2g_ca_bundle);
 }
 
 class NoopEvseSecurity : public ocpp::EvseSecurity {
@@ -481,9 +485,17 @@ bool OcppAdapter::start() {
     security_cfg.secc_leaf_cert_directory = cfg_.security.secc_cert_dir;
     security_cfg.secc_leaf_key_directory = cfg_.security.secc_key_dir;
 
+    const bool bundles_ready = security_bundles_ready(cfg_);
+    const bool allow_stub = should_use_stub_security(cfg_);
+    if (!bundles_ready && !allow_stub) {
+        EVLOG_error << "EVSE security bundles missing/empty; refusing to start without TLS material. "
+                    << "Install CA bundles or set DC_OCPP_STUB_SECURITY=1 for non-production testing.";
+        return false;
+    }
+
     std::shared_ptr<ocpp::EvseSecurity> evse_security;
-    if (should_use_stub_security(cfg_)) {
-        EVLOG_warning << "EVSE security bundles missing/empty; using stub security backend. "
+    if (!bundles_ready && allow_stub) {
+        EVLOG_warning << "EVSE security bundles missing/empty; using stub security backend (test only). "
                       << "Set DC_OCPP_STUB_SECURITY=0 after installing CA bundles.";
         evse_security = std::make_shared<NoopEvseSecurity>(cfg_.security);
         charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,

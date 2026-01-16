@@ -61,12 +61,48 @@ public:
     bool supports_cross_slot_islands() const override;
 
 private:
+    struct IdentityAssembly {
+        uint8_t len{0};
+        uint8_t seg_cnt{0};
+        std::vector<uint8_t> data;
+        std::vector<bool> received;
+        std::chrono::steady_clock::time_point updated{};
+
+        void reset() {
+            len = 0;
+            seg_cnt = 0;
+            data.clear();
+            received.clear();
+            updated = std::chrono::steady_clock::time_point{};
+        }
+    };
+
+    struct RfidAssembly {
+        uint8_t uid_len{0};
+        uint8_t seg_cnt{0};
+        uint8_t event_id{0};
+        std::vector<uint8_t> data;
+        std::vector<bool> received;
+        std::chrono::steady_clock::time_point updated{};
+
+        void reset() {
+            uid_len = 0;
+            seg_cnt = 0;
+            event_id = 0;
+            data.clear();
+            received.clear();
+            updated = std::chrono::steady_clock::time_point{};
+        }
+    };
+
     struct PlcState {
         ConnectorConfig cfg;
+        int connector_id{0};
         int plc_id{0};
         std::string iface;
         std::atomic<uint8_t> seq{0};
         bool authorized{false};
+        bool auth_pending{false};
         bool sys_enable{false};
         bool output_enabled{false};
         bool regulating{false};
@@ -74,16 +110,56 @@ private:
         double present_voltage_v{0.0};
         double present_current_a{0.0};
         double present_power_kw{0.0};
+        double ev_target_voltage_v{0.0};
+        double ev_target_current_a{0.0};
+        double ev_present_voltage_v{0.0};
+        double ev_present_current_a{0.0};
         double energy_kwh{0.0};
         double freq_hz{0.0};
         can_contract::RelayStatus last_relay{};
         can_contract::SafetyStatus last_safety{};
         can_contract::MeterReading last_meter{};
+        uint32_t evse_limit_ack_count{0};
+        std::chrono::steady_clock::time_point last_evse_limit_ack{};
+        std::chrono::steady_clock::time_point last_energy_update{};
         std::chrono::steady_clock::time_point last_status_rx{};
         std::chrono::steady_clock::time_point last_meter_rx{};
         std::chrono::steady_clock::time_point last_limits_tx{};
         std::chrono::steady_clock::time_point last_present_tx{};
+        std::chrono::steady_clock::time_point last_ev_targets_rx{};
+        std::chrono::steady_clock::time_point last_relay_tx{};
+        std::chrono::steady_clock::time_point last_evse_present_update{};
+        std::chrono::steady_clock::time_point last_cp_rx{};
+        std::chrono::steady_clock::time_point last_chargeinfo_rx{};
+        std::chrono::steady_clock::time_point last_session_rx{};
+        std::chrono::steady_clock::time_point last_boot_rx{};
         EvseLimits limits{};
+        uint8_t relay_cmd_mask{0};
+        uint8_t relay_enable_mask{0};
+        bool relay_force_off{false};
+        bool relay_clear_faults{false};
+        char cp_state{'U'};
+        uint8_t cp_duty_pct{0};
+        uint8_t hlc_stage{0};
+        bool hlc_charge_complete{false};
+        bool hlc_precharge_active{false};
+        bool hlc_cable_checked{false};
+        bool hlc_auth_granted{false};
+        bool hlc_auth_pending{false};
+        bool lock_engaged{false};
+        bool lock_engaged_valid{false};
+        bool lock_command{true};
+        bool lock_command_set{false};
+        uint8_t boot_feature_flags{0};
+        bool meter_available{true};
+        bool protocol_ok{true};
+        bool protocol_sent{false};
+        std::chrono::steady_clock::time_point last_protocol_tx{};
+        IdentityAssembly evccid;
+        IdentityAssembly evemaid0;
+        IdentityAssembly evemaid1;
+        IdentityAssembly evmac;
+        RfidAssembly rfid;
     };
 
     ChargerConfig cfg_;
@@ -96,6 +172,9 @@ private:
     std::atomic<bool> running_{false};
     bool init_ok_{false};
     int connection_timeout_s_{0};
+    mutable std::mutex state_mutex_;
+    std::mutex token_mutex_;
+    std::vector<AuthToken> pending_tokens_;
 
     // Delegate uploads/firmware handling to the simulation backend to reuse tested code-paths.
     std::unique_ptr<SimulatedHardware> diag_helper_;
@@ -109,6 +188,17 @@ private:
     std::int32_t connector_from_plc(uint8_t plc_id) const;
     void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now);
+    void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now);
+    void set_relay_command(PlcState& st, uint8_t module_mask, bool want_power, bool force_off);
+    void set_lock_command(PlcState& st, bool lock);
+    static bool assemble_identity_segment(IdentityAssembly& asmbl,
+                                          const can_contract::IdentitySegment& seg,
+                                          std::chrono::steady_clock::time_point now,
+                                          std::vector<uint8_t>& out);
+    static bool assemble_rfid_segment(RfidAssembly& asmbl,
+                                      const can_contract::RfidEventSegment& seg,
+                                      std::chrono::steady_clock::time_point now,
+                                      std::vector<uint8_t>& out);
     static uint16_t clamp_to_0p1(double v);
     static uint16_t clamp_to_0p1k(double kw);
     static uint16_t clamp_to_0p1_current(double a);

@@ -21,6 +21,13 @@ constexpr uint8_t PARAM_AUTH_PENDING = 21;
 constexpr uint8_t PARAM_LOCK_CMD = 30;
 constexpr uint8_t PARAM_EVSE_LIMIT_ACK = 90;
 constexpr uint8_t PARAM_PROTO_VERSION = 91;
+constexpr uint8_t PROTOCOL_VERSION = 1;
+
+// BootConfig feature flags.
+constexpr uint8_t FEATURE_RELAYS = 1u << 0;
+constexpr uint8_t FEATURE_SAFETY = 1u << 1;
+constexpr uint8_t FEATURE_METER = 1u << 2;
+constexpr uint8_t FEATURE_RFID = 1u << 3;
 
 inline uint32_t rx_id(uint8_t type_nibble, uint8_t plc_id) {
     return RX_BASE_ID | (static_cast<uint32_t>(type_nibble & 0x0Fu) << RX_TYPE_SHIFT) |
@@ -38,10 +45,24 @@ inline uint32_t config_cmd_id(uint8_t plc_id) { return rx_id(0x8u, plc_id); }
 inline uint32_t evse_dc_max_limits_id(uint8_t plc_id) { return rx_id(0x0u, plc_id); }
 inline uint32_t evse_dc_reg_limits_id(uint8_t plc_id) { return rx_id(0x1u, plc_id); }
 
+inline uint32_t charge_info_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x0u, plc_id); }
 inline uint32_t relay_status_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x6u, plc_id); }
 inline uint32_t energy_meter_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x7u, plc_id); }
+inline uint32_t rfid_event_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x8u, plc_id); }
 inline uint32_t safety_status_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x9u, plc_id); }
 inline uint32_t config_ack_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0xAu, plc_id); }
+inline uint32_t evdc_max_limits_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x0u, plc_id); }
+inline uint32_t evdc_targets_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x1u, plc_id); }
+inline uint32_t ev_status_display_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x2u, plc_id); }
+inline uint32_t evdc_energy_limits_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x3u, plc_id); }
+inline uint32_t evac_chg_ctrl_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x5u, plc_id); }
+inline uint32_t evccid_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x8u, plc_id); }
+inline uint32_t evemaid0_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x6u, plc_id); }
+inline uint32_t evemaid1_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x7u, plc_id); }
+inline uint32_t evmac_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x4u, plc_id); }
+inline uint32_t cp_voltage_levels_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x3u, plc_id); }
+inline uint32_t charging_session_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x1u, plc_id); }
+inline uint32_t boot_config_id(uint8_t plc_id) { return TX_BASE_BOOT | static_cast<uint32_t>(plc_id & 0x0Fu); }
 
 constexpr std::array<const char*, 13> FAULT_REASONS = {{
     "OK",
@@ -123,6 +144,104 @@ struct ConfigAck {
     bool crc_ok{true};
 };
 
+struct ChargeInfo {
+    uint8_t hlc_stage{0};
+    bool charge_complete{false};
+    bool precharge_active{false};
+    bool cable_checked{false};
+    bool auth_granted{false};
+    bool auth_pending{false};
+    bool lock_engaged{false};
+    uint8_t target_mv_lsb{0};
+    uint8_t target_ma_lsb{0};
+    uint8_t present_mv_lsb{0};
+    uint8_t present_ma_lsb{0};
+};
+
+struct CpVoltageLevels {
+    uint16_t mv_robust{0};
+    uint16_t mv_peak{0};
+    uint16_t mv_min{0};
+    char cp_state{'U'};
+    uint8_t duty_pct{0};
+};
+
+struct ChargingSession {
+    uint32_t session_epoch{0};
+    char cp_state{'U'};
+    uint8_t duty_pct{0};
+    uint8_t hlc_stage{0};
+    bool auth_pending{false};
+};
+
+struct BootConfig {
+    uint8_t fw_major{0};
+    uint8_t fw_minor{0};
+    uint8_t fw_patch{0};
+    uint8_t feature_flags{0};
+    uint8_t can_bitrate_kbps{0};
+};
+
+struct EvdcTargets {
+    double target_v{0.0};
+    double target_a{0.0};
+    double present_v{0.0};
+    double present_a{0.0};
+};
+
+struct EvdcLimits {
+    double max_voltage_v{0.0};
+    double max_current_a{0.0};
+    double max_power_kw{0.0};
+};
+
+struct EvacChgCtrl {
+    uint8_t duty_pct{0};
+    char cp_state{'U'};
+    double target_v{0.0};
+    double target_a{0.0};
+    double present_a{0.0};
+};
+
+struct RfidEventSegment {
+    uint8_t event_type{0};
+    uint8_t uid_len{0};
+    uint8_t event_id{0};
+    uint8_t seg_idx{0};
+    uint8_t seg_cnt{0};
+    std::array<uint8_t, 5> payload{};
+};
+
+struct IdentitySegment {
+    uint8_t len{0};
+    uint8_t seg_cnt{0};
+    uint8_t seg_idx{0};
+    std::array<uint8_t, 5> payload{};
+};
+
+inline std::array<uint8_t, 8> build_relay_control_masks(uint8_t cmd_mask,
+                                                        uint8_t enable_mask,
+                                                        uint8_t seq,
+                                                        bool sys_enable,
+                                                        bool force_all_off,
+                                                        bool clear_faults,
+                                                        uint16_t pulse_ms,
+                                                        bool use_crc8) {
+    std::array<uint8_t, 8> data{};
+    data[0] = static_cast<uint8_t>(cmd_mask & 0x07u);
+    if (sys_enable) data[0] |= 0x08u;
+    if (force_all_off) data[0] |= 0x10u;
+    if (clear_faults) data[0] |= 0x20u;
+    data[1] = seq;
+    data[2] = static_cast<uint8_t>(enable_mask & 0x07u);
+    data[3] = pulse_ms > 0 ? 1u : 0u;
+    data[4] = static_cast<uint8_t>(pulse_ms & 0xFFu);
+    data[5] = static_cast<uint8_t>((pulse_ms >> 8) & 0xFFu);
+    data[6] = 0;
+    data[7] = use_crc8 ? crc8_07(data.data(), 7) : 0;
+    return data;
+}
+
 inline std::array<uint8_t, 8> build_relay_control(uint8_t relay_mask,
                                                   bool state_on,
                                                   uint8_t seq,
@@ -131,19 +250,9 @@ inline std::array<uint8_t, 8> build_relay_control(uint8_t relay_mask,
                                                   bool clear_faults,
                                                   uint16_t pulse_ms,
                                                   bool use_crc8) {
-    std::array<uint8_t, 8> data{};
-    if (state_on) data[0] |= static_cast<uint8_t>(relay_mask & 0x07u);
-    if (sys_enable) data[0] |= 0x08u;
-    if (force_all_off) data[0] |= 0x10u;
-    if (clear_faults) data[0] |= 0x20u;
-    data[1] = seq;
-    data[2] = static_cast<uint8_t>(relay_mask & 0x07u);
-    data[3] = pulse_ms > 0 ? 1u : 0u;
-    data[4] = static_cast<uint8_t>(pulse_ms & 0xFFu);
-    data[5] = static_cast<uint8_t>((pulse_ms >> 8) & 0xFFu);
-    data[6] = 0;
-    data[7] = use_crc8 ? crc8_07(data.data(), 7) : 0;
-    return data;
+    const uint8_t cmd_mask = state_on ? relay_mask : 0u;
+    return build_relay_control_masks(cmd_mask, relay_mask, seq, sys_enable, force_all_off, clear_faults,
+                                     pulse_ms, use_crc8);
 }
 
 inline std::array<uint8_t, 8> build_config_cmd(uint8_t param_id, uint8_t op, uint32_t value, bool use_crc8) {
@@ -289,6 +398,111 @@ inline ConfigAck decode_config_ack(const uint8_t in[8], bool use_crc8) {
         ack.crc_ok = crc8_07(in, 7) == in[7];
     }
     return ack;
+}
+
+inline ChargeInfo decode_charge_info(const uint8_t in[8]) {
+    ChargeInfo info{};
+    info.hlc_stage = in[0];
+    const uint8_t flags = in[1];
+    info.charge_complete = (flags & 0x01u) != 0;
+    info.precharge_active = (flags & 0x02u) != 0;
+    info.cable_checked = (flags & 0x04u) != 0;
+    info.auth_granted = (flags & 0x08u) != 0;
+    info.auth_pending = (flags & 0x10u) != 0;
+    info.lock_engaged = (flags & 0x20u) != 0;
+    info.target_mv_lsb = in[2];
+    info.target_ma_lsb = in[3];
+    info.present_mv_lsb = in[4];
+    info.present_ma_lsb = in[5];
+    return info;
+}
+
+inline CpVoltageLevels decode_cp_voltage_levels(const uint8_t in[8]) {
+    CpVoltageLevels cp{};
+    cp.mv_robust = static_cast<uint16_t>(in[0]) | (static_cast<uint16_t>(in[1]) << 8);
+    cp.cp_state = static_cast<char>(in[2]);
+    cp.duty_pct = in[3];
+    cp.mv_peak = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+    cp.mv_min = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
+    return cp;
+}
+
+inline ChargingSession decode_charging_session(const uint8_t in[8]) {
+    ChargingSession session{};
+    session.session_epoch = static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
+                            (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
+    session.cp_state = static_cast<char>(in[4]);
+    session.duty_pct = in[5];
+    session.hlc_stage = in[6];
+    session.auth_pending = (in[7] != 0);
+    return session;
+}
+
+inline BootConfig decode_boot_config(const uint8_t in[8]) {
+    BootConfig cfg{};
+    cfg.fw_major = in[0];
+    cfg.fw_minor = in[1];
+    cfg.fw_patch = in[2];
+    cfg.feature_flags = in[3];
+    cfg.can_bitrate_kbps = in[4];
+    return cfg;
+}
+
+inline EvdcTargets decode_evdc_targets(const uint8_t in[8]) {
+    EvdcTargets t{};
+    const uint16_t tgt_v_0p1 = static_cast<uint16_t>(in[0]) | (static_cast<uint16_t>(in[1]) << 8);
+    const uint16_t tgt_i_0p1 = static_cast<uint16_t>(in[2]) | (static_cast<uint16_t>(in[3]) << 8);
+    const uint16_t pres_v_0p1 = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+    const uint16_t pres_i_0p1 = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
+    t.target_v = static_cast<double>(tgt_v_0p1) / 10.0;
+    t.target_a = static_cast<double>(tgt_i_0p1) / 10.0;
+    t.present_v = static_cast<double>(pres_v_0p1) / 10.0;
+    t.present_a = static_cast<double>(pres_i_0p1) / 10.0;
+    return t;
+}
+
+inline EvdcLimits decode_evdc_limits(const uint8_t in[8]) {
+    EvdcLimits l{};
+    const uint16_t max_v_0p1 = static_cast<uint16_t>(in[0]) | (static_cast<uint16_t>(in[1]) << 8);
+    const uint16_t max_i_0p1 = static_cast<uint16_t>(in[2]) | (static_cast<uint16_t>(in[3]) << 8);
+    const uint16_t max_p_0p1k = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+    l.max_voltage_v = static_cast<double>(max_v_0p1) / 10.0;
+    l.max_current_a = static_cast<double>(max_i_0p1) / 10.0;
+    l.max_power_kw = static_cast<double>(max_p_0p1k) / 10.0;
+    return l;
+}
+
+inline EvacChgCtrl decode_evac_chg_ctrl(const uint8_t in[8]) {
+    EvacChgCtrl c{};
+    c.duty_pct = in[0];
+    c.cp_state = static_cast<char>(in[1]);
+    const uint16_t tgt_v_0p1 = static_cast<uint16_t>(in[2]) | (static_cast<uint16_t>(in[3]) << 8);
+    const uint16_t tgt_i_0p1 = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+    const uint16_t pres_i_0p1 = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
+    c.target_v = static_cast<double>(tgt_v_0p1) / 10.0;
+    c.target_a = static_cast<double>(tgt_i_0p1) / 10.0;
+    c.present_a = static_cast<double>(pres_i_0p1) / 10.0;
+    return c;
+}
+
+inline RfidEventSegment decode_rfid_event(const uint8_t in[8]) {
+    RfidEventSegment seg{};
+    seg.uid_len = static_cast<uint8_t>(in[0] & 0x0Fu);
+    seg.event_type = static_cast<uint8_t>((in[0] >> 4) & 0x0Fu);
+    seg.event_id = in[1];
+    seg.seg_idx = static_cast<uint8_t>(in[2] & 0x0Fu);
+    seg.seg_cnt = static_cast<uint8_t>((in[2] >> 4) & 0x0Fu);
+    seg.payload = {in[3], in[4], in[5], in[6], in[7]};
+    return seg;
+}
+
+inline IdentitySegment decode_identity_segment(const uint8_t in[8]) {
+    IdentitySegment seg{};
+    seg.len = in[0];
+    seg.seg_cnt = in[1];
+    seg.seg_idx = in[2];
+    seg.payload = {in[3], in[4], in[5], in[6], in[7]};
+    return seg;
 }
 
 } // namespace charger::can_contract

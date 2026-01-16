@@ -232,4 +232,5 @@ Known gaps / TODO for production
 Security and TLS
 ----------------
 - Certificate bundles and key directories are created automatically on boot if missing.
+- Startup fails if CA bundles are empty unless `DC_OCPP_STUB_SECURITY=1` is set (test only).
 - See `docs/security_pki.md` for provisioning TLS/PKI material for both OCPP and ISO 15118 (CSMS CA, MO/V2G CA, client certs/keys).

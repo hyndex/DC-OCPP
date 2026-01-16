@@ -1,28 +1,32 @@
-# TODO
+# Production Hardening TODO
 
-## Stage 1 — Protocol correctness
-- [x] Fix GCMC status ACK tracking (preserve expected seq; track applied/received separately).
-- [x] Enforce CRC/DLC=8 for CRC-tagged frames and force CRC8 on the controller path.
+This list tracks the end-to-end work required to align the controller and PLC (Ref/Basic) with the CAN contract, V2G flows, and production safety requirements. Update statuses as work completes.
 
-## Stage 2 — PLC firmware hardening
-- [x] Add PROTO_VERSION config param (91) with NOT_ALLOWED on mismatch and controller-side gating.
-- [x] Split EVSE_PRESENT CRC failure accounting and include CRC totals in debug frame.
-- [x] Prioritize RELAY_CMD over legacy GCMC_CMD when both arrive within the shadow window.
+## Stage 0 — Contract Alignment + Safety Gates (Controller)
+- [x] Add CAN contract decoding for ChargeInfo/CP_Voltage_Levels/ChargingSession/RFID/EVCCID/EMAID/EVMAC/BootConfig.
+- [x] Decode EVDC_Targets and use EV setpoints for power planning (avoid treating EVSE limits as targets).
+- [x] Stop overwriting EVSE-present telemetry with setpoints; prefer fresh EVSE present, fallback to EV present.
+- [x] Add PLC lock command support (PARAM_LOCK_CMD) for UnlockConnector + session relock.
+- [x] Track per-PLC CP state, HLC stage/flags, lock feedback, and boot feature flags with freshness gating.
+- [x] Implement periodic RelayControl keepalive (<=100 ms) and map relay ownership via `gunRelayOwnedByPlc`/`moduleRelaysEnabled`.
+- [x] Emit auth tokens from RFID/EVCCID/EMAID/EVMAC frames with de-dup and connector hints.
+- [x] Clear PLC auth pending when authorization is denied/unknown.
+- [x] Record EVSE limit ACKs and surface them in `GunStatus` for safety watchdogs.
+- [x] Meter fallback integration in PLC backend (energy integration + meter availability detection).
 
-## Stage 3 — Validation and docs
-- [x] Add CAN protocol golden-vector tests (CRC + pack/unpack coverage) and wire into CMake.
-- [x] Document protocol version handshake, CRC/DLC enforcement, and relay precedence in `docs/CAN_CONTRACT.md`.
-- [x] Run and record results for the new CAN protocol tests on target build/CI.
-- [x] Collapse protocol constants into a single generated artifact sourced from `docs/can_contract_constants.json` to prevent drift between controller and PLC firmware.
+## Stage 1 — PLC Firmware Readiness (Ref/Basic)
+- [x] Use CAN EVSE present/regulating as PSU readiness to unblock HLC PowerDelivery when hardware PSU is external.
+- [x] Propagate CAN fault bits into PSU fault status (avoid false-ready on faults).
+- [x] Validate protocol version handshake via ConfigCmd/ConfigAck (PARAM_PROTO_VERSION).
+- [ ] Wire module telemetry as the authoritative meter source (controller-side) and verify EnergyMeterData accuracy.
 
-## Stage 4 — Safety/contract alignment
-- [x] Gate PLC clear-faults handling on CRC validity for RelayControl/GCMC commands.
-- [x] Enable RX cadence timeouts for EVSE_DC_PRESENT and EVSE_DC_MAX_LIMITS; align EVSE_PRESENT naming.
-- [x] Make controller clear-faults explicit via HardwareInterface hook; remove auto-clear on any fault.
-- [x] Fix controller fault mapping (earth fault vs estop input) and estop bit interpretation.
-- [x] Remove HW_CONFIG RX handling/filter from controller (Controller→PLC only).
-- [x] Update CAN contract/system overview docs to reflect new timeout and clear-fault semantics.
+## Stage 2 — Security + Auth (Controller/OCPP)
+- [x] Require valid CA bundles by default; allow insecure only via explicit opt-in flag/env var.
+- [ ] (Deferred) Implement ISO15118/PnC DataTransfer handling if/when Plug-and-Charge is required.
+- [ ] Confirm idToken mapping strategy for Autocharge (EVCCID/EMAID/EVMAC) with CSMS.
 
-## Stage 5 — Validation follow-through
-- [x] Run controller/PLC build and CAN protocol tests (`can_crc_filter_tests`, `can_protocol_vectors_tests`, `can_end_to_end_sim_tests`).
-- [ ] Exercise fault-injection checklist on hardware or HIL (CRC bad clear-fault, relay timeout, bus-off recovery).
+## Stage 3 — System Tests + HIL
+- [ ] Run CAN protocol tests (CRC + vector + end-to-end) against updated controller + PLC.
+- [ ] Execute HIL plan (`tests/HIL_PLAN.md`) with PLC hardware and CSMS.
+- [ ] Execute soak plan (`docs/soak_test_plan.md`) and record stability/telemetry results.
+- [ ] Verify security profile compliance (TLS, cert provisioning, revoke/renewal flows).
