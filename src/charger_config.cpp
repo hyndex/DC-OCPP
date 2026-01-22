@@ -186,6 +186,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.telemetry_timeout_ms <= 0) {
         cfg.telemetry_timeout_ms = 2000;
     }
+    if (cfg.max_modules_per_gun > 2) {
+        throw std::runtime_error("maxModulesPerGun > 2 is not supported by this build (PLC relay mask and telemetry "
+                                 "arrays are sized for 2 modules per gun)");
+    }
 
     if (json.contains("ocpp") && json["ocpp"].is_object()) {
         cfg.ocpp_config_inline = json["ocpp"].dump();
@@ -273,6 +277,14 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             ModuleConfig m1{"M" + std::to_string(conn.id) + "_1", "MN_" + std::to_string(conn.id) + "_1"};
             sm.modules = {m0, m1};
             cfg.slots.push_back(sm);
+        }
+    }
+
+    for (const auto& slot : cfg.slots) {
+        if (slot.modules.size() > 2) {
+            throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " has " +
+                                     std::to_string(slot.modules.size()) +
+                                     " modules; this build supports at most 2 modules per slot");
         }
     }
 

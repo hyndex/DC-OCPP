@@ -48,8 +48,10 @@ constexpr std::chrono::milliseconds MAXWELL_POLL_PERIOD(500);
 constexpr std::chrono::seconds TELEMETRY_STALE(2);
 // Severe faults that should mark modules unusable.
 constexpr uint32_t MAXWELL_ALARM_SEVERE_MASK =
-    (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) |
-    (1u << 14) | (1u << 16) | (1u << 17) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
+    (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14) |
+    (1u << 16) | (1u << 17) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
+constexpr uint8_t MAXWELL_ALARM_ONOFF_BIT = 22; // 0=On, 1=Off per V1.50 table.
+constexpr auto MAXWELL_START_TIMEOUT = std::chrono::seconds(2);
 
 struct ModuleSetpoint {
     bool enable{false};
@@ -202,6 +204,12 @@ public:
     void apply(const ModuleSetpoint& sp) override {
         desired_ = sp;
         const auto now = std::chrono::steady_clock::now();
+        if (sp.enable && !last_desired_enable_) {
+            enable_requested_at_ = now;
+        } else if (!sp.enable && last_desired_enable_) {
+            enable_requested_at_ = std::chrono::steady_clock::time_point{};
+        }
+        last_desired_enable_ = sp.enable;
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
@@ -355,14 +363,20 @@ private:
             const uint32_t val = decode_u32_be(&frame.data[4]);
             if (reg == 0x0040) {
                 telemetry_.alarms = val;
+                const bool module_off = (val & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0;
                 const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
-                telemetry_.fault = severe;
+                bool fault = severe;
+                if (!fault && desired_.enable && enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
+                    (now - enable_requested_at_) > MAXWELL_START_TIMEOUT) {
+                    fault = true;
+                }
+                telemetry_.fault = fault;
                 uint8_t bit = 0x01;
                 if (spec_.slot_index >= 0 && spec_.slot_index < 8) {
                     bit = static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index));
                 }
-                telemetry_.healthy_mask = severe ? 0x00 : bit;
-                telemetry_.fault_mask = severe ? bit : 0x00;
+                telemetry_.healthy_mask = fault ? 0x00 : bit;
+                telemetry_.fault_mask = fault ? bit : 0x00;
             }
         }
         telemetry_.last_update = now;
@@ -374,6 +388,8 @@ private:
 
     ModuleSetpoint last_sent_{};
     ModuleSetpoint desired_{};
+    bool last_desired_enable_{false};
+    std::chrono::steady_clock::time_point enable_requested_at_{};
     std::chrono::steady_clock::time_point last_tx_{};
     std::chrono::steady_clock::time_point last_poll_{};
     std::shared_ptr<CanChannel> channel_;
