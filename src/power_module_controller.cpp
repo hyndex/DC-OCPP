@@ -46,6 +46,10 @@ constexpr uint8_t MAXWELL_CONTROLLER_ADDR = 0xF0;
 constexpr std::chrono::milliseconds MAXWELL_PERIODIC_TX(500);
 constexpr std::chrono::milliseconds MAXWELL_POLL_PERIOD(500);
 constexpr std::chrono::seconds TELEMETRY_STALE(2);
+// Severe faults that should mark modules unusable.
+constexpr uint32_t MAXWELL_ALARM_SEVERE_MASK =
+    (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) |
+    (1u << 14) | (1u << 16) | (1u << 17) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
 
 struct ModuleSetpoint {
     bool enable{false};
@@ -65,27 +69,6 @@ struct ModuleTelemetryState {
     uint8_t fault_mask{0};
     std::chrono::steady_clock::time_point last_update{};
 };
-
-void map_maxwell_alarms(uint32_t alarms, uint8_t& healthy_mask, uint8_t& fault_mask) {
-    if (alarms == 0) {
-        healthy_mask = 0x03;
-        fault_mask = 0x00;
-        return;
-    }
-    // Severe faults that should mark modules unusable
-    constexpr uint32_t SEVERE_MASK =
-        (1u << 0) |  (1u << 1) |  (1u << 3) |  (1u << 4) |  (1u << 5) |
-        (1u << 7) |  (1u << 8) |  (1u << 9) |  (1u << 14) | (1u << 16) |
-        (1u << 17) | (1u << 22) | (1u << 27) | (1u << 28) | (1u << 30) |
-        (1u << 31);
-    if ((alarms & SEVERE_MASK) != 0) {
-        healthy_mask = 0x00;
-        fault_mask = 0x03; // both modules in slot
-    } else {
-        healthy_mask = 0x03;
-        fault_mask = 0x00;
-    }
-}
 
 int popcount(uint8_t v) {
     int count = 0;
@@ -128,8 +111,8 @@ public:
             EVLOG_error << "Failed to open CAN socket on " << iface_;
             return;
         }
-        const int on = 1;
-        ::setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &on, sizeof(on));
+        const int recv_own = 0;
+        ::setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own));
         struct ifreq ifr {};
         std::strncpy(ifr.ifr_name, iface_.c_str(), IFNAMSIZ - 1);
         if (::ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) {
@@ -242,17 +225,12 @@ public:
                                    ? static_cast<float>(std::clamp(sp.current_a / rated_current, 0.0, 1.0))
                                    : 1.0f;
             send_set_float(0x0022, frac);
-        if (spec_.rated_power_kw > 0.0 && sp.power_kw > 0.0) {
-            const float p_frac =
-                static_cast<float>(std::clamp(sp.power_kw / spec_.rated_power_kw, 0.0, 1.0));
-            send_set_float(0x0020, p_frac);
+            send_set_int(0x0030, 0x00000000); // startup
+        } else {
+            send_set_int(0x0030, 0x00010000); // shutdown
         }
-        send_set_int(0x0030, 0x00000000); // startup
-    } else {
-        send_set_int(0x0030, 0x00010000); // shutdown
-    }
-    last_sent_ = sp;
-    last_tx_ = now;
+        last_sent_ = sp;
+        last_tx_ = now;
 }
 
     void poll() override {
@@ -278,7 +256,7 @@ private:
     uint32_t build_can_id() const {
         uint32_t id = 0;
         id |= (static_cast<uint32_t>(MAXWELL_PROT_NO & 0x1FF) << 20);
-        id |= (1U << 19); // PTP
+        id |= (static_cast<uint32_t>(spec_.broadcast ? 0 : 1) << 19); // PTP (0=broadcast, 1=point-to-point)
         uint32_t dst = static_cast<uint32_t>(spec_.address & 0xFF);
         if (spec_.broadcast) {
             if (spec_.group <= 7) {
@@ -290,7 +268,9 @@ private:
         }
         id |= (dst << 11);
         id |= (static_cast<uint32_t>(MAXWELL_CONTROLLER_ADDR) << 3);
-        id |= (static_cast<uint32_t>(spec_.group & 0x07));
+        // Extended group broadcasts use GROUP=0; intra-group broadcast uses GROUP=0..7.
+        const uint32_t group = (spec_.broadcast && spec_.group > 7) ? 0u : static_cast<uint32_t>(spec_.group & 0x07);
+        id |= group;
         return id | CAN_EFF_FLAG;
     }
 
@@ -343,8 +323,10 @@ private:
     void handle_frame(const can_frame& frame) {
         const uint32_t id = frame.can_id & CAN_EFF_MASK;
         const uint16_t prot = static_cast<uint16_t>((id >> 20) & 0x1FF);
+        const uint8_t dst_addr = static_cast<uint8_t>((id >> 11) & 0xFF);
         const uint8_t src_addr = static_cast<uint8_t>((id >> 3) & 0xFF);
-        if (prot != MAXWELL_PROT_NO || src_addr != static_cast<uint8_t>(spec_.address & 0xFF)) {
+        if (prot != MAXWELL_PROT_NO || dst_addr != MAXWELL_CONTROLLER_ADDR ||
+            src_addr != static_cast<uint8_t>(spec_.address & 0xFF)) {
             return;
         }
         if (frame.can_dlc < 8) {
@@ -373,12 +355,14 @@ private:
             const uint32_t val = decode_u32_be(&frame.data[4]);
             if (reg == 0x0040) {
                 telemetry_.alarms = val;
-                telemetry_.fault = val != 0;
-                uint8_t healthy_mask = 0x00;
-                uint8_t fault_mask = 0x00;
-                map_maxwell_alarms(val, healthy_mask, fault_mask);
-                telemetry_.healthy_mask = healthy_mask;
-                telemetry_.fault_mask = fault_mask;
+                const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
+                telemetry_.fault = severe;
+                uint8_t bit = 0x01;
+                if (spec_.slot_index >= 0 && spec_.slot_index < 8) {
+                    bit = static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index));
+                }
+                telemetry_.healthy_mask = severe ? 0x00 : bit;
+                telemetry_.fault_mask = severe ? bit : 0x00;
             }
         }
         telemetry_.last_update = now;
@@ -404,7 +388,6 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         modules_.clear();
         slot_index_.clear();
-        channels_.clear();
         for (auto& spec : specs) {
             if (spec.type.empty()) {
                 continue;
@@ -418,7 +401,9 @@ public:
             std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             spec.type = type_lower;
-            auto chan = get_or_create_channel(spec.can_interface);
+            // Use a dedicated SocketCAN channel per module to avoid receive-drain races between drivers.
+            // (Each socket will still see the bus, but they don't steal frames from each other.)
+            auto chan = std::make_shared<CanChannel>(spec.can_interface);
             ModuleRuntime rt;
             rt.spec = spec;
             rt.driver = make_driver(spec, chan);
@@ -474,14 +459,20 @@ public:
         }
         snap.valid = true;
         const auto now = std::chrono::steady_clock::now();
+        double voltage_sum = 0.0;
+        int voltage_count = 0;
+        double current_sum = 0.0;
+        bool any_telem = false;
         for (auto idx : it->second) {
             if (idx >= modules_.size()) continue;
             const auto& mod = modules_[idx];
             const auto& telem = mod.driver ? mod.driver->telemetry() : ModuleTelemetryState{};
             const bool fresh = telem.last_update.time_since_epoch().count() > 0 &&
                                (now - telem.last_update) <= TELEMETRY_STALE;
-            const bool healthy = fresh && !telem.fault && telem.fault_mask == 0 && telem.alarms == 0;
-            const uint8_t bit = static_cast<uint8_t>(1U << mod.spec.slot_index);
+            const bool healthy = fresh && !telem.fault && telem.fault_mask == 0;
+            const uint8_t bit = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8)
+                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(mod.spec.slot_index))
+                                    : 0x00;
             if (healthy) {
                 if (telem.healthy_mask) {
                     snap.healthy_mask |= telem.healthy_mask;
@@ -498,6 +489,18 @@ public:
             if (mod.spec.slot_index < static_cast<int>(snap.temperatures_c.size())) {
                 snap.temperatures_c[mod.spec.slot_index] = telem.temperature_c;
             }
+            if (fresh) {
+                any_telem = true;
+                voltage_sum += telem.voltage_v;
+                voltage_count++;
+                current_sum += telem.current_a;
+            }
+        }
+        if (any_telem && voltage_count > 0) {
+            snap.telemetry_valid = true;
+            snap.voltage_v = voltage_sum / static_cast<double>(voltage_count);
+            snap.current_a = current_sum;
+            snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
         }
         return snap;
     }
@@ -517,16 +520,6 @@ private:
         std::unique_ptr<ModuleDriver> driver;
     };
 
-    std::shared_ptr<CanChannel> get_or_create_channel(const std::string& iface) {
-        const auto it = channels_.find(iface);
-        if (it != channels_.end()) {
-            return it->second;
-        }
-        auto chan = std::make_shared<CanChannel>(iface);
-        channels_[iface] = chan;
-        return chan;
-    }
-
     static std::unique_ptr<ModuleDriver> make_driver(const ModuleSpec& spec,
                                                      const std::shared_ptr<CanChannel>& channel) {
         if (spec.type == "maxwell-mxr" || spec.type == "maxwell") {
@@ -538,7 +531,6 @@ private:
     mutable std::mutex mtx_;
     std::vector<ModuleRuntime> modules_;
     std::map<int, std::vector<size_t>> slot_index_;
-    std::map<std::string, std::shared_ptr<CanChannel>> channels_;
 };
 } // namespace
 

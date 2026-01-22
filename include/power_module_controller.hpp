@@ -38,6 +38,10 @@ struct ModuleHealthSnapshot {
     uint8_t healthy_mask{0};
     uint8_t fault_mask{0};
     std::array<double, 2> temperatures_c{{0.0, 0.0}};
+    bool telemetry_valid{false};
+    double voltage_v{0.0};
+    double current_a{0.0};
+    double power_kw{0.0};
 };
 
 /// \brief Externalized power-module controller with pluggable module drivers (e.g. Maxwell MXR).

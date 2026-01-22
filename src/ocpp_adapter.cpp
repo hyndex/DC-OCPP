@@ -404,6 +404,7 @@ void OcppAdapter::initialize_slots() {
                 ms.rated_current_a = m.rated_current_a;
                 ms.poll_interval_ms = m.poll_interval_ms;
                 ms.cmd_interval_ms = m.cmd_interval_ms;
+                ms.broadcast = m.broadcast;
                 module_states_.push_back(ms);
             }
             slots.push_back(s);
@@ -460,6 +461,7 @@ void OcppAdapter::initialize_slots() {
         spec.rated_current_a = ms.rated_current_a;
         spec.poll_interval_ms = ms.poll_interval_ms;
         spec.cmd_interval_ms = ms.cmd_interval_ms;
+        spec.broadcast = ms.broadcast;
         module_specs.push_back(spec);
     }
     if (!module_specs.empty()) {
@@ -1882,6 +1884,10 @@ void OcppAdapter::apply_power_plan() {
             power_constrained_[c.id] = true;
         }
         const Slot* slot_for_conn = find_slot_for_gun(c.id);
+        bool module_telem_valid = false;
+        double module_voltage_v = 0.0;
+        double module_current_a = 0.0;
+        double module_power_kw = 0.0;
         if (module_controller_ && slot_for_conn) {
             auto snap = module_controller_->snapshot_for_slot(slot_for_conn->id);
             if (snap.valid) {
@@ -1891,8 +1897,15 @@ void OcppAdapter::apply_power_plan() {
                     st.module_temp_c[i] = snap.temperatures_c[i];
                 }
             }
+            if (snap.telemetry_valid) {
+                module_telem_valid = true;
+                module_voltage_v = snap.voltage_v;
+                module_current_a = snap.current_a;
+                module_power_kw = snap.power_kw;
+            }
         }
-        if (safety_trip_needed(st)) {
+        const bool have_telemetry = st.last_telemetry.time_since_epoch().count() != 0;
+        if (have_telemetry && safety_trip_needed(st)) {
             trip_global = true;
             if (global_reason.empty()) {
                 if (st.estop) {
@@ -1972,9 +1985,6 @@ void OcppAdapter::apply_power_plan() {
         double measured_v = st.present_voltage_v ? st.present_voltage_v.value()
                                                  : (last_voltage_v_[c.id] > 50.0 ? last_voltage_v_[c.id]
                                                                                   : planner_cfg_.default_voltage_v);
-        if (measured_v > 0.0) {
-            last_voltage_v_[c.id] = measured_v;
-        }
         double measured_i =
             st.present_current_a ? st.present_current_a.value()
                                  : (last_power_w_[c.id] > 0 && measured_v > 0.0 ? last_power_w_[c.id] / measured_v
@@ -1982,8 +1992,21 @@ void OcppAdapter::apply_power_plan() {
         double measured_power_kw =
             st.present_power_w ? st.present_power_w.value() / 1000.0
                                : (last_power_w_[c.id] > 0 ? last_power_w_[c.id] / 1000.0 : 0.0);
+        if (module_telem_valid) {
+            measured_v = module_voltage_v;
+            measured_i = module_current_a;
+            measured_power_kw = module_power_kw;
+            st.present_voltage_v = measured_v;
+            st.present_current_a = measured_i;
+            st.present_power_w = measured_power_kw * 1000.0;
+        }
+        if (measured_v > 0.0) {
+            last_voltage_v_[c.id] = measured_v;
+        }
         if (st.present_power_w) {
             last_power_w_[c.id] = st.present_power_w.value();
+        } else if (module_telem_valid) {
+            last_power_w_[c.id] = measured_power_kw * 1000.0;
         }
         const bool welded = st.gc_welded || st.mc_welded;
         const bool isolation_fault = st.isolation_fault || st.earth_fault || st.estop;
