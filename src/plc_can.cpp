@@ -660,7 +660,18 @@ ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t connector) {
         if (st.last_energy_update.time_since_epoch().count() != 0) {
             const auto dt = std::chrono::duration_cast<std::chrono::seconds>(now - st.last_energy_update).count();
             if (dt > 0) {
-                st.energy_kwh += st.present_power_kw * (static_cast<double>(dt) / 3600.0);
+                // If no energy meter is available, estimate imported energy from the best available
+                // power telemetry (typically derived from module V/I via publish_evse_present()).
+                //
+                // Clamp power to 0 when output is not enabled to avoid accumulating energy from stale
+                // or noise readings while contactors are open.
+                const bool present_fresh =
+                    st.last_evse_present_update.time_since_epoch().count() != 0 &&
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_evse_present_update).count() <=
+                        telemetry_timeout_ms_;
+                const double power_kw =
+                    (st.output_enabled && present_fresh && st.present_power_kw > 0.0) ? st.present_power_kw : 0.0;
+                st.energy_kwh += power_kw * (static_cast<double>(dt) / 3600.0);
             }
         }
         st.last_energy_update = now;
