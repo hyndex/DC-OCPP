@@ -127,7 +127,7 @@
       "mc": "MC_1",
       "modules": [
         {
-          "address": 3,
+          "address": 1,
           "group": 0,
           "id": "M1_0",
           "mn": "MN_1_0",
