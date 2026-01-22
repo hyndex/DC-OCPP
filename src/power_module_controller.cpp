@@ -214,32 +214,75 @@ public:
             return;
         }
         const auto cmd_interval = std::chrono::milliseconds(std::max(100, spec_.cmd_interval_ms));
-        const bool state_change = (sp.enable != last_sent_.enable) ||
-                                  (std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5) ||
-                                  (std::fabs(sp.current_a - last_sent_.current_a) > 0.5) ||
-                                  (std::fabs(sp.power_kw - last_sent_.power_kw) > 0.5);
         const bool periodic = (now - last_tx_) >= cmd_interval;
-        if (!state_change && !periodic) {
+        const bool enable_edge_on = sp.enable && !last_sent_.enable;
+        const bool enable_edge_off = !sp.enable && last_sent_.enable;
+        const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
+        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
+
+        const bool have_recent_status =
+            last_status_update_.time_since_epoch().count() != 0 && (now - last_status_update_) <= TELEMETRY_STALE;
+        const bool module_off =
+            have_recent_status && ((telemetry_.alarms & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0);
+
+        const bool should_send =
+            enable_edge_on || enable_edge_off ||
+            (sp.enable && (voltage_changed || current_changed || periodic)) ||
+            (!sp.enable && periodic);
+
+        if (!should_send) {
             return;
         }
+
+        const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
+                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
+                                      (!std::isfinite(sp.power_kw) || sp.power_kw < 0.0);
+        if (invalid_setpoint) {
+            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                    : 0x00;
+            telemetry_.fault = true;
+            telemetry_.healthy = false;
+            telemetry_.fault_mask = bit;
+            telemetry_.healthy_mask = 0;
+            telemetry_.last_update = now;
+            send_set_int(0x0030, 0x00010000); // shutdown (fail-safe)
+            last_sent_ = ModuleSetpoint{};
+            last_tx_ = now;
+            desired_ = ModuleSetpoint{};
+            return;
+        }
+
+        const double voltage_v = sp.voltage_v > 0.0 ? sp.voltage_v : 0.0;
+        const double current_a = sp.current_a > 0.0 ? sp.current_a : 0.0;
+
         if (sp.enable) {
-            send_set_float(0x0021, static_cast<float>(sp.voltage_v));
+            // Start once when transitioning to enable, and retry during periodic updates if the module still reports OFF.
+            if (enable_edge_on || (periodic && module_off)) {
+                send_set_int(0x0030, 0x00000000); // startup
+            }
             const double rated_current = spec_.rated_current_a > 0.0
                                              ? spec_.rated_current_a
-                                             : (spec_.rated_power_kw > 0.0 && sp.voltage_v > 1.0
-                                                    ? (spec_.rated_power_kw * 1000.0) / sp.voltage_v
+                                             : (spec_.rated_power_kw > 0.0 && voltage_v > 1.0
+                                                    ? (spec_.rated_power_kw * 1000.0) / voltage_v
                                                     : 0.0);
             const float frac = rated_current > 0.0
-                                   ? static_cast<float>(std::clamp(sp.current_a / rated_current, 0.0, 1.0))
+                                   ? static_cast<float>(std::clamp(current_a / rated_current, 0.0, 1.0))
                                    : 1.0f;
-            send_set_float(0x0022, frac);
-            send_set_int(0x0030, 0x00000000); // startup
+            if (enable_edge_on || current_changed || periodic) {
+                send_set_float(0x0022, frac);
+            }
+            if (enable_edge_on || voltage_changed || periodic) {
+                send_set_float(0x0021, static_cast<float>(voltage_v));
+            }
         } else {
-            send_set_int(0x0030, 0x00010000); // shutdown
+            if (enable_edge_off || periodic) {
+                send_set_int(0x0030, 0x00010000); // shutdown
+            }
         }
         last_sent_ = sp;
         last_tx_ = now;
-}
+    }
 
     void poll() override {
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
@@ -344,25 +387,41 @@ private:
         const uint8_t status = frame.data[1];
         const uint16_t reg = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
         if (status != MAXWELL_OK) {
+            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                    : 0x00;
             telemetry_.fault = true;
             telemetry_.healthy = false;
+            telemetry_.fault_mask = bit;
+            telemetry_.healthy_mask = 0;
             telemetry_.last_update = std::chrono::steady_clock::now();
             return;
         }
         const auto now = std::chrono::steady_clock::now();
         if (type == MAXWELL_TYPE_FLOAT) {
             const float val = decode_float_be(&frame.data[4]);
+            if (!std::isfinite(val)) {
+                telemetry_.last_update = now;
+                return;
+            }
             if (reg == 0x0001) {
-                telemetry_.voltage_v = val;
+                if (val >= -0.1f && val <= 2000.0f) {
+                    telemetry_.voltage_v = std::max(0.0, static_cast<double>(val));
+                }
             } else if (reg == 0x0002) {
-                telemetry_.current_a = val;
+                if (val >= -0.1f && val <= 500.0f) {
+                    telemetry_.current_a = std::max(0.0, static_cast<double>(val));
+                }
             } else if (reg == 0x0004) {
-                telemetry_.temperature_c = val;
+                if (val >= -50.0f && val <= 200.0f) {
+                    telemetry_.temperature_c = static_cast<double>(val);
+                }
             }
         } else if (type == MAXWELL_TYPE_INT) {
             const uint32_t val = decode_u32_be(&frame.data[4]);
             if (reg == 0x0040) {
                 telemetry_.alarms = val;
+                last_status_update_ = now;
                 const bool module_off = (val & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0;
                 const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
                 bool fault = severe;
@@ -390,6 +449,7 @@ private:
     ModuleSetpoint desired_{};
     bool last_desired_enable_{false};
     std::chrono::steady_clock::time_point enable_requested_at_{};
+    std::chrono::steady_clock::time_point last_status_update_{};
     std::chrono::steady_clock::time_point last_tx_{};
     std::chrono::steady_clock::time_point last_poll_{};
     std::shared_ptr<CanChannel> channel_;

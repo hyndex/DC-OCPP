@@ -31,3 +31,5 @@
 
 # Certificates or generated data
 /data/certs/*
+/data/db/*
+/data/user_config.json

@@ -2,6 +2,7 @@
 #include "ocpp_adapter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -51,6 +52,32 @@ bool has_nonempty_file(const fs::path& path) {
     return size > 0;
 }
 
+fs::path system_ca_bundle() {
+    static constexpr std::array<const char*, 4> kCandidates = {
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Raspbian
+        "/etc/ssl/certs/ca-bundle.crt",        // Alpine (often symlinked)
+        "/etc/pki/tls/certs/ca-bundle.crt",    // RHEL/CentOS/Fedora
+        "/etc/ssl/ca-bundle.pem",              // OpenSUSE
+    };
+    for (const auto* candidate : kCandidates) {
+        const fs::path p(candidate);
+        if (has_nonempty_file(p)) {
+            return p;
+        }
+    }
+    return {};
+}
+
+fs::path resolve_bundle_path(const fs::path& configured, const fs::path& fallback) {
+    if (has_nonempty_file(configured)) {
+        return configured;
+    }
+    if (has_nonempty_file(fallback)) {
+        return fallback;
+    }
+    return configured;
+}
+
 bool should_use_stub_security(const ChargerConfig& cfg) {
     const char* env = std::getenv("DC_OCPP_STUB_SECURITY");
     if (!env) {
@@ -59,38 +86,33 @@ bool should_use_stub_security(const ChargerConfig& cfg) {
     return std::string(env) != "0";
 }
 
-bool security_bundles_ready(const ChargerConfig& cfg) {
-    return has_nonempty_file(cfg.security.csms_ca_bundle) &&
-           has_nonempty_file(cfg.security.mo_ca_bundle) &&
-           has_nonempty_file(cfg.security.v2g_ca_bundle);
-}
-
-class NoopEvseSecurity : public ocpp::EvseSecurity {
+class FileBasedEvseSecurity : public ocpp::EvseSecurity {
 public:
-    explicit NoopEvseSecurity(SecurityConfig cfg) : cfg_(std::move(cfg)) {}
+    explicit FileBasedEvseSecurity(SecurityConfig cfg, bool permissive) :
+        cfg_(std::move(cfg)), permissive_(permissive), sys_ca_(system_ca_bundle()) {}
 
     ocpp::InstallCertificateResult install_ca_certificate(const std::string&,
                                                           const ocpp::CaCertificateType&) override {
-        return ocpp::InstallCertificateResult::Accepted;
+        return permissive_ ? ocpp::InstallCertificateResult::Accepted : ocpp::InstallCertificateResult::WriteError;
     }
 
     ocpp::DeleteCertificateResult delete_certificate(const ocpp::CertificateHashDataType&) override {
-        return ocpp::DeleteCertificateResult::Accepted;
+        return permissive_ ? ocpp::DeleteCertificateResult::Accepted : ocpp::DeleteCertificateResult::Failed;
     }
 
     ocpp::InstallCertificateResult update_leaf_certificate(const std::string&,
                                                            const ocpp::CertificateSigningUseEnum&) override {
-        return ocpp::InstallCertificateResult::Accepted;
+        return permissive_ ? ocpp::InstallCertificateResult::Accepted : ocpp::InstallCertificateResult::WriteError;
     }
 
     ocpp::CertificateValidationResult verify_certificate(const std::string&,
                                                          const ocpp::LeafCertificateType&) override {
-        return ocpp::CertificateValidationResult::Valid;
+        return permissive_ ? ocpp::CertificateValidationResult::Valid : ocpp::CertificateValidationResult::IssuerNotFound;
     }
 
     ocpp::CertificateValidationResult verify_certificate(
         const std::string&, const std::vector<ocpp::LeafCertificateType>&) override {
-        return ocpp::CertificateValidationResult::Valid;
+        return permissive_ ? ocpp::CertificateValidationResult::Valid : ocpp::CertificateValidationResult::IssuerNotFound;
     }
 
     std::vector<ocpp::CertificateHashDataChain>
@@ -147,13 +169,13 @@ private:
     fs::path bundle_for_type(const ocpp::CaCertificateType& certificate_type) const {
         switch (certificate_type) {
         case ocpp::CaCertificateType::CSMS:
-            return cfg_.csms_ca_bundle;
+            return resolve_bundle_path(cfg_.csms_ca_bundle, sys_ca_);
         case ocpp::CaCertificateType::MO:
-            return cfg_.mo_ca_bundle;
+            return resolve_bundle_path(cfg_.mo_ca_bundle, sys_ca_);
         case ocpp::CaCertificateType::V2G:
-            return cfg_.v2g_ca_bundle;
+            return resolve_bundle_path(cfg_.v2g_ca_bundle, sys_ca_);
         case ocpp::CaCertificateType::MF:
-            return cfg_.mo_ca_bundle;
+            return resolve_bundle_path(cfg_.mo_ca_bundle, sys_ca_);
         case ocpp::CaCertificateType::OEM:
             return {};
         }
@@ -161,6 +183,8 @@ private:
     }
 
     SecurityConfig cfg_;
+    bool permissive_{false};
+    fs::path sys_ca_;
 };
 
 std::chrono::milliseconds evse_limit_ack_timeout(const ChargerConfig& cfg) {
@@ -322,16 +346,15 @@ OcppAdapter::~OcppAdapter() {
 }
 
 void OcppAdapter::prepare_security_files() const {
-    auto touch = [](const fs::path& path) {
-        if (!path.empty() && !fs::exists(path)) {
-            std::ofstream out(path);
-            out << "";
-        }
+    auto ensure_parent = [](const fs::path& path) {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::create_directories(path.parent_path(), ec);
     };
 
-    touch(cfg_.security.csms_ca_bundle);
-    touch(cfg_.security.mo_ca_bundle);
-    touch(cfg_.security.v2g_ca_bundle);
+    ensure_parent(cfg_.security.csms_ca_bundle);
+    ensure_parent(cfg_.security.mo_ca_bundle);
+    ensure_parent(cfg_.security.v2g_ca_bundle);
 }
 
 void OcppAdapter::seed_default_evse_limits() {
@@ -477,37 +500,36 @@ bool OcppAdapter::start() {
 
     const auto config_str = load_and_patch_ocpp_config(cfg_);
 
-    ocpp::SecurityConfiguration security_cfg{};
-    security_cfg.csms_ca_bundle = cfg_.security.csms_ca_bundle;
-    security_cfg.mf_ca_bundle = cfg_.security.mo_ca_bundle;
-    security_cfg.mo_ca_bundle = cfg_.security.mo_ca_bundle;
-    security_cfg.v2g_ca_bundle = cfg_.security.v2g_ca_bundle;
-    security_cfg.csms_leaf_cert_directory = cfg_.security.client_cert_dir;
-    security_cfg.csms_leaf_key_directory = cfg_.security.client_key_dir;
-    security_cfg.secc_leaf_cert_directory = cfg_.security.secc_cert_dir;
-    security_cfg.secc_leaf_key_directory = cfg_.security.secc_key_dir;
+    int security_profile = 0;
+    try {
+        const auto cfg_json = nlohmann::json::parse(config_str);
+        if (cfg_json.contains("Security") && cfg_json["Security"].is_object()) {
+            const auto& sec = cfg_json["Security"];
+            if (sec.contains("SecurityProfile") && sec["SecurityProfile"].is_number_integer()) {
+                security_profile = sec["SecurityProfile"].get<int>();
+            }
+        }
+    } catch (const std::exception&) {
+        security_profile = 0;
+    }
 
-    const bool bundles_ready = security_bundles_ready(cfg_);
-    const bool allow_stub = should_use_stub_security(cfg_);
-    if (!bundles_ready && !allow_stub) {
-        EVLOG_error << "EVSE security bundles missing/empty; refusing to start without TLS material. "
-                    << "Install CA bundles or set DC_OCPP_STUB_SECURITY=1 for non-production testing.";
+    // This standalone binary does not use libocpp's internal EvseSecurityImpl backend because
+    // the upstream evse_security dependency is unstable in this deployment (observed SIGSEGV on init).
+    // Only SecurityProfile 0 is supported here.
+    if (security_profile != 0) {
+        EVLOG_error << "OCPP SecurityProfile=" << security_profile
+                    << " requested, but this build supports only SecurityProfile=0 (no certificate provisioning).";
         return false;
     }
 
-    std::shared_ptr<ocpp::EvseSecurity> evse_security;
-    if (!bundles_ready && allow_stub) {
-        EVLOG_warning << "EVSE security bundles missing/empty; using stub security backend (test only). "
-                      << "Set DC_OCPP_STUB_SECURITY=0 after installing CA bundles.";
-        evse_security = std::make_shared<NoopEvseSecurity>(cfg_.security);
-        charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
-                                                                 cfg_.database_dir, cfg_.sql_migrations,
-                                                                 cfg_.message_log_path, evse_security, std::nullopt);
-    } else {
-        charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
-                                                                 cfg_.database_dir, cfg_.sql_migrations,
-                                                                 cfg_.message_log_path, nullptr, security_cfg);
+    const bool permissive = should_use_stub_security(cfg_);
+    if (permissive) {
+        EVLOG_warning << "Using permissive EVSE security stub (DC_OCPP_STUB_SECURITY=1). This is NOT production-safe.";
     }
+    const auto evse_security = std::make_shared<FileBasedEvseSecurity>(cfg_.security, permissive);
+    charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
+                                                             cfg_.database_dir, cfg_.sql_migrations,
+                                                             cfg_.message_log_path, evse_security, std::nullopt);
 
     register_callbacks();
 
