@@ -505,11 +505,23 @@ bool OcppAdapter::start() {
         const auto cfg_json = nlohmann::json::parse(config_str);
         if (cfg_json.contains("Security") && cfg_json["Security"].is_object()) {
             const auto& sec = cfg_json["Security"];
-            if (sec.contains("SecurityProfile") && sec["SecurityProfile"].is_number_integer()) {
-                security_profile = sec["SecurityProfile"].get<int>();
+            if (sec.contains("SecurityProfile")) {
+                const auto& sp = sec["SecurityProfile"];
+                if (sp.is_number_integer()) {
+                    security_profile = sp.get<int>();
+                } else if (sp.is_string()) {
+                    try {
+                        security_profile = std::stoi(sp.get<std::string>());
+                    } catch (const std::exception&) {
+                        security_profile = 0;
+                    }
+                }
             }
         }
     } catch (const std::exception&) {
+        security_profile = 0;
+    }
+    if (security_profile < 0) {
         security_profile = 0;
     }
 
