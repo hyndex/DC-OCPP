@@ -1905,7 +1905,8 @@ void OcppAdapter::apply_power_plan() {
             }
         }
         const bool have_telemetry = st.last_telemetry.time_since_epoch().count() != 0;
-        if (have_telemetry && safety_trip_needed(st)) {
+        const bool critical_trip = st.estop || st.earth_fault;
+        if ((have_telemetry || critical_trip) && safety_trip_needed(st)) {
             trip_global = true;
             if (global_reason.empty()) {
                 if (st.estop) {

@@ -123,6 +123,8 @@ private:
         std::chrono::steady_clock::time_point last_evse_limit_ack{};
         std::chrono::steady_clock::time_point last_energy_update{};
         std::chrono::steady_clock::time_point last_status_rx{};
+        std::chrono::steady_clock::time_point last_relay_rx{};
+        std::chrono::steady_clock::time_point last_safety_rx{};
         std::chrono::steady_clock::time_point last_meter_rx{};
         std::chrono::steady_clock::time_point last_limits_tx{};
         std::chrono::steady_clock::time_point last_present_tx{};

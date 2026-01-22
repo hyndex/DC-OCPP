@@ -263,10 +263,12 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->auth_pending = info.auth_pending;
     } else if (can_id == can_contract::relay_status_id(plc_id)) {
         st->last_relay = can_contract::decode_relay_status(data, use_crc_);
+        st->last_relay_rx = now;
         st->last_status_rx = now;
         st->output_enabled = st->last_relay.relay[0] || st->last_relay.relay[1] || st->last_relay.relay[2];
     } else if (can_id == can_contract::safety_status_id(plc_id)) {
         st->last_safety = can_contract::decode_safety_status(data, use_crc_);
+        st->last_safety_rx = now;
         st->last_status_rx = now;
     } else if (can_id == can_contract::energy_meter_id(plc_id)) {
         static std::atomic<uint64_t> seq{0};
@@ -734,7 +736,9 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 && gs.hlc_cable_check_ok &&
                            !gs.hlc_precharge_active && !gs.hlc_charge_complete;
     gs.hlc_power_ready = hlc_ready;
-    gs.last_telemetry = st.last_status_rx;
+    if (st.last_relay_rx.time_since_epoch().count() != 0 && st.last_safety_rx.time_since_epoch().count() != 0) {
+        gs.last_telemetry = std::min(st.last_relay_rx, st.last_safety_rx);
+    }
     const bool meter_expected = (st.cfg.meter_source == "plc") && st.meter_available;
     const bool meter_flagged_stale = st.last_meter.comm_error || st.last_meter.stale;
     gs.meter_stale = meter_expected &&
