@@ -265,7 +265,7 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->last_relay = can_contract::decode_relay_status(data, use_crc_);
         st->last_relay_rx = now;
         st->last_status_rx = now;
-        st->output_enabled = st->last_relay.relay[0] || st->last_relay.relay[1] || st->last_relay.relay[2];
+        st->output_enabled = st->last_relay.relay[0];
     } else if (can_id == can_contract::safety_status_id(plc_id)) {
         st->last_safety = can_contract::decode_safety_status(data, use_crc_);
         st->last_safety_rx = now;
@@ -394,12 +394,12 @@ uint16_t PlcCanHardware::clamp_to_0p1_current(double a) {
     return static_cast<uint16_t>(a * 10.0 + 0.5);
 }
 
-void PlcCanHardware::set_relay_command(PlcState& st, uint8_t module_mask, bool want_power, bool force_off) {
+void PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off) {
     uint8_t enable_mask = 0;
     uint8_t cmd_mask = 0;
     if (!cfg_.plc_owns_gun_relay) {
         enable_mask |= kRelayGunMask;
-        if (want_power) {
+        if (gun_on) {
             cmd_mask |= kRelayGunMask;
         }
     }
@@ -412,7 +412,8 @@ void PlcCanHardware::set_relay_command(PlcState& st, uint8_t module_mask, bool w
             cmd_mask |= kRelayModule1Mask;
         }
     }
-    st.sys_enable = want_power || cfg_.plc_owns_gun_relay;
+    const bool any_requested = gun_on || (cfg_.plc_module_relays_enabled && (module_mask & 0x03u) != 0);
+    st.sys_enable = any_requested || cfg_.plc_owns_gun_relay;
     st.relay_cmd_mask = cmd_mask;
     st.relay_enable_mask = enable_mask;
     st.relay_force_off = force_off && !cfg_.plc_owns_gun_relay;
@@ -567,7 +568,7 @@ bool PlcCanHardware::enable(std::int32_t connector) {
     if (st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    set_relay_command(st, 0x03u, true, false);
+    set_relay_command(st, true, 0x03u, false);
     update_relay_tx(st, std::chrono::steady_clock::now());
     return true;
 }
@@ -579,7 +580,7 @@ bool PlcCanHardware::disable(std::int32_t connector) {
     auto& st = it->second;
     st.output_enabled = false;
     st.regulating = false;
-    set_relay_command(st, 0x00u, false, true);
+    set_relay_command(st, false, 0x00u, true);
     update_relay_tx(st, std::chrono::steady_clock::now());
     return true;
 }
@@ -712,7 +713,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     if (cfg_.plc_owns_gun_relay) {
         gs.relay_closed = st.output_enabled || st.regulating;
     } else {
-        gs.relay_closed = st.last_relay.relay[0] || st.last_relay.relay[1] || st.last_relay.relay[2];
+        gs.relay_closed = st.last_relay.relay[0];
     }
     const bool cp_fresh =
         st.last_cp_rx.time_since_epoch().count() != 0 &&
@@ -834,13 +835,15 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     if (it == connectors_.end()) return;
     auto& st = it->second;
     uint8_t module_mask = cmd.module_mask;
-    if (module_mask == 0 && cmd.module_count > 0) {
-        module_mask = static_cast<uint8_t>((1u << std::min(cmd.module_count, 2)) - 1u);
+    if (!cmd.mc_closed) {
+        module_mask = 0;
     }
-    const bool want_power = cmd.module_count > 0 && (cmd.gc_closed || cmd.mc_closed);
-    st.output_enabled = want_power;
-    st.regulating = want_power;
-    if (want_power && st.cfg.require_lock) {
+    module_mask &= 0x03u;
+    const bool gun_on = cmd.gc_closed;
+    const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && module_mask != 0);
+    st.output_enabled = gun_on;
+    st.regulating = any_relays;
+    if (any_relays && st.cfg.require_lock) {
         set_lock_command(st, true);
     }
     EvseLimits limits{};
@@ -849,7 +852,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     limits.max_power_kw = cmd.power_kw > 0.0 ? cmd.power_kw : st.limits.max_power_kw;
     st.limits = limits;
     st.last_limits_tx = std::chrono::steady_clock::time_point{};
-    set_relay_command(st, module_mask, want_power, !want_power);
+    set_relay_command(st, gun_on, module_mask, !any_relays);
     update_relay_tx(st, std::chrono::steady_clock::now());
 }
 
@@ -866,7 +869,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
     if (want_power && st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    set_relay_command(st, module_mask, want_power, !want_power);
+    set_relay_command(st, want_power, module_mask, !want_power);
     update_relay_tx(st, std::chrono::steady_clock::now());
 }
 

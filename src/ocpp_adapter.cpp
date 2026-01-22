@@ -1991,6 +1991,9 @@ void OcppAdapter::apply_power_plan() {
         const bool session_ready = session_present && session_authorized && !disabled_by_csms && !paused_by_csms;
         const bool power_ready = session_ready &&
             (st.relay_closed || power_delivery_requested(st, lock_required));
+        const bool have_ev_targets = st.target_voltage_v && st.target_voltage_v.value() > 0.0;
+        const bool precharge_hint = session_ready && st.plugged_in && !st.hlc_charge_complete &&
+                                    (st.hlc_precharge_active || have_ev_targets);
         if (session_present) {
             g.reserved = false;
             reserved_connectors_[c.id] = false;
@@ -2059,7 +2062,7 @@ void OcppAdapter::apply_power_plan() {
         if (welded) fault_bits |= 0x20;
         if (hardware_) {
             const bool output_enabled = st.relay_closed;
-            const bool regulating = power_ready;
+            const bool regulating = power_ready || precharge_hint;
             hardware_->publish_fault_state(c.id, fault_bits);
             hardware_->publish_evse_present(c.id, measured_v, measured_i, measured_power_kw, output_enabled,
                                             regulating);
@@ -2072,19 +2075,23 @@ void OcppAdapter::apply_power_plan() {
         const bool modules_ok = healthy_modules > 0;
 
         double req_kw = 0.0;
-        if (power_ready && g.safety_ok && modules_ok && !st.gc_welded && !st.mc_welded) {
+        if ((power_ready || precharge_hint) && g.safety_ok && modules_ok && !st.gc_welded && !st.mc_welded) {
             if (st.target_voltage_v && st.target_current_a) {
                 req_kw = (st.target_voltage_v.value() * st.target_current_a.value()) / 1000.0;
             } else if (st.target_current_a) {
                 req_kw = (measured_v > 0.0 ? measured_v : 800.0) * st.target_current_a.value() / 1000.0;
-            } else if (st.evse_max_power_kw) {
+            } else if (power_ready && st.evse_max_power_kw) {
                 req_kw = st.evse_max_power_kw.value();
-            } else if (last_requested_power_kw_[c.id] > 0.0) {
+            } else if (power_ready && last_requested_power_kw_[c.id] > 0.0) {
                 req_kw = last_requested_power_kw_[c.id];
-            } else if (g.gun_power_limit_kw > 0.0) {
+            } else if (power_ready && g.gun_power_limit_kw > 0.0) {
                 req_kw = g.gun_power_limit_kw;
             }
-            if (req_kw <= 0.0) {
+            if (req_kw <= 0.0 && precharge_hint) {
+                const double module_kw = planner_cfg_.module_power_kw > 0.0 ? planner_cfg_.module_power_kw : 30.0;
+                req_kw = std::max(0.1, std::min(1.0, module_kw * 0.1));
+            }
+            if (req_kw <= 0.0 && power_ready) {
                 req_kw = g.gun_power_limit_kw;
             }
         }
@@ -2140,7 +2147,7 @@ void OcppAdapter::apply_power_plan() {
         }
         const bool blocked = !g.safety_ok || runtime_healthy_modules <= 0 || st.gc_welded || st.mc_welded;
         g.ev_session_active = session_ready;
-        const bool ready_for_power = power_ready && !blocked;
+        const bool ready_for_power = (power_ready || precharge_hint) && !blocked;
 
         if (blocked) {
             g.fsm_state = GunFsmState::Fault;
@@ -2491,7 +2498,7 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
-        const bool modules_allowed = in_island && !local_fault && !info.disabled_by_csms &&
+        const bool modules_allowed = in_island && status.plugged_in && !local_fault && !info.disabled_by_csms &&
                                      isolation_ready && dispatch.modules_assigned > 0 && mc_closed_cmd;
         const int slot_module_cmd = modules_allowed ? info.modules_final : 0;
         const uint8_t slot_mask_cmd = modules_allowed ? info.mask_final : 0;

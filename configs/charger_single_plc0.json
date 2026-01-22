@@ -103,7 +103,7 @@
   },
   "plc": {
     "gunRelayOwnedByPlc": false,
-    "moduleRelaysEnabled": false,
+    "moduleRelaysEnabled": true,
     "requireHttpsUploads": true,
     "useCRC8": true
   },

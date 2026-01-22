@@ -191,7 +191,7 @@ private:
     void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now);
-    void set_relay_command(PlcState& st, uint8_t module_mask, bool want_power, bool force_off);
+    void set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
     static bool assemble_identity_segment(IdentityAssembly& asmbl,
                                           const can_contract::IdentitySegment& seg,
