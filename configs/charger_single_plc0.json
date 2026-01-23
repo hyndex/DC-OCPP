@@ -89,8 +89,8 @@
     },
     "LocalAuthListManagement": {
       "LocalAuthListEnabled": true,
-      "LocalAuthListMaxLength": 42,
-      "SendLocalListMaxLength": 42
+      "LocalAuthListMaxLength": 10000,
+      "SendLocalListMaxLength": 20
     },
     "PnC": {
       "ContractValidationOffline": false,
@@ -102,10 +102,10 @@
       "SecurityProfile": 0
     },
     "SmartCharging": {
-      "ChargeProfileMaxStackLevel": 42,
-      "ChargingScheduleAllowedChargingRateUnit": "Current",
-      "ChargingScheduleMaxPeriods": 42,
-      "MaxChargingProfilesInstalled": 42
+      "ChargeProfileMaxStackLevel": 10,
+      "ChargingScheduleAllowedChargingRateUnit": "Current,Power",
+      "ChargingScheduleMaxPeriods": 10,
+      "MaxChargingProfilesInstalled": 20
     }
   },
   "planner": {
