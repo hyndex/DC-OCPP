@@ -266,9 +266,16 @@ public:
                                              : (spec_.rated_power_kw > 0.0 && voltage_v > 1.0
                                                     ? (spec_.rated_power_kw * 1000.0) / voltage_v
                                                     : 0.0);
-            const float frac = rated_current > 0.0
-                                   ? static_cast<float>(std::clamp(current_a / rated_current, 0.0, 1.0))
-                                   : 1.0f;
+            float frac = 0.0f;
+            if (current_a <= 0.0) {
+                frac = 0.0f;
+            } else if (rated_current > 0.0) {
+                frac = static_cast<float>(std::clamp(current_a / rated_current, 0.0, 1.0));
+            } else {
+                // If the module doesn't report a rated current and voltage is too low to infer it,
+                // keep Ilim at max only for non-zero current requests.
+                frac = 1.0f;
+            }
             if (enable_edge_on || current_changed || periodic) {
                 send_set_float(0x0022, frac);
             }

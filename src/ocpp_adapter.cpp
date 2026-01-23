@@ -2094,21 +2094,22 @@ void OcppAdapter::apply_power_plan() {
         if (thermal_fault) fault_bits |= 0x08;
         if (overcurrent_fault) fault_bits |= 0x10;
         if (welded) fault_bits |= 0x20;
-        if (hardware_) {
-            const bool output_enabled = st.relay_closed;
-            const bool modules_online =
-                st.plugged_in && !general_fault && module_telem_valid && module_voltage_v > 50.0;
-            const bool regulating = power_ready || precharge_hint || modules_online;
-            hardware_->publish_fault_state(c.id, fault_bits);
-            hardware_->publish_evse_present(c.id, measured_v, measured_i, measured_power_kw, output_enabled,
-                                            regulating);
-        }
 
         const uint8_t healthy_mask = st.module_healthy_mask;
         const uint8_t fault_mask = st.module_fault_mask;
         const uint8_t usable_mask = static_cast<uint8_t>(healthy_mask & static_cast<uint8_t>(~fault_mask));
         const int healthy_modules = popcount(usable_mask);
         const bool modules_ok = healthy_modules > 0;
+
+        if (hardware_) {
+            const bool output_enabled = st.relay_closed;
+            const bool modules_online =
+                st.plugged_in && !general_fault && module_telem_valid && modules_ok;
+            const bool regulating = power_ready || precharge_hint || modules_online;
+            hardware_->publish_fault_state(c.id, fault_bits);
+            hardware_->publish_evse_present(c.id, measured_v, measured_i, measured_power_kw, output_enabled,
+                                            regulating);
+        }
 
         double req_kw = 0.0;
         if ((power_ready || precharge_hint) && g.safety_ok && modules_ok && !st.gc_welded && !st.mc_welded) {
@@ -2592,7 +2593,7 @@ void OcppAdapter::apply_power_plan() {
             mreq.slot_id = slot->id;
             mreq.enable = modules_allowed || warmup;
             mreq.mask = modules_allowed ? slot_mask_cmd : (warmup ? slot_cfg_mask : 0u);
-            const double warmup_voltage_v = c.min_voltage_v > 0.0 ? c.min_voltage_v : 200.0;
+            const double warmup_voltage_v = 0.0;
             mreq.voltage_v = modules_allowed ? dispatch.voltage_set_v : warmup_voltage_v;
             mreq.current_a = modules_allowed ? dispatch.current_limit_a : 0.0;
             mreq.power_kw = modules_allowed ? dispatch.p_set_kw : 0.0;
