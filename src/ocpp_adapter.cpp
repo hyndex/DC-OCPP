@@ -1362,16 +1362,6 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 had_session = false;
                 fault = true;
             }
-            if (!fault && status.cp_state == 'D') {
-                ocpp::v16::ErrorInfo err("ventilation_required",
-                                         ocpp::v16::ChargePointErrorCode::OtherError, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
-                fault = true;
-            }
-
             if (push_meter_now) {
                 bool send_meter = false;
                 const auto keepalive = std::chrono::seconds(std::max(1, cfg_.meter_keepalive_s));
@@ -1417,8 +1407,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     }
                 }
             }
-            const bool meter_fault_relevant =
-                status.meter_stale && (had_session || status.plugged_in || status.relay_closed);
+            const bool tx_active = had_session && session.transaction_started;
+            const bool meter_fault_relevant = status.meter_stale && (tx_active || status.relay_closed);
             if (meter_fault_relevant) {
                 ocpp::v16::ErrorInfo err("meter_stale", ocpp::v16::ChargePointErrorCode::PowerMeterFailure, false);
                 report_fault(connector, err);
@@ -2094,7 +2084,8 @@ void OcppAdapter::apply_power_plan() {
         const bool comm_fault = st.comm_fault;
         const bool thermal_fault = st.overtemp_fault;
         const bool overcurrent_fault = st.overcurrent_fault;
-        const bool general_fault = !st.safety_ok || st.cp_fault || st.meter_stale || welded || isolation_fault ||
+        const bool meter_fault_active = st.meter_stale && (power_ready || precharge_hint || st.relay_closed);
+        const bool general_fault = !st.safety_ok || st.cp_fault || meter_fault_active || welded || isolation_fault ||
                                    thermal_fault || overcurrent_fault || comm_fault;
         uint8_t fault_bits = 0;
         if (general_fault) fault_bits |= 0x01;
@@ -2105,7 +2096,9 @@ void OcppAdapter::apply_power_plan() {
         if (welded) fault_bits |= 0x20;
         if (hardware_) {
             const bool output_enabled = st.relay_closed;
-            const bool regulating = power_ready || precharge_hint;
+            const bool modules_online =
+                st.plugged_in && !general_fault && module_telem_valid && module_voltage_v > 50.0;
+            const bool regulating = power_ready || precharge_hint || modules_online;
             hardware_->publish_fault_state(c.id, fault_bits);
             hardware_->publish_evse_present(c.id, measured_v, measured_i, measured_power_kw, output_enabled,
                                             regulating);
@@ -2545,6 +2538,10 @@ void OcppAdapter::apply_power_plan() {
                                      isolation_ready && dispatch.modules_assigned > 0 && mc_closed_cmd;
         const int slot_module_cmd = modules_allowed ? info.modules_final : 0;
         const uint8_t slot_mask_cmd = modules_allowed ? info.mask_final : 0;
+        const uint8_t slot_cfg_mask =
+            slot->modules.size() >= 8 ? 0xFFu : static_cast<uint8_t>((1u << slot->modules.size()) - 1u);
+        const bool warmup = status.plugged_in && !local_fault && !info.disabled_by_csms && !modules_allowed;
+        const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
         const int gc_module_count = is_home ? dispatch.modules_assigned : slot_module_cmd;
         const bool allow_energy = modules_allowed && gc_closed_cmd && isolation_ready && precharge_ok && is_home;
 
@@ -2579,14 +2576,26 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
+        // Warm modules on plug-in (safe standby): close module relays but keep output contactor open,
+        // and command 0 current/power so the PLC can progress HLC cable-check/precharge.
+        if (warmup && warmup_mask != 0u) {
+            cmd.gc_closed = false;
+            cmd.mc_closed = true;
+            cmd.module_mask = warmup_mask;
+            cmd.module_count = popcount(warmup_mask);
+            cmd.current_limit_a = 0.0;
+            cmd.power_kw = 0.0;
+        }
+
         if (module_controller_ && slot) {
             ModuleCommandRequest mreq;
             mreq.slot_id = slot->id;
-            mreq.mask = slot_mask_cmd;
-            mreq.enable = modules_allowed;
-            mreq.voltage_v = dispatch.voltage_set_v;
-            mreq.current_a = dispatch.current_limit_a;
-            mreq.power_kw = dispatch.p_set_kw;
+            mreq.enable = modules_allowed || warmup;
+            mreq.mask = modules_allowed ? slot_mask_cmd : (warmup ? slot_cfg_mask : 0u);
+            const double warmup_voltage_v = c.min_voltage_v > 0.0 ? c.min_voltage_v : 200.0;
+            mreq.voltage_v = modules_allowed ? dispatch.voltage_set_v : warmup_voltage_v;
+            mreq.current_a = modules_allowed ? dispatch.current_limit_a : 0.0;
+            mreq.power_kw = modules_allowed ? dispatch.p_set_kw : 0.0;
             module_controller_->apply_command(mreq);
         }
 
@@ -2811,7 +2820,7 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         paused = paused_evse_[connector];
         constrained = power_constrained_[connector];
     }
-    const bool meter_fault_active = status.meter_stale && (has_session || vehicle_present);
+    const bool meter_fault_active = status.meter_stale && ((has_session && tx_started) || status.relay_closed);
     if (fault_active || meter_fault_active) {
         next = ConnectorState::Faulted;
     } else if (disabled) {

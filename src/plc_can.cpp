@@ -308,13 +308,13 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         }
     } else if (can_id == can_contract::cp_voltage_levels_id(plc_id)) {
         const auto cp = can_contract::decode_cp_voltage_levels(data);
-        st->cp_state = cp.cp_state;
-        st->cp_duty_pct = cp.duty_pct;
+        st->cp_state_raw = cp.cp_state;
+        st->cp_duty_raw = cp.duty_pct;
         st->last_cp_rx = now;
     } else if (can_id == can_contract::charging_session_id(plc_id)) {
         const auto session = can_contract::decode_charging_session(data);
-        st->cp_state = session.cp_state;
-        st->cp_duty_pct = session.duty_pct;
+        st->cp_state_session = session.cp_state;
+        st->cp_duty_session = session.duty_pct;
         st->hlc_stage = session.hlc_stage;
         st->hlc_auth_pending = session.auth_pending;
         st->last_session_rx = now;
@@ -654,7 +654,8 @@ ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t connector) {
     if (it == connectors_.end()) return m;
     auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
-    const bool meter_ok = st.last_meter.meter_ok && !st.last_meter.stale && !st.last_meter.comm_error;
+    const bool use_plc_meter = (st.cfg.meter_source == "plc") && st.meter_available;
+    const bool meter_ok = use_plc_meter && st.last_meter.meter_ok && !st.last_meter.stale && !st.last_meter.comm_error;
     if (meter_ok) {
         st.energy_kwh = st.last_meter.import_energy_kwh;
     } else {
@@ -720,13 +721,19 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     } else {
         gs.relay_closed = st.last_relay.relay[0];
     }
-    const bool cp_fresh =
+    const bool cp_session_fresh =
+        st.last_session_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_session_rx).count() <=
+            telemetry_timeout_ms_;
+    const bool cp_raw_fresh =
         st.last_cp_rx.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_cp_rx).count() <=
             telemetry_timeout_ms_;
-    const char cp_state = cp_fresh ? st.cp_state : 'U';
+    const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
+    const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
     gs.cp_state = cp_state;
-    gs.pilot_duty_pct = cp_fresh ? static_cast<double>(st.cp_duty_pct) : 0.0;
+    const uint8_t duty = cp_session_fresh ? st.cp_duty_session : (cp_raw_fresh ? st.cp_duty_raw : 0);
+    gs.pilot_duty_pct = cp_fresh ? static_cast<double>(duty) : 0.0;
     const bool cp_connected = cp_state != 'A' && cp_state != 'U';
     const bool chargeinfo_fresh =
         st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&

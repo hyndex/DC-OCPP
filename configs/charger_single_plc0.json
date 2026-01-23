@@ -27,10 +27,10 @@
       "maxVoltageV": 1000,
       "meterOffsetWh": 0,
       "meterScale": 1,
-      "meterSource": "plc",
+      "meterSource": "module",
       "minVoltageV": 200,
       "plcId": 0,
-      "requireLock": true
+      "requireLock": false
     }
   ],
   "databaseDir": "../data/db",

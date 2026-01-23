@@ -140,8 +140,12 @@ private:
         uint8_t relay_enable_mask{0};
         bool relay_force_off{false};
         bool relay_clear_faults{false};
-        char cp_state{'U'};
-        uint8_t cp_duty_pct{0};
+        // CP state from the CP voltage sampler (may be noisy on some harnesses).
+        char cp_state_raw{'U'};
+        uint8_t cp_duty_raw{0};
+        // CP state reported by the session tracker (preferred for readiness / fault decisions).
+        char cp_state_session{'U'};
+        uint8_t cp_duty_session{0};
         uint8_t hlc_stage{0};
         bool hlc_charge_complete{false};
         bool hlc_precharge_active{false};
