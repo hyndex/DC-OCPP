@@ -48,7 +48,7 @@
       "ClockAlignedDataInterval": 0,
       "ConnectionTimeOut": 120,
       "ConnectorPhaseRotation": "0.RST,1.RST",
-      "GetConfigurationMaxKeys": 50,
+      "GetConfigurationMaxKeys": 1024,
       "HeartbeatInterval": 60,
       "LocalAuthorizeOffline": true,
       "LocalPreAuthorize": true,
