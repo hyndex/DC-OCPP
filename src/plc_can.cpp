@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -30,6 +31,14 @@ constexpr int kTxLimitsMs = 500;
 constexpr int kTxPresentMs = 300;
 constexpr int kTxRelayMs = 100;
 constexpr int kSegmentTimeoutMs = 2000;
+constexpr int kPlugInDebounceMs = 200;
+constexpr int kPlugOutDebounceMs = 1000;
+constexpr int kCpFaultOnDebounceMs = 500;
+constexpr int kCpFaultOffDebounceMs = 1000;
+
+constexpr double kPresentVoltageEps = 1.0;
+constexpr double kPresentCurrentEps = 0.5;
+constexpr double kPresentPowerEps = 0.5;
 
 constexpr uint8_t kRelayGunMask = 0x01u;
 constexpr uint8_t kRelayModule0Mask = 0x02u;
@@ -74,6 +83,17 @@ uint64_t steady_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+bool opt_equal(const std::optional<double>& a, const std::optional<double>& b) {
+    if (a.has_value() != b.has_value()) return false;
+    if (!a) return true;
+    return *a == *b;
+}
+
+bool limits_equal(const EvseLimits& a, const EvseLimits& b) {
+    return opt_equal(a.max_voltage_v, b.max_voltage_v) && opt_equal(a.max_current_a, b.max_current_a) &&
+           opt_equal(a.max_power_kw, b.max_power_kw);
 }
 
 } // namespace
@@ -394,7 +414,7 @@ uint16_t PlcCanHardware::clamp_to_0p1_current(double a) {
     return static_cast<uint16_t>(a * 10.0 + 0.5);
 }
 
-void PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off) {
+bool PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off) {
     uint8_t enable_mask = 0;
     uint8_t cmd_mask = 0;
     if (!cfg_.plc_owns_gun_relay) {
@@ -413,14 +433,21 @@ void PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module
         }
     }
     const bool any_requested = gun_on || (cfg_.plc_module_relays_enabled && (module_mask & 0x03u) != 0);
-    st.sys_enable = any_requested || cfg_.plc_owns_gun_relay;
+    const bool sys_enable = any_requested || cfg_.plc_owns_gun_relay;
+    const bool relay_force_off = force_off && !cfg_.plc_owns_gun_relay;
+    if (force_off) {
+        cmd_mask = 0;
+    }
+    const bool changed = (st.sys_enable != sys_enable) || (st.relay_cmd_mask != cmd_mask) ||
+                         (st.relay_enable_mask != enable_mask) || (st.relay_force_off != relay_force_off);
+    st.sys_enable = sys_enable;
     st.relay_cmd_mask = cmd_mask;
     st.relay_enable_mask = enable_mask;
-    st.relay_force_off = force_off && !cfg_.plc_owns_gun_relay;
-    if (force_off) {
-        st.relay_cmd_mask = 0;
+    st.relay_force_off = relay_force_off;
+    if (changed) {
+        st.last_relay_tx = std::chrono::steady_clock::time_point{};
     }
-    st.last_relay_tx = std::chrono::steady_clock::time_point{};
+    return changed;
 }
 
 void PlcCanHardware::set_lock_command(PlcState& st, bool lock) {
@@ -568,8 +595,10 @@ bool PlcCanHardware::enable(std::int32_t connector) {
     if (st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    set_relay_command(st, true, 0x03u, false);
-    update_relay_tx(st, std::chrono::steady_clock::now());
+    const bool relay_changed = set_relay_command(st, true, 0x03u, false);
+    if (relay_changed) {
+        update_relay_tx(st, std::chrono::steady_clock::now());
+    }
     return true;
 }
 
@@ -580,8 +609,10 @@ bool PlcCanHardware::disable(std::int32_t connector) {
     auto& st = it->second;
     st.output_enabled = false;
     st.regulating = false;
-    set_relay_command(st, false, 0x00u, true);
-    update_relay_tx(st, std::chrono::steady_clock::now());
+    const bool relay_changed = set_relay_command(st, false, 0x00u, true);
+    if (relay_changed) {
+        update_relay_tx(st, std::chrono::steady_clock::now());
+    }
     return true;
 }
 
@@ -705,7 +736,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     const auto it = connectors_.find(connector);
     if (it == connectors_.end()) return gs;
-    const auto& st = it->second;
+    auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
     const bool comm_stale =
         st.last_status_rx.time_since_epoch().count() == 0 ||
@@ -744,8 +775,53 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         hlc_source_ts.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - hlc_source_ts).count() <=
             telemetry_timeout_ms_;
-    gs.plugged_in = cp_fresh ? cp_connected : (hlc_fresh && st.hlc_stage > 0);
-    gs.cp_fault = cp_fresh && (cp_state == 'E' || cp_state == 'F');
+
+    const bool plugged_raw = cp_fresh ? cp_connected : (hlc_fresh && st.hlc_stage > 0);
+    if (st.plugged_raw_changed.time_since_epoch().count() == 0) {
+        st.plugged_raw = plugged_raw;
+        st.plugged_in = plugged_raw;
+        st.plugged_raw_changed = now;
+    } else {
+        if (plugged_raw != st.plugged_raw) {
+            st.plugged_raw = plugged_raw;
+            st.plugged_raw_changed = now;
+        }
+        const int debounce_ms = st.plugged_raw ? kPlugInDebounceMs : kPlugOutDebounceMs;
+        if (st.plugged_in != st.plugged_raw &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.plugged_raw_changed).count() >=
+                debounce_ms) {
+            const bool prev = st.plugged_in;
+            st.plugged_in = st.plugged_raw;
+            EVLOG_debug << "Connector " << connector << " plugged_in=" << (st.plugged_in ? "true" : "false")
+                        << " (was " << (prev ? "true" : "false") << ", cp_state=" << cp_state
+                        << ", cp_fresh=" << (cp_fresh ? "true" : "false") << ")";
+        }
+    }
+
+    const bool cp_fault_raw = cp_fresh && (cp_state == 'E' || cp_state == 'F');
+    if (st.cp_fault_raw_changed.time_since_epoch().count() == 0) {
+        st.cp_fault_raw = cp_fault_raw;
+        st.cp_fault = cp_fault_raw;
+        st.cp_fault_raw_changed = now;
+    } else {
+        if (cp_fault_raw != st.cp_fault_raw) {
+            st.cp_fault_raw = cp_fault_raw;
+            st.cp_fault_raw_changed = now;
+        }
+        const int debounce_ms = st.cp_fault_raw ? kCpFaultOnDebounceMs : kCpFaultOffDebounceMs;
+        if (st.cp_fault != st.cp_fault_raw &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.cp_fault_raw_changed).count() >=
+                debounce_ms) {
+            const bool prev = st.cp_fault;
+            st.cp_fault = st.cp_fault_raw;
+            EVLOG_debug << "Connector " << connector << " cp_fault=" << (st.cp_fault ? "true" : "false")
+                        << " (was " << (prev ? "true" : "false") << ", cp_state=" << cp_state
+                        << ", cp_fresh=" << (cp_fresh ? "true" : "false") << ")";
+        }
+    }
+
+    gs.plugged_in = st.plugged_in;
+    gs.cp_fault = st.cp_fault;
     const bool lock_required = st.cfg.require_lock;
     const bool lock_fresh = st.lock_engaged_valid && chargeinfo_fresh;
     gs.lock_engaged = lock_required ? (lock_fresh && st.lock_engaged) : true;
@@ -873,10 +949,14 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     limits.max_voltage_v = cmd.voltage_set_v > 0.0 ? cmd.voltage_set_v : st.limits.max_voltage_v;
     limits.max_current_a = cmd.current_limit_a > 0.0 ? cmd.current_limit_a : st.limits.max_current_a;
     limits.max_power_kw = cmd.power_kw > 0.0 ? cmd.power_kw : st.limits.max_power_kw;
-    st.limits = limits;
-    st.last_limits_tx = std::chrono::steady_clock::time_point{};
-    set_relay_command(st, gun_on, module_mask, !any_relays);
-    update_relay_tx(st, std::chrono::steady_clock::now());
+    if (!limits_equal(st.limits, limits)) {
+        st.limits = limits;
+        st.last_limits_tx = std::chrono::steady_clock::time_point{};
+    }
+    const bool relay_changed = set_relay_command(st, gun_on, module_mask, !any_relays);
+    if (relay_changed) {
+        update_relay_tx(st, std::chrono::steady_clock::now());
+    }
 }
 
 void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules) {
@@ -892,8 +972,10 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
     if (want_power && st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    set_relay_command(st, want_power, module_mask, !want_power);
-    update_relay_tx(st, std::chrono::steady_clock::now());
+    const bool relay_changed = set_relay_command(st, want_power, module_mask, !want_power);
+    if (relay_changed) {
+        update_relay_tx(st, std::chrono::steady_clock::now());
+    }
 }
 
 void PlcCanHardware::set_evse_limits(std::int32_t connector, const EvseLimits& limits) {
@@ -901,8 +983,10 @@ void PlcCanHardware::set_evse_limits(std::int32_t connector, const EvseLimits& l
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
-    st.limits = limits;
-    st.last_limits_tx = std::chrono::steady_clock::time_point{}; // force immediate send
+    if (!limits_equal(st.limits, limits)) {
+        st.limits = limits;
+        st.last_limits_tx = std::chrono::steady_clock::time_point{}; // force immediate send
+    }
 }
 
 void PlcCanHardware::publish_evse_present(std::int32_t connector, double voltage_v, double current_a, double power_kw,
@@ -911,21 +995,33 @@ void PlcCanHardware::publish_evse_present(std::int32_t connector, double voltage
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
+    const auto now = std::chrono::steady_clock::now();
+    const bool first = st.last_evse_present_update.time_since_epoch().count() == 0;
+    const bool output_changed = (st.output_enabled != output_enabled) || (st.regulating != regulating);
+    const bool v_changed = std::fabs(st.present_voltage_v - voltage_v) >= kPresentVoltageEps;
+    const bool i_changed = std::fabs(st.present_current_a - current_a) >= kPresentCurrentEps;
+    const bool p_changed = std::fabs(st.present_power_kw - power_kw) >= kPresentPowerEps;
+    const bool changed = first || output_changed || v_changed || i_changed || p_changed;
     st.present_voltage_v = voltage_v;
     st.present_current_a = current_a;
     st.present_power_kw = power_kw;
     st.output_enabled = output_enabled;
     st.regulating = regulating;
-    st.last_evse_present_update = std::chrono::steady_clock::now();
-    st.last_present_tx = std::chrono::steady_clock::time_point{}; // force immediate send
+    st.last_evse_present_update = now;
+    if (changed) {
+        st.last_present_tx = std::chrono::steady_clock::time_point{}; // force immediate send
+    }
 }
 
 void PlcCanHardware::publish_fault_state(std::int32_t connector, uint8_t fault_bits) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
-    it->second.fault_bits = fault_bits;
-    it->second.last_present_tx = std::chrono::steady_clock::time_point{};
+    auto& st = it->second;
+    if (st.fault_bits != fault_bits) {
+        st.fault_bits = fault_bits;
+        st.last_present_tx = std::chrono::steady_clock::time_point{};
+    }
 }
 
 void PlcCanHardware::clear_faults(std::int32_t connector) {

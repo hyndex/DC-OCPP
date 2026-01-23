@@ -146,6 +146,12 @@ private:
         // CP state reported by the session tracker (preferred for readiness / fault decisions).
         char cp_state_session{'U'};
         uint8_t cp_duty_session{0};
+        bool plugged_raw{false};
+        bool plugged_in{false};
+        std::chrono::steady_clock::time_point plugged_raw_changed{};
+        bool cp_fault_raw{false};
+        bool cp_fault{false};
+        std::chrono::steady_clock::time_point cp_fault_raw_changed{};
         uint8_t hlc_stage{0};
         bool hlc_charge_complete{false};
         bool hlc_precharge_active{false};
@@ -195,7 +201,7 @@ private:
     void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now);
-    void set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
+    bool set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
     static bool assemble_identity_segment(IdentityAssembly& asmbl,
                                           const can_contract::IdentitySegment& seg,
