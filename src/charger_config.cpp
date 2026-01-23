@@ -29,6 +29,13 @@ void ensure_parent_dir(const fs::path& file_path) {
     }
 }
 
+std::string trim_copy(std::string s) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
 ConnectorConfig parse_connector(const nlohmann::json& connector_json, int default_interval) {
     ConnectorConfig connector;
     connector.id = connector_json.value("id", 1);
@@ -117,7 +124,33 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.vendor = cp.value("vendor", "UnknownVendor");
     cfg.model = cp.value("model", "UnknownModel");
     cfg.firmware_version = cp.value("firmwareVersion", "0.0.0");
-    cfg.central_system_uri = cp.value("centralSystemURI", "");
+    cfg.charge_point_serial_number = cp.value("chargePointSerialNumber", cp.value("serialNumber", ""));
+    cfg.meter_serial_number = cp.value("meterSerialNumber", "");
+    cfg.meter_type = cp.value("meterType", "");
+    cfg.iccid = cp.value("iccid", json.value("ICCID", ""));
+    cfg.imsi = cp.value("imsi", json.value("IMSI", ""));
+    cfg.imei = cp.value("imei", json.value("IMEI", ""));
+    cfg.apn = cp.value("apn", json.value("APN", ""));
+
+    if (cfg.charge_point_serial_number.empty() && !cfg.imei.empty()) {
+        cfg.charge_point_serial_number = cfg.imei;
+    }
+
+    const auto endpoint_override = trim_copy(cp.value("ocppEndpointToBackend", json.value("OCPPEndpointToBackend", "")));
+    if (!endpoint_override.empty()) {
+        std::string endpoint = endpoint_override;
+        while (!endpoint.empty() && endpoint.back() == '/') endpoint.pop_back();
+        const auto scheme_pos = endpoint.find("://");
+        const std::size_t after_scheme = scheme_pos == std::string::npos ? 0 : scheme_pos + 3;
+        const auto last_slash = endpoint.find_last_of('/');
+        if (last_slash == std::string::npos || last_slash < after_scheme || last_slash + 1 >= endpoint.size()) {
+            throw std::runtime_error("Invalid OCPPEndpointToBackend: " + endpoint_override);
+        }
+        cfg.charge_point_id = endpoint.substr(last_slash + 1);
+        cfg.central_system_uri = endpoint.substr(0, last_slash);
+    } else {
+        cfg.central_system_uri = cp.value("centralSystemURI", "");
+    }
     cfg.simulation_mode = cp.value("simulationMode", false);
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
@@ -365,6 +398,21 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
     json["Internal"]["ChargePointModel"] = cfg.model;
     json["Internal"]["ChargePointVendor"] = cfg.vendor;
     json["Internal"]["FirmwareVersion"] = cfg.firmware_version;
+    if (!cfg.charge_point_serial_number.empty()) {
+        json["Internal"]["ChargePointSerialNumber"] = cfg.charge_point_serial_number;
+    }
+    if (!cfg.meter_serial_number.empty()) {
+        json["Internal"]["MeterSerialNumber"] = cfg.meter_serial_number;
+    }
+    if (!cfg.meter_type.empty()) {
+        json["Internal"]["MeterType"] = cfg.meter_type;
+    }
+    if (!cfg.iccid.empty()) {
+        json["Internal"]["ICCID"] = cfg.iccid;
+    }
+    if (!cfg.imsi.empty()) {
+        json["Internal"]["IMSI"] = cfg.imsi;
+    }
     if (!cfg.central_system_uri.empty()) {
         json["Internal"]["CentralSystemURI"] = cfg.central_system_uri;
     }

@@ -66,6 +66,13 @@ struct ChargerConfig {
     std::string vendor;
     std::string model;
     std::string firmware_version;
+    std::string charge_point_serial_number;
+    std::string meter_serial_number;
+    std::string meter_type;
+    std::string iccid;
+    std::string imsi;
+    std::string imei;
+    std::string apn;
     std::string central_system_uri;
     std::string can_interface; // Default CAN interface for PLC nodes (e.g. "can0")
     bool use_plc{false};

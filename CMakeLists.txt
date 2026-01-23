@@ -430,6 +430,7 @@ set(_OCPP_APP_LIBS
   CURL::libcurl
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
+  sqlite3
   Boost::filesystem
   Boost::thread
   Boost::regex

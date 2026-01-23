@@ -116,7 +116,6 @@ private:
 
     std::atomic<bool> running_{false};
     std::filesystem::path pending_token_store_;
-    std::filesystem::path local_auth_cache_store_;
     std::map<std::int32_t, ActiveSession> sessions_;
     std::map<std::int32_t, std::deque<PendingToken>> pending_tokens_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> plug_event_time_;
@@ -142,7 +141,6 @@ private:
     std::mutex plan_mutex_;
     std::mutex meter_mutex_;
     std::mutex auth_mutex_;
-    std::mutex auth_cache_mutex_;
     std::vector<ModuleState> module_states_;
     bool slots_initialized_{false};
     std::map<int, int> last_module_alloc_;
@@ -170,7 +168,6 @@ private:
     std::map<int, uint64_t> last_limit_stale_counts_;
     std::map<int, uint64_t> limit_ack_stale_events_;
     std::map<int, uint64_t> telemetry_timeout_events_;
-    std::map<std::string, std::chrono::steady_clock::time_point> local_auth_cache_;
     std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
@@ -209,12 +206,6 @@ private:
                                                        const std::optional<std::string>& required_token = std::nullopt,
                                                        const std::optional<std::string>& parent_token = std::nullopt);
     AuthorizationState try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
-    bool authorize_from_cache(const std::string& token);
-    bool authorize_from_cache_locked(const std::string& token,
-                                     const std::chrono::steady_clock::time_point& now);
-    void update_local_auth_cache(const std::string& token);
-    void update_local_auth_cache_locked(const std::string& token,
-                                        const std::chrono::steady_clock::time_point& now);
     AuthorizationState authorize_token_for_session(std::int32_t connector, const std::string& session_id,
                                                    const PendingToken& pending);
     void clear_local_auth_cache();
@@ -222,9 +213,7 @@ private:
     std::string clamp_id_token(const std::string& raw) const;
     void persist_pending_tokens();
     void persist_pending_tokens_locked();
-    void persist_local_auth_cache_locked();
     void load_pending_tokens_from_disk();
-    void load_local_auth_cache_from_disk();
     std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
     static std::string token_source_to_string(AuthTokenSource src);

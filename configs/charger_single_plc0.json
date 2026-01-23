@@ -4,10 +4,15 @@
     "freeMode": false
   },
   "chargePoint": {
+    "apn": "cmnet",
     "canInterface": "can0",
     "centralSystemURI": "ws://ocpp.joulepoint.com:80",
+    "chargePointSerialNumber": "",
     "firmwareVersion": "0.0.1",
+    "iccid": "",
     "id": "jyotisman",
+    "imei": "",
+    "imsi": "",
     "model": "Joulepoint-DC",
     "usePLC": true,
     "vendor": "JoulePoint"
@@ -50,15 +55,20 @@
       "MaxEnergyOnInvalidId": 2000,
       "MeterValueSampleInterval": 15,
       "MeterValuesAlignedData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
+      "MeterValuesAlignedDataMaxLength": 1024,
       "MeterValuesSampledData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
+      "MeterValuesSampledDataMaxLength": 1024,
       "MinimumStatusDuration": 0,
       "NumberOfConnectors": 1,
       "ResetRetries": 5,
       "StopTransactionOnEVSideDisconnect": true,
       "StopTransactionOnInvalidId": true,
       "StopTxnAlignedData": "Energy.Active.Import.Register",
+      "StopTxnAlignedDataMaxLength": 1024,
       "StopTxnSampledData": "Energy.Active.Import.Register",
+      "StopTxnSampledDataMaxLength": 1024,
       "SupportedFeatureProfiles": "Core,FirmwareManagement,RemoteTrigger,Reservation,LocalAuthListManagement,SmartCharging",
+      "SupportedFeatureProfilesMaxLength": 1024,
       "TransactionMessageAttempts": 2,
       "TransactionMessageRetryInterval": 40,
       "UnlockConnectorOnEVSideDisconnect": true,
@@ -98,6 +108,7 @@
       "ISO15118PnCEnabled": false
     },
     "Security": {
+      "AuthorizationKey": "DEADBEEFDEADBEEF",
       "DisableSecurityEventNotifications": true,
       "SecurityProfile": 0
     },
@@ -105,6 +116,7 @@
       "ChargeProfileMaxStackLevel": 10,
       "ChargingScheduleAllowedChargingRateUnit": "Current,Power",
       "ChargingScheduleMaxPeriods": 10,
+      "ConnectorSwitch3to1PhaseSupported": false,
       "MaxChargingProfilesInstalled": 20
     }
   },

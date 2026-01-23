@@ -17,6 +17,7 @@
 #include <sstream>
 #include <thread>
 #include <type_traits>
+#include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
 #include <everest/logging.hpp>
@@ -32,7 +33,6 @@ namespace {
 constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power delivery readiness
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
-constexpr std::chrono::seconds LOCAL_AUTH_CACHE_TTL(24 * 3600);
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
@@ -318,7 +318,6 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
                       << "Enable chargePoint.simulationMode=true to suppress comm faults for simulation.";
     }
     pending_token_store_ = cfg_.database_dir / "pending_tokens.json";
-    local_auth_cache_store_ = cfg_.database_dir / "local_auth_cache.json";
     for (const auto& c : cfg_.connectors) {
         connector_faulted_[c.id] = false;
         connector_state_[c.id] = ConnectorState::Available;
@@ -337,7 +336,6 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
                                                                          : cfg_.meter_sample_interval_s;
     }
     load_pending_tokens_from_disk();
-    load_local_auth_cache_from_disk();
     initialize_slots();
 }
 
@@ -1419,7 +1417,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     }
                 }
             }
-            if (status.meter_stale) {
+            const bool meter_fault_relevant =
+                status.meter_stale && (had_session || status.plugged_in || status.relay_closed);
+            if (meter_fault_relevant) {
                 ocpp::v16::ErrorInfo err("meter_stale", ocpp::v16::ChargePointErrorCode::PowerMeterFailure, false);
                 report_fault(connector, err);
                 {
@@ -1775,15 +1775,10 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
         return AuthorizationState::Granted;
     }
     const auto trimmed = clamp_id_token(pending.token.id_token);
-    bool accepted = false;
-    if (pending.token.prevalidated || authorize_from_cache(trimmed)) {
-        accepted = true;
-    } else if (charge_point_) {
+    bool accepted = pending.token.prevalidated;
+    if (!accepted && charge_point_) {
         const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
         accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
-        if (accepted) {
-            update_local_auth_cache(trimmed);
-        }
     }
     if (accepted) {
         session.authorized = true;
@@ -1802,57 +1797,15 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
     }
 }
 
-bool OcppAdapter::authorize_from_cache(const std::string& token) {
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(auth_cache_mutex_);
-    return authorize_from_cache_locked(token, now);
-}
-
-bool OcppAdapter::authorize_from_cache_locked(const std::string& token,
-                                              const std::chrono::steady_clock::time_point& now) {
-    const auto it = local_auth_cache_.find(token);
-    if (it == local_auth_cache_.end()) {
-        return false;
-    }
-    if ((now - it->second) > LOCAL_AUTH_CACHE_TTL) {
-        local_auth_cache_.erase(it);
-        persist_local_auth_cache_locked();
-        return false;
-    }
-    EVLOG_info << "Authorizing via local cache for token " << token;
-    return true;
-}
-
-void OcppAdapter::update_local_auth_cache(const std::string& token) {
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(auth_cache_mutex_);
-    update_local_auth_cache_locked(token, now);
-}
-
-void OcppAdapter::update_local_auth_cache_locked(const std::string& token,
-                                                 const std::chrono::steady_clock::time_point& now) {
-    local_auth_cache_[token] = now;
-    persist_local_auth_cache_locked();
-}
-
 AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connector,
                                                             const std::string& session_id,
                                                             const PendingToken& pending) {
     const auto now = std::chrono::steady_clock::now();
     const auto trimmed = clamp_id_token(pending.token.id_token);
     bool accepted = pending.token.prevalidated;
-    if (!accepted) {
-        {
-            std::lock_guard<std::mutex> lock(auth_cache_mutex_);
-            accepted = authorize_from_cache_locked(trimmed, now);
-        }
-        if (!accepted && charge_point_) {
-            const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
-            accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
-            if (accepted) {
-                update_local_auth_cache(trimmed);
-            }
-        }
+    if (!accepted && charge_point_) {
+        const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
+        accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
     }
 
     AuthorizationState new_state = AuthorizationState::Denied;
@@ -1883,9 +1836,32 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
 }
 
 void OcppAdapter::clear_local_auth_cache() {
-    std::lock_guard<std::mutex> lock(auth_cache_mutex_);
-    local_auth_cache_.clear();
-    persist_local_auth_cache_locked();
+    fs::path db_path = cfg_.database_dir;
+    std::error_code ec;
+    if (fs::is_directory(db_path, ec) && !ec) {
+        db_path /= (cfg_.charge_point_id + ".db");
+    }
+    if (db_path.empty() || !fs::exists(db_path, ec) || ec) {
+        EVLOG_warning << "Cannot clear authorization cache: database not found at " << db_path;
+        return;
+    }
+    sqlite3* db = nullptr;
+    const auto db_path_str = db_path.string();
+    if (sqlite3_open(db_path_str.c_str(), &db) != SQLITE_OK) {
+        EVLOG_warning << "Failed to open OCPP database for auth cache clear: " << db_path_str
+                      << " err=" << (db ? sqlite3_errmsg(db) : "unknown");
+        if (db) sqlite3_close(db);
+        return;
+    }
+    char* errmsg = nullptr;
+    const int rc = sqlite3_exec(db, "DELETE FROM AUTH_CACHE;", nullptr, nullptr, &errmsg);
+    if (rc != SQLITE_OK) {
+        EVLOG_warning << "Failed to clear AUTH_CACHE table: " << (errmsg ? errmsg : "unknown error");
+        if (errmsg) sqlite3_free(errmsg);
+    } else {
+        EVLOG_info << "Cleared libocpp AUTH_CACHE table";
+    }
+    sqlite3_close(db);
 }
 
 void OcppAdapter::clear_pending_tokens() {
@@ -2835,7 +2811,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         paused = paused_evse_[connector];
         constrained = power_constrained_[connector];
     }
-    if (fault_active || status.meter_stale) {
+    const bool meter_fault_active = status.meter_stale && (has_session || vehicle_present);
+    if (fault_active || meter_fault_active) {
         next = ConnectorState::Faulted;
     } else if (disabled) {
         next = ConnectorState::SuspendedEVSE;
@@ -3085,31 +3062,6 @@ void OcppAdapter::persist_pending_tokens_locked() {
     }
 }
 
-void OcppAdapter::persist_local_auth_cache_locked() {
-    try {
-        nlohmann::json root;
-        root["entries"] = nlohmann::json::array();
-        const auto now_sys = std::chrono::system_clock::now();
-        for (const auto& kv : local_auth_cache_) {
-            const auto sys_tp = to_system(kv.second);
-            nlohmann::json entry;
-            entry["idToken"] = kv.first;
-            entry["lastSeen"] = std::chrono::duration_cast<std::chrono::seconds>(sys_tp.time_since_epoch()).count();
-            root["entries"].push_back(entry);
-        }
-        if (!local_auth_cache_store_.empty()) {
-            std::error_code ec;
-            std::filesystem::create_directories(local_auth_cache_store_.parent_path(), ec);
-            std::ofstream out(local_auth_cache_store_);
-            if (out) {
-                out << root.dump(2);
-            }
-        }
-    } catch (const std::exception& e) {
-        EVLOG_warning << "Failed to persist local auth cache: " << e.what();
-    }
-}
-
 void OcppAdapter::load_pending_tokens_from_disk() {
     if (pending_token_store_.empty()) return;
     if (!std::filesystem::exists(pending_token_store_)) return;
@@ -3154,32 +3106,6 @@ void OcppAdapter::load_pending_tokens_from_disk() {
         }
     } catch (const std::exception& e) {
         EVLOG_warning << "Failed to load pending tokens: " << e.what();
-    }
-}
-
-void OcppAdapter::load_local_auth_cache_from_disk() {
-    if (local_auth_cache_store_.empty()) return;
-    if (!std::filesystem::exists(local_auth_cache_store_)) return;
-    std::lock_guard<std::mutex> lock(auth_cache_mutex_);
-    try {
-        std::ifstream in(local_auth_cache_store_);
-        if (!in) return;
-        nlohmann::json root;
-        in >> root;
-        if (!root.contains("entries")) return;
-        local_auth_cache_.clear();
-        const auto now = std::chrono::steady_clock::now();
-        for (const auto& entry : root["entries"]) {
-            if (!entry.contains("idToken") || !entry.contains("lastSeen")) continue;
-            const auto id = entry["idToken"].get<std::string>();
-            const auto last = std::chrono::system_clock::time_point(std::chrono::seconds(entry["lastSeen"].get<int64_t>()));
-            const auto steady = to_steady(last);
-            if ((now - steady) < LOCAL_AUTH_CACHE_TTL) {
-                local_auth_cache_[id] = steady;
-            }
-        }
-    } catch (const std::exception& e) {
-        EVLOG_warning << "Failed to load local auth cache: " << e.what();
     }
 }
 
