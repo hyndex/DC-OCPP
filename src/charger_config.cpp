@@ -367,13 +367,10 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
 
     const auto connector_count = static_cast<int>(cfg.connectors.size());
     json["Core"]["NumberOfConnectors"] = connector_count;
-    // Keep websocket alive by default: libocpp uses ping interval 0 when unset, which can
-    // produce warnings when combined with a non-zero pong timeout.
-    if (json.contains("Core") && json["Core"].is_object()) {
-        const int ping_s = json["Core"].value("WebSocketPingInterval", 0);
-        if (ping_s <= 0) {
-            json["Core"]["WebSocketPingInterval"] = 10;
-        }
+    // Keep websocket alive by default: set a ping interval only if the user didn't configure one.
+    // Note: a configured value of 0 explicitly disables websocket pings (valid in libocpp).
+    if (json.contains("Core") && json["Core"].is_object() && !json["Core"].contains("WebSocketPingInterval")) {
+        json["Core"]["WebSocketPingInterval"] = 10;
     }
     if (cfg.minimum_status_duration_s > 0) {
         json["Core"]["MinimumStatusDuration"] = cfg.minimum_status_duration_s;

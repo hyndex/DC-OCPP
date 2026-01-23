@@ -74,7 +74,8 @@
       "LogMessagesFormat": [
         "log",
         "console_detailed"
-      ]
+      ],
+      "WebsocketPongTimeout": 30
     },
     "LocalAuthListManagement": {
       "LocalAuthListEnabled": true,
@@ -87,6 +88,7 @@
       "ISO15118PnCEnabled": false
     },
     "Security": {
+      "DisableSecurityEventNotifications": true,
       "SecurityProfile": 0
     },
     "SmartCharging": {

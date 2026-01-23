@@ -560,6 +560,7 @@ bool OcppAdapter::start() {
     seed_default_evse_limits();
 
     running_ = true;
+    csms_connected_.store(false);
     start_metering_threads();
     planner_thread_running_ = true;
     planner_thread_ = std::thread([this]() {
@@ -581,6 +582,34 @@ bool OcppAdapter::start() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     });
+
+    csms_reconnect_thread_running_ = true;
+    csms_reconnect_thread_ = std::thread([this]() {
+        int backoff_s = 10;
+        while (running_ && csms_reconnect_thread_running_) {
+            if (csms_connected_.load()) {
+                backoff_s = 10;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            const auto wake_at = std::chrono::steady_clock::now() + std::chrono::seconds(backoff_s);
+            while (running_ && csms_reconnect_thread_running_ && std::chrono::steady_clock::now() < wake_at) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            if (!running_ || !csms_reconnect_thread_running_) {
+                break;
+            }
+            if (!csms_connected_.load() && charge_point_) {
+                EVLOG_warning << "CSMS disconnected; requesting websocket reconnect";
+                try {
+                    charge_point_->connect_websocket();
+                } catch (const std::exception& e) {
+                    EVLOG_warning << "connect_websocket() failed: " << e.what();
+                }
+            }
+            backoff_s = std::min(backoff_s * 2, 60);
+        }
+    });
     return true;
 }
 
@@ -589,7 +618,11 @@ void OcppAdapter::stop() {
         return;
     }
     running_ = false;
+    csms_reconnect_thread_running_ = false;
     planner_thread_running_ = false;
+    if (csms_reconnect_thread_.joinable()) {
+        csms_reconnect_thread_.join();
+    }
     if (planner_thread_.joinable()) {
         planner_thread_.join();
     }
@@ -890,7 +923,8 @@ void OcppAdapter::register_callbacks() {
                        << " currentTime=" << ss.str();
         });
 
-    charge_point_->register_connection_state_changed_callback([](bool is_connected) {
+    charge_point_->register_connection_state_changed_callback([this](bool is_connected) {
+        csms_connected_.store(is_connected);
         EVLOG_info << "CSMS websocket state changed: " << (is_connected ? "connected" : "disconnected");
     });
 

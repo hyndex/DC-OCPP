@@ -128,6 +128,9 @@ private:
     std::vector<std::thread> meter_threads_;
     std::thread planner_thread_;
     std::atomic<bool> planner_thread_running_{false};
+    std::thread csms_reconnect_thread_;
+    std::atomic<bool> csms_reconnect_thread_running_{false};
+    std::atomic<bool> csms_connected_{false};
     std::map<int, bool> evse_disabled_;
     std::map<int, bool> reserved_connectors_;
     std::map<int, int> reservation_lookup_;
