@@ -691,6 +691,11 @@ ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t connector) {
     m.power_meter.voltage_V.emplace();
     const double voltage_v = meter_ok ? st.last_meter.voltage_v : st.present_voltage_v;
     m.power_meter.voltage_V->DC = static_cast<float>(voltage_v);
+    const double freq_hz = meter_ok ? st.last_meter.freq_hz : st.freq_hz;
+    if (freq_hz > 0.0) {
+        m.power_meter.frequency_Hz.emplace();
+        m.power_meter.frequency_Hz->L1 = static_cast<float>(freq_hz);
+    }
     return m;
 }
 
@@ -752,12 +757,23 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.last_telemetry = std::min(st.last_relay_rx, st.last_safety_rx);
     }
     const bool meter_expected = (st.cfg.meter_source == "plc") && st.meter_available;
-    const bool meter_flagged_stale = st.last_meter.comm_error || st.last_meter.stale;
-    gs.meter_stale = meter_expected &&
-                     (meter_flagged_stale ||
-                      st.last_meter_rx.time_since_epoch().count() == 0 ||
-                      std::chrono::duration_cast<std::chrono::seconds>(now - st.last_meter_rx).count() >
-                          cfg_.meter_keepalive_s);
+    const bool have_meter_sample = st.last_meter_rx.time_since_epoch().count() != 0;
+    const bool meter_flagged_stale = have_meter_sample && (st.last_meter.comm_error || st.last_meter.stale);
+    if (meter_expected) {
+        if (meter_flagged_stale) {
+            gs.meter_stale = true;
+        } else if (have_meter_sample) {
+            gs.meter_stale =
+                std::chrono::duration_cast<std::chrono::seconds>(now - st.last_meter_rx).count() > cfg_.meter_keepalive_s;
+        } else if (st.last_status_rx.time_since_epoch().count() != 0) {
+            // Avoid an immediate meter fault at boot: allow up to meter_keepalive_s after the first status frame
+            // before declaring the meter stale if we have not received any meter sample yet.
+            gs.meter_stale =
+                std::chrono::duration_cast<std::chrono::seconds>(now - st.last_status_rx).count() > cfg_.meter_keepalive_s;
+        } else {
+            gs.meter_stale = false;
+        }
+    }
 
     const bool meter_ok = st.last_meter.meter_ok && !st.last_meter.stale && !st.last_meter.comm_error;
     const bool evse_present_fresh =

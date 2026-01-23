@@ -1,4 +1,8 @@
 {
+  "controller": {
+    "defaultTag": "1234567890",
+    "freeMode": false
+  },
   "chargePoint": {
     "canInterface": "can0",
     "centralSystemURI": "ws://ocpp.joulepoint.com:80",
@@ -29,39 +33,45 @@
   "gridLimitKW": 720,
   "loggingConfig": "../libocpp/config/logging.ini",
   "messageLogPath": "../logs",
-  "meterSampleIntervalSeconds": 30,
+  "meterSampleIntervalSeconds": 15,
   "modulePowerKW": 30,
   "ocpp": {
     "Core": {
+      "AllowOfflineTxForUnknownId": false,
       "AuthorizationCacheEnabled": true,
-      "AuthorizeRemoteTxRequests": true,
-      "ClockAlignedDataInterval": 900,
-      "ConnectionTimeOut": 10,
+      "AuthorizeRemoteTxRequests": false,
+      "ClockAlignedDataInterval": 0,
+      "ConnectionTimeOut": 120,
       "ConnectorPhaseRotation": "0.RST,1.RST",
-      "GetConfigurationMaxKeys": 100,
-      "HeartbeatInterval": 300,
-      "LocalAuthorizeOffline": false,
-      "LocalPreAuthorize": false,
-      "MeterValueSampleInterval": 30,
-      "MeterValuesAlignedData": "Energy.Active.Import.Register",
-      "MeterValuesSampledData": "Energy.Active.Import.Register",
-      "MinimumStatusDuration": 5,
+      "GetConfigurationMaxKeys": 50,
+      "HeartbeatInterval": 60,
+      "LocalAuthorizeOffline": true,
+      "LocalPreAuthorize": true,
+      "MaxEnergyOnInvalidId": 2000,
+      "MeterValueSampleInterval": 15,
+      "MeterValuesAlignedData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
+      "MeterValuesSampledData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
+      "MinimumStatusDuration": 0,
       "NumberOfConnectors": 1,
-      "ResetRetries": 1,
+      "ResetRetries": 5,
       "StopTransactionOnEVSideDisconnect": true,
       "StopTransactionOnInvalidId": true,
       "StopTxnAlignedData": "Energy.Active.Import.Register",
       "StopTxnSampledData": "Energy.Active.Import.Register",
       "SupportedFeatureProfiles": "Core,FirmwareManagement,RemoteTrigger,Reservation,LocalAuthListManagement,SmartCharging",
-      "TransactionMessageAttempts": 1,
-      "TransactionMessageRetryInterval": 10,
-      "UnlockConnectorOnEVSideDisconnect": true
+      "TransactionMessageAttempts": 2,
+      "TransactionMessageRetryInterval": 40,
+      "UnlockConnectorOnEVSideDisconnect": true,
+      "WebSocketPingInterval": 0
     },
     "CostAndPrice": {
       "CustomDisplayCostAndPrice": false
     },
     "FirmwareManagement": {
-      "SupportedFileTransferProtocols": "HTTPS"
+      "SupportedFileTransferProtocols": "FTP,HTTP,HTTPS"
+    },
+    "Reservation": {
+      "ReserveConnectorZeroSupported": true
     },
     "Internal": {
       "CentralSystemURI": "ws://ocpp.joulepoint.com:80",
@@ -75,7 +85,7 @@
         "log",
         "console_detailed"
       ],
-      "WebsocketPongTimeout": 30
+      "WebsocketPongTimeout": 0
     },
     "LocalAuthListManagement": {
       "LocalAuthListEnabled": true,

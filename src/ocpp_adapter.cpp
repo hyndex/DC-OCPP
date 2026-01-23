@@ -1015,6 +1015,19 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             }
 
             auto measurement = hardware_->sample_meter(connector);
+            // Enrich metering with temperatures derived from PLC/module telemetry when available.
+            auto add_temp = [&](double temp_c, const std::string& location) {
+                if (!std::isfinite(temp_c)) return;
+                if (temp_c < -40.0 || temp_c > 200.0) return;
+                ocpp::Temperature t{};
+                t.value = static_cast<float>(temp_c);
+                t.location = location;
+                measurement.temperature_C.push_back(t);
+            };
+            add_temp(status.connector_temp_c, "Connector");
+            for (std::size_t idx = 0; idx < status.module_temp_c.size(); ++idx) {
+                add_temp(status.module_temp_c[idx], "Module" + std::to_string(idx));
+            }
             // Check measurement vs reported telemetry for consistency.
             auto dc_voltage = extract_dc_value(measurement.power_meter.voltage_V);
             auto dc_current = extract_dc_value(measurement.power_meter.current_A);
@@ -1061,6 +1074,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             std::optional<std::string> parent_tag;
             std::optional<PendingToken> pending_auth;
             std::string pending_auth_session_id;
+            bool auto_auth_granted = false;
             {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                 constrained = power_constrained_[connector];
@@ -1113,8 +1127,24 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         pending_auth_session_id = s.session_id;
                         have_token = true;
                     } else if (!reserved) {
-                        set_auth_state(connector, AuthorizationState::Pending);
-                        have_token = true;
+                        if (cfg_.free_mode) {
+                            const auto tag = clamp_id_token(cfg_.default_tag);
+                            if (!tag.empty()) {
+                                s.authorized = true;
+                                s.id_token = tag;
+                                s.authorized_at = now;
+                                s.token_source = AuthTokenSource::Autocharge;
+                                auto_auth_granted = true;
+                                have_token = true;
+                            } else {
+                                EVLOG_warning << "FreeMode enabled but no DefaultTag configured; falling back to auth pending";
+                                set_auth_state(connector, AuthorizationState::Pending);
+                                have_token = true;
+                            }
+                        } else {
+                            set_auth_state(connector, AuthorizationState::Pending);
+                            have_token = true;
+                        }
                     }
                     if (reserved && !have_token) {
                         create_session = false;
@@ -1159,6 +1189,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (pending_changed) {
                     persist_pending_tokens_locked();
                 }
+            }
+            if (auto_auth_granted) {
+                set_auth_state(connector, AuthorizationState::Granted);
             }
             if (pending_auth) {
                 authorize_token_for_session(connector, pending_auth_session_id, *pending_auth);
@@ -3011,8 +3044,6 @@ void OcppAdapter::handle_configuration_key_change(const ocpp::v16::KeyValue& key
         cfg_.minimum_status_duration_s = parse_int(cfg_.minimum_status_duration_s);
     } else if (key == "ConnectionTimeOut") {
         hardware_->set_connection_timeout(parse_int(0));
-    } else if (key == "HeartbeatInterval") {
-        cfg_.meter_keepalive_s = std::max(1, parse_int(cfg_.meter_keepalive_s));
     }
 }
 

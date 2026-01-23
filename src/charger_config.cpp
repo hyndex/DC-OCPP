@@ -212,9 +212,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.message_log_path = make_absolute(base_dir, json.value("messageLogPath", "logs"));
     cfg.logging_config = make_absolute(base_dir, json.value("loggingConfig", "libocpp/config/logging.ini"));
 
-    cfg.meter_sample_interval_s = json.value("meterSampleIntervalSeconds", 30);
+    cfg.meter_sample_interval_s = json.value("meterSampleIntervalSeconds", cfg.meter_sample_interval_s);
     cfg.meter_keepalive_s = json.value("meterKeepAliveSeconds", cfg.meter_keepalive_s);
     cfg.minimum_status_duration_s = json.value("minimumStatusDurationSeconds", cfg.minimum_status_duration_s);
+
+    const auto controller = json.value("controller", nlohmann::json::object());
+    cfg.free_mode = controller.value("freeMode", json.value("FreeMode", cfg.free_mode));
+    cfg.default_tag = controller.value("defaultTag", json.value("DefaultTag", cfg.default_tag));
 
     const auto security = json.value("security", nlohmann::json::object());
     cfg.security.csms_ca_bundle = make_absolute(base_dir, security.value("csmsCaBundle", "data/certs/ca/csms/CSMS_ROOT_CA.pem"));

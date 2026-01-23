@@ -101,6 +101,8 @@ struct ChargerConfig {
     int plc_limits_warn_ms{1500};
     int minimum_status_duration_s{0};
     int meter_keepalive_s{300};
+    bool free_mode{false};
+    std::string default_tag;
     std::string ocpp_config_inline; // Preferred inline OCPP base config JSON (single source)
 
     fs::path ocpp_config;
