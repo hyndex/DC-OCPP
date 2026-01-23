@@ -2541,7 +2541,11 @@ void OcppAdapter::apply_power_plan() {
         const uint8_t slot_mask_cmd = modules_allowed ? info.mask_final : 0;
         const uint8_t slot_cfg_mask =
             slot->modules.size() >= 8 ? 0xFFu : static_cast<uint8_t>((1u << slot->modules.size()) - 1u);
-        const bool warmup = status.plugged_in && !local_fault && !info.disabled_by_csms && !modules_allowed;
+        // Warmup should not be blocked by module telemetry health; warmup powers the module relays so the
+        // module can come online. Only block on safety/CP faults and welded contactors.
+        const bool warmup_safe = status.plugged_in && !info.disabled_by_csms && !status.cp_fault &&
+                                 info.gun_state.safety_ok && !status.gc_welded && !status.mc_welded;
+        const bool warmup = warmup_safe && !modules_allowed;
         const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
         const int gc_module_count = is_home ? dispatch.modules_assigned : slot_module_cmd;
         const bool allow_energy = modules_allowed && gc_closed_cmd && isolation_ready && precharge_ok && is_home;
@@ -2589,12 +2593,13 @@ void OcppAdapter::apply_power_plan() {
         }
 
         if (module_controller_ && slot) {
+            // Only enable module output when the planner has allocated modules for power delivery.
+            // During warmup we keep module relays closed (via the PLC) but leave module output OFF (0V/0A standby).
             ModuleCommandRequest mreq;
             mreq.slot_id = slot->id;
-            mreq.enable = modules_allowed || warmup;
-            mreq.mask = modules_allowed ? slot_mask_cmd : (warmup ? slot_cfg_mask : 0u);
-            const double warmup_voltage_v = 0.0;
-            mreq.voltage_v = modules_allowed ? dispatch.voltage_set_v : warmup_voltage_v;
+            mreq.enable = modules_allowed;
+            mreq.mask = modules_allowed ? slot_mask_cmd : 0u;
+            mreq.voltage_v = modules_allowed ? dispatch.voltage_set_v : 0.0;
             mreq.current_a = modules_allowed ? dispatch.current_limit_a : 0.0;
             mreq.power_kw = modules_allowed ? dispatch.p_set_kw : 0.0;
             module_controller_->apply_command(mreq);
