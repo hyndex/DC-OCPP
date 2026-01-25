@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <filesystem>
@@ -121,6 +122,7 @@ private:
     std::map<std::int32_t, std::chrono::steady_clock::time_point> plug_event_time_;
     std::map<std::int32_t, bool> plugged_in_state_;
     std::map<std::int32_t, bool> connector_faulted_;
+    std::map<std::int32_t, std::set<std::string>> active_ocpp_errors_;
     std::map<std::int32_t, ConnectorState> connector_state_;
     std::map<std::int32_t, bool> post_stop_plugged_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> post_stop_time_;
@@ -216,6 +218,8 @@ private:
     void load_pending_tokens_from_disk();
     std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
+    void sync_ocpp_error(std::int32_t connector, const std::string& uuid, ocpp::v16::ChargePointErrorCode error_code,
+                         bool is_fault, bool active, const std::optional<std::string>& info = std::nullopt);
     static std::string token_source_to_string(AuthTokenSource src);
     static AuthTokenSource token_source_from_string(const std::string& s);
     void set_auth_state(std::int32_t connector, AuthorizationState state);

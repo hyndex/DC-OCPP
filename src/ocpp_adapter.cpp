@@ -1006,11 +1006,6 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             bool had_session = false;
             bool pending_changed = false;
             bool fault = false;
-            bool was_faulted = false;
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                was_faulted = connector_faulted_[connector];
-            }
 
             auto measurement = hardware_->sample_meter(connector);
             // Enrich metering with temperatures derived from PLC/module telemetry when available.
@@ -1247,8 +1242,6 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 cp_fault_since_[connector] = std::chrono::steady_clock::time_point{};
             }
             if (status.cp_fault && !cp_fault_grace) {
-                ocpp::v16::ErrorInfo err("cp_fault", ocpp::v16::ChargePointErrorCode::OtherError, true);
-                report_fault(connector, err);
                 bool already_faulted = false;
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1265,19 +1258,14 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 fault = true;
             }
             if (!status.safety_ok || status.estop || status.earth_fault || status.comm_fault) {
-                ocpp::v16::ErrorInfo err("safety", ocpp::v16::ChargePointErrorCode::GroundFailure, true);
                 ocpp::v16::Reason stop_reason = ocpp::v16::Reason::EmergencyStop;
                 if (status.estop) {
-                    err = ocpp::v16::ErrorInfo("estop", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
                     stop_reason = ocpp::v16::Reason::EmergencyStop;
                 } else if (status.comm_fault) {
-                    err = ocpp::v16::ErrorInfo("comm", ocpp::v16::ChargePointErrorCode::InternalError, true);
                     stop_reason = ocpp::v16::Reason::PowerLoss;
                 } else if (status.earth_fault) {
-                    err = ocpp::v16::ErrorInfo("earth", ocpp::v16::ChargePointErrorCode::GroundFailure, true);
                     stop_reason = ocpp::v16::Reason::Other;
                 }
-                report_fault(connector, err);
                 bool already_faulted = false;
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1292,74 +1280,105 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 fault = true;
             }
             if (!fault && status.isolation_fault) {
-                ocpp::v16::ErrorInfo err("isolation_fault",
-                                         ocpp::v16::ChargePointErrorCode::GroundFailure, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             if (!fault && status.overtemp_fault) {
-                ocpp::v16::ErrorInfo err("overtemp",
-                                         ocpp::v16::ChargePointErrorCode::HighTemperature, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             if (!fault && status.overcurrent_fault) {
-                ocpp::v16::ErrorInfo err("overcurrent",
-                                         ocpp::v16::ChargePointErrorCode::OverCurrentFailure, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             if (!fault && status.gc_welded) {
-                ocpp::v16::ErrorInfo err("gc_welded",
-                                         ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             if (!fault && status.mc_welded) {
-                ocpp::v16::ErrorInfo err("mc_welded",
-                                         ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             const uint8_t usable_modules =
                 static_cast<uint8_t>(status.module_healthy_mask &
                                      static_cast<uint8_t>(~status.module_fault_mask));
             if (!fault && usable_modules == 0) {
-                ocpp::v16::ErrorInfo err("module_fault",
-                                         ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
-                report_fault(connector, err);
-                finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
-            } else if (!fault && status.module_fault_mask != 0) {
-                ocpp::v16::ErrorInfo err("module_degraded",
-                                         ocpp::v16::ChargePointErrorCode::OtherError, false);
-                report_fault(connector, err);
             }
             // Lock fault: if lock disengaged while plug-in/session active, treat as fault
             if (!fault && lock_required && !status.lock_engaged && (status.plugged_in || had_session)) {
-                ocpp::v16::ErrorInfo err("lock_fault",
-                                         ocpp::v16::ChargePointErrorCode::ConnectorLockFailure, true);
-                report_fault(connector, err);
-                finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
-                had_session = false;
+                bool already_faulted = false;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    already_faulted = connector_faulted_[connector];
+                    connector_faulted_[connector] = true;
+                }
+                if (!already_faulted) {
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                    hardware_->disable(connector);
+                    had_session = false;
+                }
                 fault = true;
             }
             if (push_meter_now) {
@@ -1410,17 +1429,52 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const bool tx_active = had_session && session.transaction_started;
             const bool meter_fault_relevant = status.meter_stale && (tx_active || status.relay_closed);
             if (meter_fault_relevant) {
-                ocpp::v16::ErrorInfo err("meter_stale", ocpp::v16::ChargePointErrorCode::PowerMeterFailure, false);
-                report_fault(connector, err);
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     telemetry_timeout_events_[connector]++;
                 }
-                fault = true;
-            } else if (!fault) {
-                if (was_faulted) {
-                    charge_point_->on_all_errors_cleared(connector);
-                }
+            }
+
+            // Sync OCPP error states (raise on edges, clear on recovery).
+            const bool ocpp_cp_fault = status.cp_fault && !cp_fault_grace;
+            const bool ocpp_estop = status.estop;
+            const bool ocpp_comm = !ocpp_estop && status.comm_fault;
+            const bool ocpp_earth = !ocpp_estop && !ocpp_comm && status.earth_fault;
+            const bool ocpp_safety = !ocpp_estop && !ocpp_comm && !ocpp_earth && !status.safety_ok;
+            const bool ocpp_isolation = status.isolation_fault;
+            const bool ocpp_overtemp = status.overtemp_fault;
+            const bool ocpp_overcurrent = status.overcurrent_fault;
+            const bool ocpp_gc_welded = status.gc_welded;
+            const bool ocpp_mc_welded = status.mc_welded;
+            const bool ocpp_module_fault = usable_modules == 0;
+            const bool ocpp_module_degraded = !ocpp_module_fault && status.module_fault_mask != 0;
+            const bool ocpp_lock_fault = lock_required && !status.lock_engaged && (status.plugged_in || had_session);
+
+            sync_ocpp_error(connector, "cp_fault", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_cp_fault);
+            sync_ocpp_error(connector, "estop", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true, ocpp_estop);
+            sync_ocpp_error(connector, "comm", ocpp::v16::ChargePointErrorCode::InternalError, true, ocpp_comm);
+            sync_ocpp_error(connector, "earth", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_earth);
+            sync_ocpp_error(connector, "safety", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_safety);
+            sync_ocpp_error(connector, "isolation_fault", ocpp::v16::ChargePointErrorCode::GroundFailure, true,
+                            ocpp_isolation);
+            sync_ocpp_error(connector, "overtemp", ocpp::v16::ChargePointErrorCode::HighTemperature, true,
+                            ocpp_overtemp);
+            sync_ocpp_error(connector, "overcurrent", ocpp::v16::ChargePointErrorCode::OverCurrentFailure, true,
+                            ocpp_overcurrent);
+            sync_ocpp_error(connector, "gc_welded", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
+                            ocpp_gc_welded);
+            sync_ocpp_error(connector, "mc_welded", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
+                            ocpp_mc_welded);
+            sync_ocpp_error(connector, "module_fault", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
+                            ocpp_module_fault);
+            sync_ocpp_error(connector, "module_degraded", ocpp::v16::ChargePointErrorCode::OtherError, false,
+                            ocpp_module_degraded);
+            sync_ocpp_error(connector, "lock_fault", ocpp::v16::ChargePointErrorCode::ConnectorLockFailure, true,
+                            ocpp_lock_fault);
+            sync_ocpp_error(connector, "meter_stale", ocpp::v16::ChargePointErrorCode::PowerMeterFailure, false,
+                            meter_fault_relevant);
+
+            if (!fault) {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 connector_faulted_[connector] = false;
             }
@@ -1640,7 +1694,42 @@ void OcppAdapter::clear_faults(std::int32_t connector) {
         hardware_->clear_faults(connector);
     }
     if (charge_point_) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            active_ocpp_errors_.erase(connector);
+            connector_faulted_[connector] = false;
+        }
         charge_point_->on_all_errors_cleared(connector);
+    }
+}
+
+void OcppAdapter::sync_ocpp_error(std::int32_t connector, const std::string& uuid,
+                                 ocpp::v16::ChargePointErrorCode error_code, bool is_fault, bool active,
+                                 const std::optional<std::string>& info) {
+    if (!charge_point_) {
+        return;
+    }
+
+    bool raise = false;
+    bool clear = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto& active_set = active_ocpp_errors_[connector];
+        const bool was_active = active_set.count(uuid) != 0;
+        if (active && !was_active) {
+            active_set.insert(uuid);
+            raise = true;
+        } else if (!active && was_active) {
+            active_set.erase(uuid);
+            clear = true;
+        }
+    }
+
+    if (raise) {
+        ocpp::v16::ErrorInfo err(uuid, error_code, is_fault, info);
+        charge_point_->on_error(connector, err);
+    } else if (clear) {
+        charge_point_->on_error_cleared(connector, uuid);
     }
 }
 
@@ -2864,7 +2953,6 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         charge_point_->on_disabled(connector);
         break;
     case ConnectorState::Preparing:
-        charge_point_->on_all_errors_cleared(connector);
         break;
     case ConnectorState::SuspendedEV:
         charge_point_->on_suspend_charging_ev(connector);
@@ -2879,7 +2967,6 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         charge_point_->on_resume_charging(connector);
         break;
     case ConnectorState::Available:
-        charge_point_->on_all_errors_cleared(connector);
         charge_point_->on_enabled(connector);
         break;
     }

@@ -164,7 +164,7 @@
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
     "authorizationSeconds": 1800,
-    "powerRequestSeconds": 60
+    "powerRequestSeconds": 600
   },
   "uploads": {
     "allowFileTargets": true,
