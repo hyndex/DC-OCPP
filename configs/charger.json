@@ -98,12 +98,12 @@
   },
   "planner": {
     "allowCrossSlotIslands": true,
-    "prechargeTimeoutMs": 2000,
+    "prechargeTimeoutMs": 15000,
     "prechargeVoltageToleranceV": 50
   },
   "plc": {
     "gunRelayOwnedByPlc": false,
-    "moduleRelaysEnabled": false,
+    "moduleRelaysEnabled": true,
     "requireHttpsUploads": true,
     "useCRC8": true
   },
@@ -356,7 +356,7 @@
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
     "authorizationSeconds": 1800,
-    "powerRequestSeconds": 60
+    "powerRequestSeconds": 0
   },
   "uploads": {
     "allowFileTargets": true,

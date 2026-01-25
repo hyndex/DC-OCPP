@@ -221,6 +221,7 @@ private:
     void sync_ocpp_error(std::int32_t connector, const std::string& uuid, ocpp::v16::ChargePointErrorCode error_code,
                          bool is_fault, bool active, const std::optional<std::string>& info = std::nullopt);
     static std::string token_source_to_string(AuthTokenSource src);
+    static std::string auth_state_to_string(AuthorizationState state);
     static AuthTokenSource token_source_from_string(const std::string& s);
     void set_auth_state(std::int32_t connector, AuthorizationState state);
     ocpp::v16::DataTransferResponse

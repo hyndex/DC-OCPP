@@ -207,10 +207,14 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.default_voltage_v <= 0.0) {
         cfg.default_voltage_v = 800.0;
     }
-    if (cfg.auth_wait_timeout_s <= 0) {
+    // authorizationSeconds == 0 disables the timeout (wait indefinitely for authorization).
+    // Keep the legacy default (1800s) only when the value is negative/invalid.
+    if (cfg.auth_wait_timeout_s < 0) {
         cfg.auth_wait_timeout_s = 1800;
     }
-    if (cfg.power_request_timeout_s <= 0) {
+    // powerRequestSeconds == 0 disables the timeout (wait indefinitely for EV power delivery).
+    // Keep the legacy default (60s) only when the value is negative/invalid.
+    if (cfg.power_request_timeout_s < 0) {
         cfg.power_request_timeout_s = 60;
     }
     if (cfg.evse_limit_ack_timeout_ms <= 0) {

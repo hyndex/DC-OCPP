@@ -1749,7 +1749,8 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
     if (tokens.empty()) {
         return;
     }
-    const auto ttl = std::chrono::seconds(std::max(1, cfg_.auth_wait_timeout_s));
+    const bool auth_timeout_enabled = cfg_.auth_wait_timeout_s > 0;
+    const auto ttl = auth_timeout_enabled ? std::chrono::seconds(cfg_.auth_wait_timeout_s) : std::chrono::seconds(0);
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (auto token : tokens) {
         const auto dedup_it = recent_token_cache_.find(token.id_token);
@@ -1762,7 +1763,8 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
         if (pending.token.received_at.time_since_epoch().count() == 0) {
             pending.token.received_at = now;
         }
-        pending.expires_at = pending.token.received_at + ttl;
+        pending.expires_at = auth_timeout_enabled ? (pending.token.received_at + ttl)
+                                                  : std::chrono::steady_clock::time_point::max();
         const int target = select_connector_for_token(pending.token);
         pending_tokens_[target].push_back(std::move(pending));
     }
@@ -1894,21 +1896,36 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
         new_state = AuthorizationState::Pending;
     }
 
-    bool session_active = false;
+    bool session_present = false;
+    bool session_matches = false;
+    bool apply_state = true;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         auto it = sessions_.find(connector);
-        if (it != sessions_.end() && it->second.session_id == session_id) {
-            session_active = true;
+        if (it != sessions_.end()) {
+            session_present = true;
+            session_matches = (it->second.session_id == session_id);
+            if (!session_matches) {
+                EVLOG_warning << "Authorization result for stale session " << session_id
+                              << " while connector " << connector << " is on session " << it->second.session_id
+                              << "; applying to current session";
+            }
             if (accepted) {
-                it->second.authorized = true;
-                it->second.id_token = trimmed;
-                it->second.authorized_at = now;
-                it->second.token_source = pending.token.source;
+                if (it->second.id_token.has_value() && it->second.id_token.value() != trimmed) {
+                    EVLOG_warning << "Authorization token mismatch on connector " << connector
+                                  << " (have " << it->second.id_token.value() << ", got " << trimmed
+                                  << "); ignoring update";
+                    apply_state = false;
+                } else {
+                    it->second.authorized = true;
+                    it->second.id_token = trimmed;
+                    it->second.authorized_at = now;
+                    it->second.token_source = pending.token.source;
+                }
             }
         }
     }
-    if (session_active) {
+    if (apply_state && session_present && (session_matches || accepted)) {
         set_auth_state(connector, new_state);
     }
     return new_state;
@@ -2699,11 +2716,27 @@ void OcppAdapter::apply_power_plan() {
         last_module_alloc_[c.id] = cmd.module_count;
         last_module_mask_cmd_[c.id] = cmd.module_mask;
         EvseLimits limits{};
-        if (dispatch.voltage_set_v > 0.0) {
-            limits.max_voltage_v = dispatch.voltage_set_v;
+        // Always advertise non-zero EVSE capability limits to the PLC (used for CPD/CurrentDemand),
+        // even when not yet delivering energy. Avoid publishing 0A/0kW limits during idle/warmup,
+        // which can stall ISO15118 progression on many EVs.
+        const double cap_v = (c.max_voltage_v > 0.0) ? c.max_voltage_v : cfg_.default_voltage_v;
+        if (cap_v > 0.0) {
+            limits.max_voltage_v = cap_v;
         }
-        limits.max_current_a = cmd.current_limit_a;
-        limits.max_power_kw = cmd.power_kw;
+        if (g.gun_current_limit_a > 0.0) {
+            limits.max_current_a = g.gun_current_limit_a;
+        }
+        if (g.gun_power_limit_kw > 0.0) {
+            limits.max_power_kw = g.gun_power_limit_kw;
+        }
+        if (allow_energy) {
+            if (cmd.current_limit_a > 0.0 && limits.max_current_a) {
+                limits.max_current_a = std::min(limits.max_current_a.value(), cmd.current_limit_a);
+            }
+            if (cmd.power_kw > 0.0 && limits.max_power_kw) {
+                limits.max_power_kw = std::min(limits.max_power_kw.value(), cmd.power_kw);
+            }
+        }
         hardware_->apply_power_command(cmd);
         hardware_->set_evse_limits(c.id, limits);
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
@@ -3005,6 +3038,16 @@ std::string OcppAdapter::token_source_to_string(AuthTokenSource src) {
     }
 }
 
+std::string OcppAdapter::auth_state_to_string(AuthorizationState state) {
+    switch (state) {
+    case AuthorizationState::Unknown: return "unknown";
+    case AuthorizationState::Pending: return "pending";
+    case AuthorizationState::Granted: return "granted";
+    case AuthorizationState::Denied: return "denied";
+    default: return "unknown";
+    }
+}
+
 AuthTokenSource OcppAdapter::token_source_from_string(const std::string& s) {
     if (s == "rfid") return AuthTokenSource::RFID;
     if (s == "autocharge") return AuthTokenSource::Autocharge;
@@ -3022,6 +3065,8 @@ void OcppAdapter::set_auth_state(std::int32_t connector, AuthorizationState stat
         }
         auth_state_cache_[connector] = state;
     }
+    EVLOG_info << "Auth state connector " << connector << ": " << auth_state_to_string(prev)
+               << " -> " << auth_state_to_string(state);
     hardware_->set_authorization_state(connector, state);
 }
 
@@ -3146,8 +3191,13 @@ void OcppAdapter::persist_pending_tokens_locked() {
                 entry["prevalidated"] = pending.token.prevalidated;
                 entry["receivedAt"] =
                     std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.token.received_at).time_since_epoch()).count();
-                entry["expiresAt"] =
-                    std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.expires_at).time_since_epoch()).count();
+                if (pending.expires_at == std::chrono::steady_clock::time_point::max()) {
+                    // Sentinel for "never expires" (authorizationSeconds==0).
+                    entry["expiresAt"] = 0;
+                } else {
+                    entry["expiresAt"] =
+                        std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.expires_at).time_since_epoch()).count();
+                }
                 root["tokens"].push_back(entry);
             }
         }
@@ -3175,7 +3225,9 @@ void OcppAdapter::load_pending_tokens_from_disk() {
         if (!root.contains("tokens") || !root["tokens"].is_array()) return;
         const auto now_sys = std::chrono::system_clock::now();
         const auto now_steady = std::chrono::steady_clock::now();
-        const auto ttl = std::chrono::seconds(std::max(1, cfg_.auth_wait_timeout_s));
+        const bool auth_timeout_enabled = cfg_.auth_wait_timeout_s > 0;
+        const auto ttl =
+            auth_timeout_enabled ? std::chrono::seconds(std::max(1, cfg_.auth_wait_timeout_s)) : std::chrono::seconds(0);
         for (const auto& entry : root["tokens"]) {
             try {
                 const int connector = entry.value("connector", 0);
@@ -3189,18 +3241,23 @@ void OcppAdapter::load_pending_tokens_from_disk() {
                 token.prevalidated = entry.value("prevalidated", false);
                 const auto recv_epoch = std::chrono::seconds(entry.value("receivedAt", 0LL));
                 const auto exp_epoch = std::chrono::seconds(entry.value("expiresAt", 0LL));
-                const auto recv_sys = std::chrono::system_clock::time_point(recv_epoch);
-                const auto exp_sys = std::chrono::system_clock::time_point(exp_epoch);
-                if (exp_sys <= now_sys) continue;
+                const auto recv_sys = recv_epoch.count() > 0 ? std::chrono::system_clock::time_point(recv_epoch) : now_sys;
                 const auto recv_delta = recv_sys - now_sys;
-                const auto exp_delta = exp_sys - now_sys;
-                token.received_at = now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(recv_delta);
+                token.received_at =
+                    now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(recv_delta);
                 PendingToken pending;
                 pending.token = token;
-                // If stored expiry is missing, recompute via TTL from receive time
-                pending.expires_at = exp_epoch.count() > 0
-                    ? now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(exp_delta)
-                    : token.received_at + ttl;
+                if (exp_epoch.count() > 0) {
+                    const auto exp_sys = std::chrono::system_clock::time_point(exp_epoch);
+                    if (exp_sys <= now_sys) continue;
+                    const auto exp_delta = exp_sys - now_sys;
+                    pending.expires_at =
+                        now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(exp_delta);
+                } else {
+                    // If stored expiry is missing (or sentinel), recompute via config.
+                    pending.expires_at = auth_timeout_enabled ? (token.received_at + ttl)
+                                                              : std::chrono::steady_clock::time_point::max();
+                }
                 pending_tokens_[connector].push_back(pending);
             } catch (...) {
                 continue;

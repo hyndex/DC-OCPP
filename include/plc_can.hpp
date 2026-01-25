@@ -101,6 +101,8 @@ private:
         int plc_id{0};
         std::string iface;
         std::atomic<uint8_t> seq{0};
+        AuthorizationState desired_auth_state{AuthorizationState::Unknown};
+        std::chrono::steady_clock::time_point last_auth_tx{};
         bool authorized{false};
         bool auth_pending{false};
         bool sys_enable{false};

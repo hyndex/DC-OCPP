@@ -112,9 +112,10 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         st.limits.max_voltage_v = c.max_voltage_v > 0 ? c.max_voltage_v : cfg_.default_voltage_v;
         st.limits.max_current_a = c.max_current_a > 0 ? c.max_current_a : std::optional<double>{};
         st.limits.max_power_kw = c.max_power_w > 0 ? c.max_power_w / 1000.0 : std::optional<double>{};
-        st.present_voltage_v = st.limits.max_voltage_v.value_or(800.0);
-        st.present_power_kw = st.limits.max_power_kw.value_or(0.0);
-        st.present_current_a = st.limits.max_current_a.value_or(0.0);
+        // Present values represent measured output. Default to 0 until real telemetry arrives.
+        st.present_voltage_v = 0.0;
+        st.present_power_kw = 0.0;
+        st.present_current_a = 0.0;
         (void)open_socket_for_iface(st.iface);
     }
 
@@ -226,6 +227,23 @@ void PlcCanHardware::tx_loop() {
                 update_limits_tx(st, now);
                 update_present_tx(st, now);
                 update_relay_tx(st, now);
+                if (st.desired_auth_state != AuthorizationState::Unknown) {
+                    const bool want_auth = (st.desired_auth_state == AuthorizationState::Granted);
+                    const bool want_pending = (st.desired_auth_state == AuthorizationState::Pending);
+                    const bool need_sync = (st.hlc_auth_granted != want_auth) || (st.hlc_auth_pending != want_pending);
+                    const auto auth_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_auth_tx).count();
+                    if (need_sync && (st.last_auth_tx.time_since_epoch().count() == 0 || auth_elapsed >= 500)) {
+                        const uint32_t auth_val = want_auth ? 1u : 0u;
+                        const uint32_t pending_val = want_pending ? 1u : 0u;
+                        auto auth_payload =
+                            can_contract::build_config_cmd(can_contract::PARAM_AUTH_STATE, 0, auth_val, use_crc_);
+                        (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), auth_payload);
+                        auto pend_payload =
+                            can_contract::build_config_cmd(can_contract::PARAM_AUTH_PENDING, 0, pending_val, use_crc_);
+                        (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), pend_payload);
+                        st.last_auth_tx = now;
+                    }
+                }
                 if (!st.protocol_sent ||
                     (!st.protocol_ok &&
                      std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_protocol_tx).count() > 1000)) {
@@ -824,7 +842,18 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.cp_fault = st.cp_fault;
     const bool lock_required = st.cfg.require_lock;
     const bool lock_fresh = st.lock_engaged_valid && chargeinfo_fresh;
-    gs.lock_engaged = lock_required ? (lock_fresh && st.lock_engaged) : true;
+    // Treat lock status as "unknown" until we have fresh ChargeInfo frames.
+    // We must not fault/abort sessions purely because the PLC hasn't yet reported lock feedback,
+    // especially during early ISO15118 stages where the EV is still authorizing.
+    //
+    // Once ChargeInfo is fresh, lock feedback becomes authoritative.
+    if (!lock_required) {
+        gs.lock_engaged = true;
+    } else if (!lock_fresh) {
+        gs.lock_engaged = true;
+    } else {
+        gs.lock_engaged = st.lock_engaged;
+    }
     const bool auth_granted = chargeinfo_fresh ? st.hlc_auth_granted : st.authorized;
     gs.authorization_granted = auth_granted;
     gs.module_healthy_mask = 0x03;
@@ -874,8 +903,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         pv = st.last_meter.voltage_v;
         pc = st.last_meter.current_a;
         pp_kw = st.last_meter.power_kw;
-    } else if (evse_present_fresh &&
-               (st.present_voltage_v > 0.0 || st.present_current_a > 0.0 || st.present_power_kw > 0.0)) {
+    } else if (evse_present_fresh) {
         pv = st.present_voltage_v;
         pc = st.present_current_a;
         pp_kw = st.present_power_kw;
@@ -918,6 +946,7 @@ void PlcCanHardware::set_authorization_state(std::int32_t connector, Authorizati
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
+    st.desired_auth_state = state;
     st.authorized = (state == AuthorizationState::Granted);
     st.auth_pending = (state == AuthorizationState::Pending);
     const uint32_t auth_val = st.authorized ? 1u : 0u;
@@ -926,6 +955,7 @@ void PlcCanHardware::set_authorization_state(std::int32_t connector, Authorizati
     (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), auth_payload);
     auto pend_payload = can_contract::build_config_cmd(can_contract::PARAM_AUTH_PENDING, 0, pending_val, use_crc_);
     (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), pend_payload);
+    st.last_auth_tx = std::chrono::steady_clock::now();
 }
 
 void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
