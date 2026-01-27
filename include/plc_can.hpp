@@ -13,6 +13,9 @@
 #include <thread>
 #include <vector>
 #include <memory>
+#include <unordered_map>
+
+struct can_frame;
 
 namespace charger {
 
@@ -137,6 +140,10 @@ private:
         std::chrono::steady_clock::time_point last_chargeinfo_rx{};
         std::chrono::steady_clock::time_point last_session_rx{};
         std::chrono::steady_clock::time_point last_boot_rx{};
+        std::chrono::steady_clock::time_point last_present_warn{};
+        std::chrono::steady_clock::time_point last_limits_warn{};
+        std::chrono::steady_clock::time_point last_limit_req{};
+        std::chrono::steady_clock::time_point last_present_req{};
         EvseLimits limits{};
         uint8_t relay_cmd_mask{0};
         uint8_t relay_enable_mask{0};
@@ -169,6 +176,9 @@ private:
         bool protocol_ok{true};
         bool protocol_sent{false};
         std::chrono::steady_clock::time_point last_protocol_tx{};
+        bool comm_fault_override{false};
+        uint64_t present_stale_events{0};
+        uint64_t limit_stale_events{0};
         IdentityAssembly evccid;
         IdentityAssembly evemaid0;
         IdentityAssembly evemaid1;
@@ -181,6 +191,9 @@ private:
     int telemetry_timeout_ms_{2000};
     std::map<std::int32_t, PlcState> connectors_;
     std::map<std::string, int> sockets_;
+    std::unordered_map<int, std::string> fd_to_iface_;
+    std::mutex sockets_mutex_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_bus_off_;
     std::thread rx_thread_;
     std::thread tx_thread_;
     std::atomic<bool> running_{false};
@@ -194,10 +207,12 @@ private:
     std::unique_ptr<SimulatedHardware> diag_helper_;
 
     bool open_socket_for_iface(const std::string& iface);
+    void close_socket_for_iface(const std::string& iface);
     bool send_frame(const PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data);
     void rx_loop();
     void tx_loop();
     void handle_frame(uint32_t can_id, const uint8_t data[8]);
+    void handle_error_frame(const std::string& iface, const struct can_frame& frame);
     PlcState* find_state_by_plc(uint8_t plc_id);
     std::int32_t connector_from_plc(uint8_t plc_id) const;
     void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now);
