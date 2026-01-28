@@ -6,7 +6,6 @@
 #include <everest/logging.hpp>
 
 #include <linux/can.h>
-#include <linux/can/error.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <poll.h>
@@ -47,8 +46,6 @@ constexpr double kDefaultCurrentA = 50.0;  // fallback when config/telemetry mis
 constexpr uint8_t kRelayGunMask = 0x01u;
 constexpr uint8_t kRelayModule0Mask = 0x02u;
 constexpr uint8_t kRelayModule1Mask = 0x04u;
-
-constexpr std::chrono::milliseconds kBusOffReopenDelay{100};
 
 bool is_printable_ascii(const std::vector<uint8_t>& bytes) {
     if (bytes.empty()) return false;
@@ -139,19 +136,14 @@ PlcCanHardware::~PlcCanHardware() {
     running_ = false;
     if (rx_thread_.joinable()) rx_thread_.join();
     if (tx_thread_.joinable()) tx_thread_.join();
-    {
-        std::lock_guard<std::mutex> lock(sockets_mutex_);
-        for (auto& kv : sockets_) {
-            if (kv.second >= 0) close(kv.second);
-        }
-        sockets_.clear();
-        fd_to_iface_.clear();
+    for (auto& kv : sockets_) {
+        if (kv.second >= 0) close(kv.second);
     }
+    sockets_.clear();
 }
 
 bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
     if (iface.empty()) return false;
-    std::lock_guard<std::mutex> lock(sockets_mutex_);
     if (sockets_.count(iface)) return true;
     int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd < 0) {
@@ -176,9 +168,6 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
         return false;
     }
 
-    can_err_mask_t err_mask = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED | CAN_ERR_CRTL;
-    (void)setsockopt(fd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &err_mask, sizeof(err_mask));
-
     int recv_own = 0;
     (void)setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own));
     int flags = fcntl(fd, F_GETFL, 0);
@@ -186,30 +175,14 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
         (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
     sockets_[iface] = fd;
-    fd_to_iface_[fd] = iface;
     EVLOG_info << "CAN socket ready on " << iface << " (fd=" << fd << ")";
     return true;
 }
 
-void PlcCanHardware::close_socket_for_iface(const std::string& iface) {
-    std::lock_guard<std::mutex> lock(sockets_mutex_);
-    auto it = sockets_.find(iface);
-    if (it != sockets_.end()) {
-        const int fd = it->second;
-        if (fd >= 0) close(fd);
-        fd_to_iface_.erase(fd);
-        sockets_.erase(it);
-    }
-}
-
 bool PlcCanHardware::send_frame(const PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data) {
-    int fd = -1;
-    {
-        std::lock_guard<std::mutex> lock(sockets_mutex_);
-        const auto it = sockets_.find(st.iface);
-        if (it == sockets_.end()) return false;
-        fd = it->second;
-    }
+    const auto it = sockets_.find(st.iface);
+    if (it == sockets_.end()) return false;
+    int fd = it->second;
     struct can_frame frame {};
     frame.can_id = can_id | CAN_EFF_FLAG;
     frame.can_dlc = 8;
@@ -228,12 +201,10 @@ bool PlcCanHardware::send_frame(const PlcState& st, uint32_t can_id, const std::
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             // If TX queue is wedged, try reopening the socket once in a while.
             if (enobufs_count >= 5) {
-                close_socket_for_iface(st.iface);
+                if (fd >= 0) close(fd);
+                sockets_.erase(st.iface);
                 open_socket_for_iface(st.iface);
-                {
-                    std::lock_guard<std::mutex> lock(sockets_mutex_);
-                    fd = sockets_.count(st.iface) ? sockets_[st.iface] : -1;
-                }
+                fd = sockets_.count(st.iface) ? sockets_[st.iface] : -1;
                 enobufs_count = 0;
                 if (fd < 0) break;
                 continue;
@@ -255,11 +226,8 @@ void PlcCanHardware::rx_loop() {
     while (running_) {
         std::vector<pollfd> pfds;
         pfds.reserve(sockets_.size());
-        {
-            std::lock_guard<std::mutex> lock(sockets_mutex_);
-            for (const auto& kv : sockets_) {
-                pfds.push_back(pollfd{kv.second, POLLIN, 0});
-            }
+        for (const auto& kv : sockets_) {
+            pfds.push_back(pollfd{kv.second, POLLIN, 0});
         }
         if (pfds.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
@@ -273,16 +241,6 @@ void PlcCanHardware::rx_loop() {
             if (!(p.revents & POLLIN)) continue;
             struct can_frame cf {};
             while (read(p.fd, &cf, sizeof(cf)) == static_cast<ssize_t>(sizeof(cf))) {
-                if (cf.can_id & CAN_ERR_FLAG) {
-                    std::string iface;
-                    {
-                        std::lock_guard<std::mutex> lock(sockets_mutex_);
-                        auto it = fd_to_iface_.find(p.fd);
-                        if (it != fd_to_iface_.end()) iface = it->second;
-                    }
-                    handle_error_frame(iface, cf);
-                    continue;
-                }
                 if (!(cf.can_id & CAN_EFF_FLAG)) continue;
                 handle_frame(cf.can_id & CAN_EFF_MASK, cf.data);
             }
@@ -300,58 +258,6 @@ void PlcCanHardware::tx_loop() {
                 update_limits_tx(st, now);
                 update_present_tx(st, now);
                 update_relay_tx(st, now);
-                const auto present_ref_ts = (st.last_present_tx.time_since_epoch().count() != 0)
-                                                ? st.last_present_tx
-                                                : st.last_present_req;
-                const auto present_ref_age = present_ref_ts.time_since_epoch().count() == 0
-                                                 ? 0
-                                                 : std::chrono::duration_cast<std::chrono::milliseconds>(now - present_ref_ts).count();
-                if (present_ref_ts.time_since_epoch().count() != 0 &&
-                    present_ref_age > cfg_.plc_present_warn_ms &&
-                    (st.last_present_warn.time_since_epoch().count() == 0 ||
-                     std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_present_warn).count() >
-                         cfg_.plc_present_warn_ms / 2)) {
-                    st.present_stale_events++;
-                    st.last_present_warn = now;
-                    EVLOG_warning << "EVSE_PRESENT cadence stale for plc_id=" << st.plc_id
-                                  << " age_ms=" << present_ref_age;
-                    st.comm_fault_override = true;
-                }
-                const auto limits_ref_ts = (st.last_limits_tx.time_since_epoch().count() != 0)
-                                               ? st.last_limits_tx
-                                               : st.last_limit_req;
-                const auto limits_age = limits_ref_ts.time_since_epoch().count() == 0
-                                            ? 0
-                                            : std::chrono::duration_cast<std::chrono::milliseconds>(now - limits_ref_ts).count();
-                if (limits_ref_ts.time_since_epoch().count() != 0 &&
-                    limits_age > cfg_.plc_limits_warn_ms &&
-                    (st.last_limits_warn.time_since_epoch().count() == 0 ||
-                     std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limits_warn).count() >
-                         cfg_.plc_limits_warn_ms / 2)) {
-                    st.limit_stale_events++;
-                    st.last_limits_warn = now;
-                    EVLOG_warning << "EVSE_LIMIT cadence stale for plc_id=" << st.plc_id
-                                  << " age_ms=" << limits_age;
-                    st.comm_fault_override = true;
-                }
-                if (st.last_limit_req.time_since_epoch().count() != 0 &&
-                    st.last_evse_limit_ack.time_since_epoch().count() == 0) {
-                    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limit_req).count();
-                    const int ack_timeout = std::max(1, cfg_.evse_limit_ack_timeout_ms);
-                    if (age > ack_timeout &&
-                        (st.last_limits_warn.time_since_epoch().count() == 0 ||
-                         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limits_warn).count() >
-                             ack_timeout / 2)) {
-                        st.limit_stale_events++;
-                        st.last_limits_warn = now;
-                        st.comm_fault_override = true;
-                        EVLOG_error << \"EVSE limit ACK missing for plc_id=\" << st.plc_id
-                                    << \" age_ms=\" << age << \" timeout_ms=\" << ack_timeout;
-                    }
-                }
-                if (!st.protocol_ok) {
-                    st.comm_fault_override = true;
-                }
                 if (st.desired_auth_state != AuthorizationState::Unknown) {
                     const bool want_auth = (st.desired_auth_state == AuthorizationState::Granted);
                     const bool want_pending = (st.desired_auth_state == AuthorizationState::Pending);
@@ -437,12 +343,10 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->last_relay_rx = now;
         st->last_status_rx = now;
         st->output_enabled = st->last_relay.relay[0];
-        st->comm_fault_override = false;
     } else if (can_id == can_contract::safety_status_id(plc_id)) {
         st->last_safety = can_contract::decode_safety_status(data, use_crc_);
         st->last_safety_rx = now;
         st->last_status_rx = now;
-        st->comm_fault_override = false;
     } else if (can_id == can_contract::energy_meter_id(plc_id)) {
         static std::atomic<uint64_t> seq{0};
         const uint8_t mux = data[0];
@@ -470,8 +374,6 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
             EVLOG_debug << "EVSE limits ack plc=" << static_cast<int>(plc_id) << " count=" << ack.value;
             st->evse_limit_ack_count = ack.value;
             st->last_evse_limit_ack = now;
-            st->comm_fault_override = false;
-            st->last_limits_warn = std::chrono::steady_clock::time_point{};
         } else if (ack.param_id == can_contract::PARAM_PROTO_VERSION) {
             const bool ok = (ack.status == 0) && (ack.value == can_contract::PROTOCOL_VERSION);
             st->protocol_ok = ok;
@@ -479,9 +381,6 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
                 EVLOG_error << "PLC protocol version mismatch plc=" << static_cast<int>(plc_id)
                             << " status=" << static_cast<int>(ack.status) << " value=" << ack.value
                             << " expected=" << static_cast<int>(can_contract::PROTOCOL_VERSION);
-                st->comm_fault_override = true;
-            } else {
-                st->comm_fault_override = false;
             }
         }
     } else if (can_id == can_contract::cp_voltage_levels_id(plc_id)) {
@@ -489,7 +388,6 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->cp_state_raw = cp.cp_state;
         st->cp_duty_raw = cp.duty_pct;
         st->last_cp_rx = now;
-        st->comm_fault_override = false;
     } else if (can_id == can_contract::charging_session_id(plc_id)) {
         const auto session = can_contract::decode_charging_session(data);
         st->cp_state_session = session.cp_state;
@@ -497,7 +395,6 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->hlc_stage = session.hlc_stage;
         st->hlc_auth_pending = session.auth_pending;
         st->last_session_rx = now;
-        st->comm_fault_override = false;
     } else if (can_id == can_contract::boot_config_id(plc_id)) {
         const auto cfg = can_contract::decode_boot_config(data);
         st->boot_feature_flags = cfg.feature_flags;
@@ -624,7 +521,6 @@ void PlcCanHardware::set_lock_command(PlcState& st, bool lock) {
 void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limits_tx).count();
     if (elapsed >= kTxLimitsMs) {
-        st.last_limit_req = now;
         const double cfg_v = (st.cfg.max_voltage_v > 0.0) ? st.cfg.max_voltage_v
                                                          : (cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v
                                                                                           : kDefaultVoltageV);
@@ -650,11 +546,10 @@ void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::t
         const uint16_t i = clamp_to_0p1_current(max_i);
         const uint16_t p = clamp_to_0p1k(max_p_kw);
         auto payload = can_contract::build_evse_limits(v, i, p, use_crc_);
-        if (send_frame(st, can_contract::evse_dc_max_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
-            st.last_limits_tx = now;
-        } else {
+        if (!send_frame(st, can_contract::evse_dc_max_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
             EVLOG_warning << "Failed to TX EVSE limits on CAN for plc_id=" << st.plc_id;
         }
+        st.last_limits_tx = now;
     }
 }
 
@@ -693,12 +588,10 @@ void PlcCanHardware::update_present_tx(PlcState& st, std::chrono::steady_clock::
         const uint16_t p = clamp_to_0p1k(p_kw_f);
         auto payload = can_contract::build_evse_present(v, i, p, st.output_enabled, st.regulating, st.fault_bits,
                                                         use_crc_);
-        st.last_present_req = now;
-        if (send_frame(st, can_contract::evse_dc_reg_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
-            st.last_present_tx = now;
-        } else {
+        if (!send_frame(st, can_contract::evse_dc_reg_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
             EVLOG_warning << "Failed to TX EVSE present on CAN for plc_id=" << st.plc_id;
         }
+        st.last_present_tx = now;
     }
 }
 
@@ -958,7 +851,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         st.last_status_rx.time_since_epoch().count() == 0 ||
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_status_rx).count() >
             telemetry_timeout_ms_;
-    gs.comm_fault = comm_stale || st.last_relay.comm_fault || !st.protocol_ok || st.comm_fault_override;
+    gs.comm_fault = comm_stale || st.last_relay.comm_fault || !st.protocol_ok;
     gs.safety_ok = st.last_relay.safety_ok && st.last_safety.safety_ok && !st.last_relay.earth_fault &&
                    !st.last_safety.earth_fault && !comm_stale;
     gs.estop = st.last_relay.estop_latched || st.last_safety.estop_latched;
@@ -1131,47 +1024,8 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.evse_max_power_kw = st.limits.max_power_kw;
     gs.evse_limit_ack_count = st.evse_limit_ack_count;
     gs.last_evse_limit_ack = st.last_evse_limit_ack;
-    gs.present_stale_events = st.present_stale_events;
-    gs.limit_stale_events = st.limit_stale_events;
     gs.comm_fault = gs.comm_fault || !st.last_relay.crc_ok || !st.last_safety.crc_ok;
     return gs;
-}
-
-void PlcCanHardware::handle_error_frame(const std::string& iface, const struct can_frame& frame) {
-    if (iface.empty()) return;
-    const uint32_t err = frame.can_id & CAN_ERR_MASK;
-    const bool bus_off = (err & CAN_ERR_BUSOFF) != 0;
-    const bool restarted = (err & CAN_ERR_RESTARTED) != 0;
-    const bool ctrl_err = (err & CAN_ERR_CRTL) != 0;
-    if (bus_off) {
-        EVLOG_error << "CAN bus-off on iface " << iface;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            for (auto& kv : connectors_) {
-                if (kv.second.iface == iface) {
-                    kv.second.comm_fault_override = true;
-                }
-            }
-        }
-        auto now = std::chrono::steady_clock::now();
-        const auto it = last_bus_off_.find(iface);
-        if (it == last_bus_off_.end() ||
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second) >= kBusOffReopenDelay) {
-            last_bus_off_[iface] = now;
-            close_socket_for_iface(iface);
-            open_socket_for_iface(iface);
-        }
-    } else if (restarted) {
-        EVLOG_info << "CAN controller restarted on iface " << iface << ", clearing comm fault";
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        for (auto& kv : connectors_) {
-            if (kv.second.iface == iface) {
-                kv.second.comm_fault_override = false;
-            }
-        }
-    } else if (ctrl_err) {
-        EVLOG_warning << "CAN controller control error on iface " << iface;
-    }
 }
 
 void PlcCanHardware::set_authorization_state(std::int32_t connector, bool authorized) {

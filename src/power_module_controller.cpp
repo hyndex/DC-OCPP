@@ -17,7 +17,6 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <linux/can.h>
-#include <linux/can/error.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -109,16 +108,10 @@ class CanChannel {
 public:
     explicit CanChannel(std::string iface) : iface_(std::move(iface)) {
 #ifdef __linux__
-        open();
-#endif
-    }
-
-#ifdef __linux__
-    bool open() {
         sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
         if (sock_ < 0) {
             EVLOG_error << "Failed to open CAN socket on " << iface_;
-            return false;
+            return;
         }
         const int recv_own = 0;
         ::setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own));
@@ -128,7 +121,7 @@ public:
             EVLOG_error << "CAN ioctl failed for " << iface_;
             ::close(sock_);
             sock_ = -1;
-            return false;
+            return;
         }
         struct sockaddr_can addr {};
         addr.can_family = AF_CAN;
@@ -137,20 +130,16 @@ public:
         filter.can_id = (static_cast<uint32_t>(MAXWELL_PROT_NO) << 20) | CAN_EFF_FLAG;
         filter.can_mask = (static_cast<uint32_t>(0x1FF) << 20) | CAN_EFF_FLAG;
         ::setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter));
-        can_err_mask_t err_mask = CAN_ERR_BUSOFF | CAN_ERR_RESTARTED | CAN_ERR_CRTL;
-        ::setsockopt(sock_, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &err_mask, sizeof(err_mask));
         if (::bind(sock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
             EVLOG_error << "Failed to bind CAN socket on " << iface_;
             ::close(sock_);
             sock_ = -1;
-            return false;
+            return;
         }
         const int flags = ::fcntl(sock_, F_GETFL, 0);
         ::fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
-        comm_fault_ = false;
-        return true;
-    }
 #endif
+    }
 
     ~CanChannel() {
 #ifdef __linux__
@@ -176,65 +165,17 @@ public:
     bool recv(can_frame& frame) {
 #ifdef __linux__
         if (sock_ < 0) return false;
-        while (true) {
-            const auto n = ::recv(sock_, &frame, sizeof(frame), MSG_DONTWAIT);
-            if (n < 0) {
-                return false;
-            }
-            if (frame.can_id & CAN_ERR_FLAG) {
-                handle_error_frame(frame);
-                continue;
-            }
-            return n == sizeof(frame);
-        }
+        const auto n = ::recv(sock_, &frame, sizeof(frame), MSG_DONTWAIT);
+        return n == sizeof(frame);
 #else
         (void)frame;
         return false;
 #endif
     }
 
-    bool comm_fault() const { return comm_fault_; }
-
 private:
-#ifdef __linux__
-    void reopen() {
-        if (sock_ >= 0) {
-            ::close(sock_);
-            sock_ = -1;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (last_reopen_.time_since_epoch().count() != 0 &&
-            (now - last_reopen_) < std::chrono::milliseconds(50)) {
-            return;
-        }
-        last_reopen_ = now;
-        open();
-    }
-
-    void handle_error_frame(const can_frame& frame) {
-        const uint32_t err = frame.can_id & CAN_ERR_MASK;
-        const bool bus_off = (err & CAN_ERR_BUSOFF) != 0;
-        const bool restarted = (err & CAN_ERR_RESTARTED) != 0;
-        const bool ctrl_err = (err & CAN_ERR_CRTL) != 0;
-        if (bus_off) {
-            comm_fault_ = true;
-            EVLOG_error << "Module CAN bus-off on iface " << iface_;
-            reopen();
-        } else if (restarted) {
-            comm_fault_ = false;
-            EVLOG_info << "Module CAN controller restarted on iface " << iface_;
-        } else if (ctrl_err) {
-            EVLOG_warning << "Module CAN controller control error on iface " << iface_;
-        }
-    }
-#endif
-
     std::string iface_;
     int sock_{-1};
-    bool comm_fault_{false};
-#ifdef __linux__
-    std::chrono::steady_clock::time_point last_reopen_{};
-#endif
 };
 
 class ModuleDriver {
@@ -352,13 +293,6 @@ public:
 
     void poll() override {
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
-            return;
-        }
-        if (channel_->comm_fault()) {
-            telemetry_.fault = true;
-            telemetry_.fault_mask = 0xFF;
-            telemetry_.healthy_mask = 0x00;
-            telemetry_.last_update = std::chrono::steady_clock::now();
             return;
         }
         const auto now = std::chrono::steady_clock::now();

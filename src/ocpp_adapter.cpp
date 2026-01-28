@@ -2045,7 +2045,6 @@ void OcppAdapter::apply_power_plan() {
         if (st.limit_stale_events > prev_limit_stale) {
             EVLOG_warning << "Connector " << c.id << " EVSE_LIMIT cadence stale events observed ("
                           << st.limit_stale_events << "); constraining power";
-            st.comm_fault = true;
             power_constrained_[c.id] = true;
             last_limit_stale_counts_[c.id] = st.limit_stale_events;
         }
@@ -2077,9 +2076,6 @@ void OcppAdapter::apply_power_plan() {
                 module_current_a = snap.current_a;
                 module_power_kw = snap.power_kw;
             }
-        }
-        if (!module_telem_valid || st.comm_fault) {
-            last_module_mask_cmd_[c.id] = 0;
         }
         const bool have_telemetry = st.last_telemetry.time_since_epoch().count() != 0;
         const bool critical_trip = st.estop || st.earth_fault;
