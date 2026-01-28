@@ -174,6 +174,7 @@ private:
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
+    std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
     std::map<int, AuthorizationState> auth_state_cache_;
     std::map<int, int> telemetry_mismatch_count_;
     bool simulation_mode_{false};

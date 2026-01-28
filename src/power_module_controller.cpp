@@ -480,6 +480,11 @@ public:
                               << ") because no address was provided";
                 continue;
             }
+            if (spec.slot_index < 0 || spec.slot_index >= 8) {
+                EVLOG_warning << "Skipping module " << spec.id << " (slot " << spec.slot_id
+                              << ") because slot_index is invalid (" << spec.slot_index << ")";
+                continue;
+            }
             std::string type_lower = spec.type;
             std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -512,7 +517,9 @@ public:
         for (auto idx : indices) {
             if (idx >= modules_.size()) continue;
             const auto& spec = modules_[idx].spec;
-            if (req.enable && ((req.mask >> spec.slot_index) & 0x1)) {
+            const bool selected = (spec.slot_index >= 0 && spec.slot_index < 8) &&
+                                  (((req.mask >> spec.slot_index) & 0x1) != 0);
+            if (req.enable && selected) {
                 enabled++;
             }
         }
@@ -521,7 +528,9 @@ public:
         for (auto idx : indices) {
             if (idx >= modules_.size()) continue;
             auto& mod = modules_[idx];
-            const bool active = req.enable && ((req.mask >> mod.spec.slot_index) & 0x1);
+            const bool selected = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8) &&
+                                  (((req.mask >> mod.spec.slot_index) & 0x1) != 0);
+            const bool active = req.enable && selected;
             ModuleSetpoint sp;
             sp.enable = active;
             sp.voltage_v = req.voltage_v;
@@ -569,7 +578,7 @@ public:
                     snap.fault_mask |= bit;
                 }
             }
-            if (mod.spec.slot_index < static_cast<int>(snap.temperatures_c.size())) {
+            if (mod.spec.slot_index >= 0 && mod.spec.slot_index < static_cast<int>(snap.temperatures_c.size())) {
                 snap.temperatures_c[mod.spec.slot_index] = telem.temperature_c;
             }
             if (fresh) {

@@ -2185,14 +2185,39 @@ void OcppAdapter::apply_power_plan() {
         } else if (module_telem_valid) {
             last_power_w_[c.id] = measured_power_kw * 1000.0;
         }
+        const uint8_t healthy_mask = st.module_healthy_mask;
+        const uint8_t fault_mask = st.module_fault_mask;
+        const uint8_t usable_mask = static_cast<uint8_t>(healthy_mask & static_cast<uint8_t>(~fault_mask));
+        const int healthy_modules = popcount(usable_mask);
+        const bool modules_ok = healthy_modules > 0;
+
         const bool welded = st.gc_welded || st.mc_welded;
         const bool isolation_fault = st.isolation_fault || st.earth_fault || st.estop;
         const bool comm_fault = st.comm_fault;
         const bool thermal_fault = st.overtemp_fault;
         const bool overcurrent_fault = st.overcurrent_fault;
         const bool meter_fault_active = st.meter_stale && (power_ready || precharge_hint || st.relay_closed);
+
+        // If we reach precharge/power stages but no healthy modules are available, fail safe so the PLC/HLC can
+        // abort instead of looping indefinitely with 0 power.
+        const bool need_modules = power_ready || precharge_hint;
+        bool module_unavailable_fault = false;
+        if (need_modules && !modules_ok) {
+            auto& ts = module_missing_since_[c.id];
+            if (ts.time_since_epoch().count() == 0) {
+                ts = now;
+            } else {
+                const auto timeout_ms = std::max({2000, cfg_.precharge_timeout_ms, cfg_.telemetry_timeout_ms});
+                if ((now - ts) > std::chrono::milliseconds(timeout_ms)) {
+                    module_unavailable_fault = true;
+                }
+            }
+        } else {
+            module_missing_since_.erase(c.id);
+        }
+
         const bool general_fault = !st.safety_ok || st.cp_fault || meter_fault_active || welded || isolation_fault ||
-                                   thermal_fault || overcurrent_fault || comm_fault;
+                                   thermal_fault || overcurrent_fault || comm_fault || module_unavailable_fault;
         uint8_t fault_bits = 0;
         if (general_fault) fault_bits |= 0x01;
         if (comm_fault) fault_bits |= 0x02;
@@ -2200,12 +2225,6 @@ void OcppAdapter::apply_power_plan() {
         if (thermal_fault) fault_bits |= 0x08;
         if (overcurrent_fault) fault_bits |= 0x10;
         if (welded) fault_bits |= 0x20;
-
-        const uint8_t healthy_mask = st.module_healthy_mask;
-        const uint8_t fault_mask = st.module_fault_mask;
-        const uint8_t usable_mask = static_cast<uint8_t>(healthy_mask & static_cast<uint8_t>(~fault_mask));
-        const int healthy_modules = popcount(usable_mask);
-        const bool modules_ok = healthy_modules > 0;
 
         if (hardware_) {
             const bool output_enabled = st.relay_closed;

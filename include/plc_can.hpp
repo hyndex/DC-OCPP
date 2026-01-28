@@ -181,6 +181,7 @@ private:
     int telemetry_timeout_ms_{2000};
     std::map<std::int32_t, PlcState> connectors_;
     std::map<std::string, int> sockets_;
+    std::mutex sockets_mutex_;
     std::thread rx_thread_;
     std::thread tx_thread_;
     std::atomic<bool> running_{false};

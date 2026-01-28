@@ -372,8 +372,10 @@ inline MeterReading decode_energy_meter(const uint8_t in[8], std::uint64_t seq) 
     m.seq = seq;
     if (mux == 0) {
         const uint16_t v0p1 = static_cast<uint16_t>(in[2]) | (static_cast<uint16_t>(in[3]) << 8);
-        const uint16_t i0p01 = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
-        const uint16_t p0p01kw = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
+        const uint16_t i0p01_u = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+        const uint16_t p0p01kw_u = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
+        const std::int16_t i0p01 = static_cast<std::int16_t>(i0p01_u);
+        const std::int16_t p0p01kw = static_cast<std::int16_t>(p0p01kw_u);
         m.voltage_v = static_cast<double>(v0p1) / 10.0;
         m.current_a = static_cast<double>(i0p01) / 100.0;
         m.power_kw = static_cast<double>(p0p01kw) / 100.0;

@@ -136,15 +136,21 @@ PlcCanHardware::~PlcCanHardware() {
     running_ = false;
     if (rx_thread_.joinable()) rx_thread_.join();
     if (tx_thread_.joinable()) tx_thread_.join();
-    for (auto& kv : sockets_) {
-        if (kv.second >= 0) close(kv.second);
+    {
+        std::lock_guard<std::mutex> lock(sockets_mutex_);
+        for (auto& kv : sockets_) {
+            if (kv.second >= 0) close(kv.second);
+        }
+        sockets_.clear();
     }
-    sockets_.clear();
 }
 
 bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
     if (iface.empty()) return false;
-    if (sockets_.count(iface)) return true;
+    {
+        std::lock_guard<std::mutex> lock(sockets_mutex_);
+        if (sockets_.count(iface)) return true;
+    }
     int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd < 0) {
         EVLOG_error << "Failed to open CAN socket for " << iface << ": " << std::strerror(errno);
@@ -174,15 +180,28 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
     if (flags >= 0) {
         (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
-    sockets_[iface] = fd;
+    {
+        std::lock_guard<std::mutex> lock(sockets_mutex_);
+        auto it = sockets_.find(iface);
+        if (it != sockets_.end()) {
+            close(fd);
+            fd = it->second;
+        } else {
+            sockets_[iface] = fd;
+        }
+    }
     EVLOG_info << "CAN socket ready on " << iface << " (fd=" << fd << ")";
     return true;
 }
 
 bool PlcCanHardware::send_frame(const PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data) {
-    const auto it = sockets_.find(st.iface);
-    if (it == sockets_.end()) return false;
-    int fd = it->second;
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(sockets_mutex_);
+        const auto it = sockets_.find(st.iface);
+        if (it == sockets_.end()) return false;
+        fd = it->second;
+    }
     struct can_frame frame {};
     frame.can_id = can_id | CAN_EFF_FLAG;
     frame.can_dlc = 8;
@@ -201,10 +220,20 @@ bool PlcCanHardware::send_frame(const PlcState& st, uint32_t can_id, const std::
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             // If TX queue is wedged, try reopening the socket once in a while.
             if (enobufs_count >= 5) {
-                if (fd >= 0) close(fd);
-                sockets_.erase(st.iface);
+                {
+                    std::lock_guard<std::mutex> lock(sockets_mutex_);
+                    const auto it = sockets_.find(st.iface);
+                    if (it != sockets_.end()) {
+                        if (it->second >= 0) close(it->second);
+                        sockets_.erase(it);
+                    }
+                }
                 open_socket_for_iface(st.iface);
-                fd = sockets_.count(st.iface) ? sockets_[st.iface] : -1;
+                {
+                    std::lock_guard<std::mutex> lock(sockets_mutex_);
+                    const auto it = sockets_.find(st.iface);
+                    fd = (it == sockets_.end()) ? -1 : it->second;
+                }
                 enobufs_count = 0;
                 if (fd < 0) break;
                 continue;
@@ -224,10 +253,18 @@ bool PlcCanHardware::send_frame(const PlcState& st, uint32_t can_id, const std::
 
 void PlcCanHardware::rx_loop() {
     while (running_) {
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(sockets_mutex_);
+            fds.reserve(sockets_.size());
+            for (const auto& kv : sockets_) {
+                fds.push_back(kv.second);
+            }
+        }
         std::vector<pollfd> pfds;
-        pfds.reserve(sockets_.size());
-        for (const auto& kv : sockets_) {
-            pfds.push_back(pollfd{kv.second, POLLIN, 0});
+        pfds.reserve(fds.size());
+        for (const int fd : fds) {
+            pfds.push_back(pollfd{fd, POLLIN, 0});
         }
         if (pfds.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
@@ -556,33 +593,19 @@ void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::t
 void PlcCanHardware::update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_present_tx).count();
     if (elapsed >= kTxPresentMs) {
-        const double cfg_v = (st.cfg.max_voltage_v > 0.0) ? st.cfg.max_voltage_v
-                                                         : (cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v
-                                                                                          : kDefaultVoltageV);
-        const double cfg_i = (st.cfg.max_current_a > 0.0)
-                                 ? st.cfg.max_current_a
-                                 : (st.cfg.max_power_w > 0.0 && cfg_v > 0.0 ? st.cfg.max_power_w / 1000.0 / cfg_v
-                                                                            : kDefaultCurrentA);
-        double v_f = st.present_voltage_v;
-        double i_f = st.present_current_a;
-        double p_kw_f = st.present_power_kw;
-        if (v_f <= 0.0) {
-            v_f = (st.limits.max_voltage_v && st.limits.max_voltage_v.value() > 0.0)
-                      ? st.limits.max_voltage_v.value()
-                      : cfg_v;
-        }
-        if (i_f < 0.0) i_f = 0.0;
+        // Publish physical telemetry as-is. Avoid synthesizing a "fake" voltage during idle because it can
+        // break EV-side precharge logic (EV expects EVSEPresentVoltage to reflect actual output bus/inlet).
+        double v_f = std::max(0.0, st.present_voltage_v);
+        double i_f = std::max(0.0, st.present_current_a);
+        double p_kw_f = std::max(0.0, st.present_power_kw);
         if (!st.output_enabled && !st.regulating) {
-            // Keep idle current/power at 0 to avoid phantom energy, but still publish a sane voltage.
+            // Keep idle current/power at 0 to avoid phantom energy accumulation.
             i_f = 0.0;
             p_kw_f = 0.0;
         }
-        if (v_f < 1.0) v_f = cfg_v;
-        if (i_f < 0.0) i_f = 0.0;
         if (p_kw_f <= 0.0 && v_f > 0.0 && i_f > 0.0) {
             p_kw_f = (v_f * i_f) / 1000.0;
         }
-        if (p_kw_f < 0.0) p_kw_f = 0.0;
         const uint16_t v = clamp_to_0p1(v_f);
         const uint16_t i = clamp_to_0p1_current(i_f);
         const uint16_t p = clamp_to_0p1k(p_kw_f);
