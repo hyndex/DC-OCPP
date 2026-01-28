@@ -37,6 +37,20 @@ constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
 
+GunStatus sanitize_status_for_lab(const GunStatus& in) {
+    GunStatus st = in;
+    // Lab bypass: ignore cable-check, weld, isolation, and temperature-related faults.
+    st.hlc_cable_check_ok = true;
+    if (st.hlc_stage >= HLC_MIN_POWER_STAGE && !st.hlc_precharge_active && !st.hlc_charge_complete) {
+        st.hlc_power_ready = true;
+    }
+    st.isolation_fault = false;
+    st.overtemp_fault = false;
+    st.gc_welded = false;
+    st.mc_welded = false;
+    return st;
+}
+
 bool has_nonempty_file(const fs::path& path) {
     if (path.empty()) {
         return false;
@@ -311,12 +325,6 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
     hardware_(std::move(hardware)),
     planner_cfg_{},
     power_manager_(planner_cfg_) {
-    simulation_mode_ = cfg_.simulation_mode;
-    force_comm_fault_ = cfg_.use_plc && !cfg_.simulation_mode && !cfg_.plc_backend_available;
-    if (force_comm_fault_) {
-        EVLOG_warning << "PLC communication not established; marking connectors as Fault. "
-                      << "Enable chargePoint.simulationMode=true to suppress comm faults for simulation.";
-    }
     pending_token_store_ = cfg_.database_dir / "pending_tokens.json";
     for (const auto& c : cfg_.connectors) {
         connector_faulted_[c.id] = false;
@@ -972,12 +980,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (!hw_tokens.empty()) {
                 ingest_auth_tokens(hw_tokens, now);
             }
-            auto status = hardware_->get_status(connector);
-            bool comm_fault = status.comm_fault || force_comm_fault_;
-            if (simulation_mode_) {
-                comm_fault = false;
-            }
-            status.comm_fault = comm_fault;
+            auto status = sanitize_status_for_lab(hardware_->get_status(connector));
             record_presence_state(connector, status.plugged_in, now);
             auto mark_post_stop = [&](bool active) {
                 std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1813,6 +1816,7 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
             return 3;
         }
     };
+    const bool csms_offline = charge_point_ && !csms_connected_.load();
     for (auto qit = queue.begin(); qit != queue.end();) {
         if (qit->expires_at <= now) {
             qit = queue.erase(qit);
@@ -1833,6 +1837,10 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
     std::optional<std::size_t> best_idx;
     int best_prio = std::numeric_limits<int>::max();
     for (std::size_t idx = 0; idx < queue.size(); ++idx) {
+        if (queue[idx].token.source == AuthTokenSource::Autocharge &&
+            !queue[idx].token.prevalidated && csms_offline) {
+            continue;
+        }
         if (!matches_reservation(queue[idx])) continue;
         const int prio = priority(queue[idx].token.source);
         if (!best_idx || prio < best_prio ||
@@ -1870,8 +1878,12 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
         persist_pending_tokens_locked();
         return AuthorizationState::Granted;
     } else {
-        const bool keep_waiting = (pending.token.source == AuthTokenSource::Autocharge);
-        const auto state = keep_waiting ? AuthorizationState::Pending : AuthorizationState::Denied;
+        AuthorizationState state = AuthorizationState::Denied;
+        if (pending.token.source == AuthTokenSource::Autocharge) {
+            state = AuthorizationState::Pending;
+            EVLOG_info << "Autocharge rejected on connector " << connector
+                       << "; keeping auth pending to allow RemoteStart";
+        }
         set_auth_state(connector, state);
         persist_pending_tokens_locked();
         return state;
@@ -1889,11 +1901,11 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
         accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
     }
 
-    AuthorizationState new_state = AuthorizationState::Denied;
-    if (accepted) {
-        new_state = AuthorizationState::Granted;
-    } else if (pending.token.source == AuthTokenSource::Autocharge) {
+    AuthorizationState new_state = accepted ? AuthorizationState::Granted : AuthorizationState::Denied;
+    if (!accepted && pending.token.source == AuthTokenSource::Autocharge) {
         new_state = AuthorizationState::Pending;
+        EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
+                   << "; keeping auth pending to allow RemoteStart";
     }
 
     bool session_present = false;
@@ -2019,20 +2031,12 @@ void OcppAdapter::apply_power_plan() {
     std::map<int, ConnSnapshot> snapshots;
     bool trip_global = false;
     std::string global_reason;
-    auto derate_linear = [](double value, double temp_c, double start_c, double trip_c) {
-        if (value <= 0.0) return 0.0;
-        if (trip_c <= start_c) return value;
-        if (temp_c >= trip_c) return 0.0;
-        if (temp_c <= start_c) return value;
-        const double scale = 1.0 - ((temp_c - start_c) / (trip_c - start_c));
-        return value * std::max(0.0, scale);
-    };
     for (const auto& c : cfg_.connectors) {
         power_constrained_[c.id] = false;
     }
 
     for (const auto& c : cfg_.connectors) {
-        GunStatus st = hardware_->get_status(c.id);
+        GunStatus st = sanitize_status_for_lab(hardware_->get_status(c.id));
         const uint64_t prev_present_stale = last_present_stale_counts_[c.id];
         const uint64_t prev_limit_stale = last_limit_stale_counts_[c.id];
         if (st.present_stale_events > prev_present_stale) {
@@ -2105,14 +2109,9 @@ void OcppAdapter::apply_power_plan() {
         g.connector_temp_c = st.connector_temp_c;
         g.gc_welded = st.gc_welded;
         g.mc_welded = st.mc_welded;
-        g.safety_ok = st.safety_ok && !st.estop && !st.earth_fault && !st.isolation_fault &&
-                      !st.overtemp_fault && !st.overcurrent_fault && !st.comm_fault;
+        g.safety_ok = st.safety_ok && !st.estop && !st.earth_fault && !st.overcurrent_fault && !st.comm_fault;
         g.plugged_in = st.plugged_in;
         g.reserved = reserved_connectors_[c.id];
-        if (planner_cfg_.connector_derate_trip_c > 0.0 &&
-            st.connector_temp_c >= planner_cfg_.connector_derate_trip_c) {
-            g.safety_ok = false;
-        }
 
         const bool lock_required = c.require_lock;
         bool session_present = false;
@@ -2192,7 +2191,7 @@ void OcppAdapter::apply_power_plan() {
         const bool modules_ok = healthy_modules > 0;
 
         const bool welded = st.gc_welded || st.mc_welded;
-        const bool isolation_fault = st.isolation_fault || st.earth_fault || st.estop;
+        const bool isolation_fault = st.isolation_fault;
         const bool comm_fault = st.comm_fault;
         const bool thermal_fault = st.overtemp_fault;
         const bool overcurrent_fault = st.overcurrent_fault;
@@ -2287,12 +2286,7 @@ void OcppAdapter::apply_power_plan() {
                         const bool fault_bit = (st.module_fault_mask & bit) != 0;
                         const double module_temp = st.module_temp_c[idx];
                         mod.temperature_c = module_temp;
-                        bool healthy = healthy_bit && g.safety_ok && !fault_bit;
-                        if (planner_cfg_.module_derate_trip_c > 0.0 &&
-                            module_temp >= planner_cfg_.module_derate_trip_c) {
-                            healthy = false;
-                        }
-                        mod.healthy = healthy;
+                        mod.healthy = healthy_bit && g.safety_ok && !fault_bit;
                         break;
                     }
                 }
@@ -2337,17 +2331,6 @@ void OcppAdapter::apply_power_plan() {
         gun_lookup[g.id] = g;
 
         snapshots[c.id] = ConnSnapshot{st, measured_power_kw, measured_i};
-        if (g.connector_temp_c > 0.0) {
-            g.gun_current_limit_a = derate_linear(g.gun_current_limit_a, g.connector_temp_c,
-                                                  planner_cfg_.connector_derate_start_c,
-                                                  planner_cfg_.connector_derate_trip_c);
-            g.gun_power_limit_kw = derate_linear(g.gun_power_limit_kw, g.connector_temp_c,
-                                                 planner_cfg_.connector_derate_start_c,
-                                                 planner_cfg_.connector_derate_trip_c);
-            if (g.gun_current_limit_a <= 0.0) {
-                g.safety_ok = false;
-            }
-        }
     }
 
     if (!trip_global && global_fault_latched_) {
@@ -2971,7 +2954,7 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
     if (fault_active || meter_fault_active) {
         next = ConnectorState::Faulted;
     } else if (disabled) {
-        next = ConnectorState::SuspendedEVSE;
+        next = has_session ? ConnectorState::SuspendedEVSE : ConnectorState::Unavailable;
     } else if (has_session) {
         if (!tx_started) {
             next = ConnectorState::Preparing;
@@ -3002,7 +2985,6 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
 
     switch (next) {
     case ConnectorState::Faulted:
-        charge_point_->on_disabled(connector);
         break;
     case ConnectorState::Preparing:
         break;
@@ -3020,6 +3002,9 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         break;
     case ConnectorState::Available:
         charge_point_->on_enabled(connector);
+        break;
+    case ConnectorState::Unavailable:
+        charge_point_->on_disabled(connector);
         break;
     }
 

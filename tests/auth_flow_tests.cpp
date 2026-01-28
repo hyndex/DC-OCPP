@@ -1,5 +1,5 @@
 #include "ocpp_adapter.hpp"
-#include "hardware_sim.hpp"
+#include "test_hardware.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -17,7 +17,7 @@ static ChargerConfig make_basic_config() {
 int main() {
     const auto now = std::chrono::steady_clock::now();
     auto cfg = make_basic_config();
-    auto hw = std::make_shared<SimulatedHardware>(cfg);
+    auto hw = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
 
     // Plug-first then late RemoteStart (prevalidated)

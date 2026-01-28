@@ -1,5 +1,5 @@
 #include "ocpp_adapter.hpp"
-#include "hardware_sim.hpp"
+#include "test_hardware.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -25,7 +25,7 @@ int main() {
     fs::create_directories(temp_dir);
 
     auto cfg = make_cfg(temp_dir);
-    auto hw = std::make_shared<SimulatedHardware>(cfg);
+    auto hw = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
     const auto now = std::chrono::steady_clock::now();
 
@@ -48,7 +48,7 @@ int main() {
     OcppAdapter::TestHook::persist_pending_tokens(adapter); // force flush to disk
 
     // Reload adapter from disk; tokens should still be available.
-    auto hw2 = std::make_shared<SimulatedHardware>(cfg);
+    auto hw2 = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter2(cfg, hw2);
     const auto load_time = now + std::chrono::seconds(5);
     auto pt1 = OcppAdapter::TestHook::pop_next_pending_token(adapter2, 1, load_time);

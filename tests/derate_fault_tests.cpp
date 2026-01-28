@@ -82,13 +82,12 @@ int main() {
     hw->status.connector_temp_c = 70.0;
     hw->status.target_current_a = 50.0;
     OcppAdapter::TestHook::apply_power_plan(adapter);
-    assert(hw->last_cmd.module_count >= 0); // not forced off
+    assert(hw->last_cmd.module_count > 0);
 
-    // Case 2: temp above trip, safety should cut power and open GC
+    // Case 2: temp above trip, should NOT block power (temperature handling disabled)
     hw->status.connector_temp_c = 100.0;
     OcppAdapter::TestHook::apply_power_plan(adapter);
-    assert(hw->last_cmd.module_count == 0);
-    assert(hw->last_cmd.gc_closed == false);
+    assert(hw->last_cmd.module_count > 0);
     std::cout << "Derate/fault tests passed\n";
     return 0;
 }

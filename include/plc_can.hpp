@@ -16,8 +16,6 @@
 
 namespace charger {
 
-class SimulatedHardware;
-
 /// \brief SocketCAN-based PLC backend using the CAN-TEST/Basic contract.
 class PlcCanHardware : public HardwareInterface {
 public:
@@ -191,8 +189,6 @@ private:
     std::mutex token_mutex_;
     std::vector<AuthToken> pending_tokens_;
 
-    // Delegate uploads/firmware handling to the simulation backend to reuse tested code-paths.
-    std::unique_ptr<SimulatedHardware> diag_helper_;
 
     bool open_socket_for_iface(const std::string& iface);
     bool send_frame(const PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data);

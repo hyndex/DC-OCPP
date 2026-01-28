@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "plc_can.hpp"
 
-#include "hardware_sim.hpp"
-
 #include <everest/logging.hpp>
 
 #include <linux/can.h>
@@ -104,8 +102,6 @@ bool limits_equal(const EvseLimits& a, const EvseLimits& b) {
 PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     use_crc_ = cfg_.plc_use_crc8;
     telemetry_timeout_ms_ = cfg_.telemetry_timeout_ms > 0 ? cfg_.telemetry_timeout_ms : 2000;
-    diag_helper_ = std::make_unique<SimulatedHardware>(cfg_);
-
     for (const auto& c : cfg_.connectors) {
         auto& st = connectors_[c.id]; // default construct in-place (std::atomic is not copyable)
         st.cfg = c;
@@ -458,35 +454,22 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
                 pending_tokens_.push_back(std::move(token));
             }
         }
+    } else if (can_id == can_contract::evmac_id(plc_id)) {
+        const auto seg = can_contract::decode_identity_segment(data);
+        std::vector<uint8_t> payload;
+        if (assemble_identity_segment(st->evmac, seg, now, payload)) {
+            AuthToken token;
+            token.id_token = format_mac_token(payload);
+            token.source = AuthTokenSource::Autocharge;
+            token.connector_hint = st->connector_id;
+            token.received_at = now;
+            std::lock_guard<std::mutex> tok_lock(token_mutex_);
+            pending_tokens_.push_back(std::move(token));
+        }
     } else if (can_id == can_contract::evccid_id(plc_id) ||
                can_id == can_contract::evemaid0_id(plc_id) ||
-               can_id == can_contract::evemaid1_id(plc_id) ||
-               can_id == can_contract::evmac_id(plc_id)) {
-        const auto seg = can_contract::decode_identity_segment(data);
-        PlcCanHardware::IdentityAssembly* target = nullptr;
-        bool is_mac = false;
-        if (can_id == can_contract::evccid_id(plc_id)) {
-            target = &st->evccid;
-        } else if (can_id == can_contract::evemaid0_id(plc_id)) {
-            target = &st->evemaid0;
-        } else if (can_id == can_contract::evemaid1_id(plc_id)) {
-            target = &st->evemaid1;
-        } else if (can_id == can_contract::evmac_id(plc_id)) {
-            target = &st->evmac;
-            is_mac = true;
-        }
-        if (target) {
-            std::vector<uint8_t> payload;
-            if (assemble_identity_segment(*target, seg, now, payload)) {
-                AuthToken token;
-                token.id_token = is_mac ? format_mac_token(payload) : format_token_bytes(payload);
-                token.source = AuthTokenSource::Autocharge;
-                token.connector_hint = st->connector_id;
-                token.received_at = now;
-                std::lock_guard<std::mutex> tok_lock(token_mutex_);
-                pending_tokens_.push_back(std::move(token));
-            }
-        }
+               can_id == can_contract::evemaid1_id(plc_id)) {
+        EVLOG_debug << "Ignoring EVCCID/EMAID identity for Autocharge; MAC id is required";
     }
 }
 
@@ -779,21 +762,32 @@ ocpp::v16::ReservationStatus PlcCanHardware::reserve(std::int32_t reservation_id
 bool PlcCanHardware::cancel_reservation(std::int32_t) { return true; }
 
 ocpp::v16::GetLogResponse PlcCanHardware::upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest& request) {
-    return diag_helper_ ? diag_helper_->upload_diagnostics(request) : ocpp::v16::GetLogResponse{};
+    (void)request;
+    EVLOG_warning << "Diagnostics upload not supported in PLC backend";
+    ocpp::v16::GetLogResponse resp{};
+    resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+    return resp;
 }
 
 ocpp::v16::GetLogResponse PlcCanHardware::upload_logs(const ocpp::v16::GetLogRequest& request) {
-    return diag_helper_ ? diag_helper_->upload_logs(request) : ocpp::v16::GetLogResponse{};
+    (void)request;
+    EVLOG_warning << "Log upload not supported in PLC backend";
+    ocpp::v16::GetLogResponse resp{};
+    resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+    return resp;
 }
 
 bool PlcCanHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest& request) {
-    return diag_helper_ ? diag_helper_->update_firmware(request) : false;
+    (void)request;
+    EVLOG_warning << "Firmware update not supported in PLC backend";
+    return false;
 }
 
 ocpp::v16::UpdateFirmwareStatusEnumType
 PlcCanHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest& request) {
-    return diag_helper_ ? diag_helper_->update_firmware_signed(request)
-                        : ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
+    (void)request;
+    EVLOG_warning << "Signed firmware update not supported in PLC backend";
+    return ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
 }
 
 void PlcCanHardware::set_connection_timeout(std::int32_t seconds) { connection_timeout_s_ = seconds; }
@@ -973,10 +967,10 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.module_healthy_mask = 0x03;
     gs.module_fault_mask = 0x00;
     gs.hlc_stage = hlc_fresh ? st.hlc_stage : 0;
-    gs.hlc_cable_check_ok = chargeinfo_fresh ? st.hlc_cable_checked : false;
+    gs.hlc_cable_check_ok = true;
     gs.hlc_precharge_active = chargeinfo_fresh ? st.hlc_precharge_active : false;
     gs.hlc_charge_complete = chargeinfo_fresh ? st.hlc_charge_complete : false;
-    const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 && gs.hlc_cable_check_ok &&
+    const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 &&
                            !gs.hlc_precharge_active && !gs.hlc_charge_complete;
     gs.hlc_power_ready = hlc_ready;
     if (st.last_relay_rx.time_since_epoch().count() != 0 && st.last_safety_rx.time_since_epoch().count() != 0) {
@@ -1040,11 +1034,35 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.target_voltage_v = st.ev_target_voltage_v;
         gs.target_current_a = st.ev_target_current_a;
     } else {
-        gs.target_current_a = 0.0;
+        gs.target_voltage_v.reset();
+        gs.target_current_a.reset();
     }
-    gs.evse_max_voltage_v = st.limits.max_voltage_v;
-    gs.evse_max_current_a = st.limits.max_current_a;
-    gs.evse_max_power_kw = st.limits.max_power_kw;
+    const double cfg_v = (st.cfg.max_voltage_v > 0.0) ? st.cfg.max_voltage_v
+                                                      : (cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v
+                                                                                      : kDefaultVoltageV);
+    const double cfg_i = (st.cfg.max_current_a > 0.0)
+                             ? st.cfg.max_current_a
+                             : (st.cfg.max_power_w > 0.0 && cfg_v > 0.0 ? st.cfg.max_power_w / 1000.0 / cfg_v
+                                                                        : kDefaultCurrentA);
+    const double cfg_p_kw = (st.cfg.max_power_w > 0.0) ? st.cfg.max_power_w / 1000.0 : 0.0;
+    double max_v = (st.limits.max_voltage_v && st.limits.max_voltage_v.value() > 0.0)
+                       ? st.limits.max_voltage_v.value()
+                       : cfg_v;
+    double max_i = (st.limits.max_current_a && st.limits.max_current_a.value() > 0.0)
+                       ? st.limits.max_current_a.value()
+                       : cfg_i;
+    double max_p_kw =
+        (st.limits.max_power_kw && st.limits.max_power_kw.value() > 0.0)
+            ? st.limits.max_power_kw.value()
+            : ((cfg_p_kw > 0.0) ? cfg_p_kw : (max_v > 0.0 && max_i > 0.0 ? (max_v * max_i / 1000.0) : 0.0));
+    if (max_v <= 0.0) max_v = cfg_v;
+    if (max_i <= 0.0) max_i = cfg_i;
+    if (max_p_kw <= 0.0) {
+        max_p_kw = (max_v > 0.0 && max_i > 0.0) ? (max_v * max_i / 1000.0) : cfg_p_kw;
+    }
+    gs.evse_max_voltage_v = max_v > 0.0 ? std::optional<double>(max_v) : std::nullopt;
+    gs.evse_max_current_a = max_i > 0.0 ? std::optional<double>(max_i) : std::nullopt;
+    gs.evse_max_power_kw = max_p_kw > 0.0 ? std::optional<double>(max_p_kw) : std::nullopt;
     gs.evse_limit_ack_count = st.evse_limit_ack_count;
     gs.last_evse_limit_ack = st.last_evse_limit_ack;
     gs.comm_fault = gs.comm_fault || !st.last_relay.crc_ok || !st.last_safety.crc_ok;

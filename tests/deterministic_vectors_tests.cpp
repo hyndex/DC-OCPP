@@ -1,5 +1,5 @@
 #include "ocpp_adapter.hpp"
-#include "hardware_sim.hpp"
+#include "test_hardware.hpp"
 #include "power_manager.hpp"
 
 #include <cassert>
@@ -47,7 +47,7 @@ static std::vector<Slot> make_slots() {
 int main() {
     const auto now = std::chrono::steady_clock::now();
     auto cfg = make_cfg();
-    auto hw = std::make_shared<SimulatedHardware>(cfg);
+    auto hw = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
 
     // Autocharge pending should not authorize; RFID afterwards should grant.

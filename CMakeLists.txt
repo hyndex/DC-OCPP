@@ -375,7 +375,6 @@ add_executable(dc_ocpp
   src/main.cpp
   src/charger_config.cpp
   src/ocpp_adapter.cpp
-  src/hardware_sim.cpp
   src/plc_can.cpp
   src/power_module_controller.cpp
   src/power_manager.cpp
@@ -548,10 +547,9 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
-    src/hardware_sim.cpp
     src/power_module_controller.cpp
   )
-  target_include_directories(auth_flow_tests PRIVATE include libocpp/include)
+  target_include_directories(auth_flow_tests PRIVATE include libocpp/include tests)
   target_link_libraries(auth_flow_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(auth_flow_tests PRIVATE CHARGER_UNIT_TESTS)
 
@@ -560,10 +558,9 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
-    src/hardware_sim.cpp
     src/power_module_controller.cpp
   )
-  target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include)
+  target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include tests)
   target_link_libraries(deterministic_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(deterministic_vectors_tests PRIVATE CHARGER_UNIT_TESTS)
 
@@ -572,10 +569,9 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
-    src/hardware_sim.cpp
     src/power_module_controller.cpp
   )
-  target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include)
+  target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include tests)
   target_link_libraries(pending_token_persistence_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(pending_token_persistence_tests PRIVATE CHARGER_UNIT_TESTS)
 
@@ -584,7 +580,6 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
-    src/hardware_sim.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
@@ -596,10 +591,9 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
-    src/hardware_sim.cpp
     src/power_module_controller.cpp
   )
-  target_include_directories(limit_fallback_tests PRIVATE include libocpp/include)
+  target_include_directories(limit_fallback_tests PRIVATE include libocpp/include tests)
   target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(limit_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
 

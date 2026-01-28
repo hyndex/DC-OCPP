@@ -151,14 +151,11 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     } else {
         cfg.central_system_uri = cp.value("centralSystemURI", "");
     }
-    cfg.simulation_mode = cp.value("simulationMode", false);
     cfg.can_interface = cp.value("canInterface", "can0");
     const auto plc_cfg = json.value("plc", nlohmann::json::object());
     cfg.use_plc = plc_cfg.value("enabled", true);
     cfg.use_plc = cp.value("usePlc", cfg.use_plc);
-    if (cfg.simulation_mode) {
-        cfg.use_plc = false;
-    }
+    cfg.use_plc = cp.value("usePLC", cfg.use_plc);
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);

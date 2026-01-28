@@ -1,5 +1,5 @@
 #include "ocpp_adapter.hpp"
-#include "hardware_sim.hpp"
+#include "test_hardware.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -52,7 +52,7 @@ static GunStatus make_ready_status(const std::chrono::steady_clock::time_point& 
 int main() {
     const auto now = std::chrono::steady_clock::now();
     auto cfg = make_cfg();
-    auto hw = std::make_shared<SimulatedHardware>(cfg);
+    auto hw = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
 
     // Pending authorization should propagate to hardware stub and keep auth not granted.
