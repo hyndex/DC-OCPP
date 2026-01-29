@@ -44,6 +44,12 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+If you only need the runtime binary (and want to avoid building all test targets), build just `dc_ocpp`:
+```bash
+cmake --build build --target dc_ocpp -j
+```
+or use `./scripts/build_dc_ocpp.sh`.
+
 The root CMake script fetches `everest-cmake` automatically. If your dependencies are installed in non‑standard locations, append them to `CMAKE_PREFIX_PATH`.
 
 Optional unit tests for the planner:

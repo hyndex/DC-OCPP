@@ -75,7 +75,8 @@ std::string format_token_bytes(const std::vector<uint8_t>& bytes) {
 
 std::string format_mac_token(const std::vector<uint8_t>& bytes) {
     if (bytes.size() == 6) {
-        return bytes_to_hex(bytes, ":");
+        // Use plain hex without separators: many CSMS implementations treat ':' as invalid in an OCPP idTag.
+        return bytes_to_hex(bytes);
     }
     return format_token_bytes(bytes);
 }
