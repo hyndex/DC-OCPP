@@ -285,7 +285,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
         if (c.meter_scale <= 0.0) {
             c.meter_scale = 1.0;
         }
-        if (c.meter_source != "plc" && c.meter_source != "shunt") {
+        if (c.meter_source != "plc" && c.meter_source != "shunt" && c.meter_source != "module") {
             c.meter_source = "plc";
         }
         if (c.min_voltage_v < 0.0) {

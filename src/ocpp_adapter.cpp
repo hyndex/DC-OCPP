@@ -2130,8 +2130,11 @@ void OcppAdapter::apply_power_plan() {
         const bool power_ready = session_ready &&
             (st.relay_closed || power_delivery_requested(st, lock_required));
         const bool have_ev_targets = st.target_voltage_v && st.target_voltage_v.value() > 0.0;
-        const bool precharge_hint = session_ready && st.plugged_in && !st.hlc_charge_complete &&
-                                    (st.hlc_precharge_active || have_ev_targets);
+        // Allow precharge/warmup decisions even before the OCPP transaction is authorized so ISO15118 can progress.
+        // Energy delivery is still gated by `power_ready`/GC closure later in the state machine.
+        const bool precharge_hint = st.plugged_in && !st.hlc_charge_complete &&
+                                    (st.hlc_precharge_active || have_ev_targets) &&
+                                    !disabled_by_csms && !paused_by_csms;
         if (session_present) {
             g.reserved = false;
             reserved_connectors_[c.id] = false;

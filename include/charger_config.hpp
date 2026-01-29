@@ -22,7 +22,7 @@ struct ConnectorConfig {
     std::string label;
     bool require_lock{true};
     int lock_input_switch{3};       // Which PLC switch input indicates lock engaged (1-4)
-    std::string meter_source{"plc"}; // "plc" (default) or "shunt"
+    std::string meter_source{"plc"}; // "plc" (default), "module", or "shunt"
     double meter_scale{1.0};        // Calibration multiplier for meter/shunt readings
     double meter_offset_wh{0.0};    // Calibration offset applied to imported energy
 };
