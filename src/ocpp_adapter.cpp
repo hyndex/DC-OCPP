@@ -429,11 +429,23 @@ void OcppAdapter::initialize_slots() {
                 ms.can_interface = !m.can_interface.empty() ? m.can_interface : cfg_.can_interface;
                 ms.address = m.address;
                 ms.group = m.group;
+                ms.monitor_address = m.monitor_address;
+                ms.production_day = m.production_day;
+                ms.serial_low = m.serial_low;
+                ms.source_address = m.source_address;
+                ms.input_mode = m.input_mode;
+                ms.hi_lo_mode = m.hi_lo_mode;
+                ms.silent_mode = m.silent_mode;
                 ms.rated_power_kw = m.rated_power_kw;
                 ms.rated_current_a = m.rated_current_a;
                 ms.poll_interval_ms = m.poll_interval_ms;
                 ms.cmd_interval_ms = m.cmd_interval_ms;
+                ms.telemetry_stale_ms = m.telemetry_stale_ms;
                 ms.broadcast = m.broadcast;
+                ms.probe_on_startup = m.probe_on_startup;
+                ms.readback_limits = m.readback_limits;
+                ms.send_output_current = m.send_output_current;
+                ms.send_output_power = m.send_output_power;
                 module_states_.push_back(ms);
             }
             slots.push_back(s);
@@ -486,11 +498,23 @@ void OcppAdapter::initialize_slots() {
         spec.can_interface = !ms.can_interface.empty() ? ms.can_interface : cfg_.can_interface;
         spec.address = ms.address;
         spec.group = ms.group;
+        spec.monitor_address = ms.monitor_address;
+        spec.production_day = ms.production_day;
+        spec.serial_low = ms.serial_low;
+        spec.source_address = ms.source_address;
+        spec.input_mode = ms.input_mode;
+        spec.hi_lo_mode = ms.hi_lo_mode;
+        spec.silent_mode = ms.silent_mode;
         spec.rated_power_kw = ms.rated_power_kw > 0.0 ? ms.rated_power_kw : cfg_.module_power_kw;
         spec.rated_current_a = ms.rated_current_a;
         spec.poll_interval_ms = ms.poll_interval_ms;
         spec.cmd_interval_ms = ms.cmd_interval_ms;
+        spec.telemetry_stale_ms = ms.telemetry_stale_ms;
         spec.broadcast = ms.broadcast;
+        spec.probe_on_startup = ms.probe_on_startup;
+        spec.readback_limits = ms.readback_limits;
+        spec.send_output_current = ms.send_output_current;
+        spec.send_output_power = ms.send_output_power;
         module_specs.push_back(spec);
     }
     if (!module_specs.empty()) {
@@ -2027,6 +2051,8 @@ void OcppAdapter::apply_power_plan() {
         GunStatus status;
         double measured_power_kw{0.0};
         double measured_current_a{0.0};
+        bool module_health_valid{true};
+        bool module_unavailable_fault{false};
     };
     std::map<int, ConnSnapshot> snapshots;
     bool trip_global = false;
@@ -2065,6 +2091,7 @@ void OcppAdapter::apply_power_plan() {
         double module_voltage_v = 0.0;
         double module_current_a = 0.0;
         double module_power_kw = 0.0;
+        bool module_health_valid = !module_controller_;
         if (module_controller_ && slot_for_conn) {
             auto snap = module_controller_->snapshot_for_slot(slot_for_conn->id);
             if (snap.valid) {
@@ -2073,6 +2100,9 @@ void OcppAdapter::apply_power_plan() {
                 for (std::size_t i = 0; i < snap.temperatures_c.size() && i < st.module_temp_c.size(); ++i) {
                     st.module_temp_c[i] = snap.temperatures_c[i];
                 }
+                module_health_valid = snap.health_valid;
+            } else {
+                module_health_valid = false;
             }
             if (snap.telemetry_valid) {
                 module_telem_valid = true;
@@ -2278,6 +2308,11 @@ void OcppAdapter::apply_power_plan() {
         g.ev_req_voltage_v = std::min(g.ev_req_voltage_v, max_voltage_v);
         g.i_meas_a = measured_i;
 
+        const auto snap_state_it = snapshots.find(c.id);
+        const bool module_health_valid_snap =
+            snap_state_it != snapshots.end() ? snap_state_it->second.module_health_valid : true;
+        const bool module_unavailable_fault_snap =
+            snap_state_it != snapshots.end() ? snap_state_it->second.module_unavailable_fault : false;
         // Update module health by slot
         if (slot_for_conn) {
             for (std::size_t idx = 0; idx < slot_for_conn->modules.size(); ++idx) {
@@ -2289,7 +2324,11 @@ void OcppAdapter::apply_power_plan() {
                         const bool fault_bit = (st.module_fault_mask & bit) != 0;
                         const double module_temp = st.module_temp_c[idx];
                         mod.temperature_c = module_temp;
-                        mod.healthy = healthy_bit && g.safety_ok && !fault_bit;
+                        if (module_health_valid_snap) {
+                            mod.healthy = healthy_bit && g.safety_ok && !fault_bit;
+                        } else if (module_unavailable_fault_snap) {
+                            mod.healthy = false;
+                        }
                         break;
                     }
                 }
@@ -2333,7 +2372,7 @@ void OcppAdapter::apply_power_plan() {
         guns.push_back(g);
         gun_lookup[g.id] = g;
 
-        snapshots[c.id] = ConnSnapshot{st, measured_power_kw, measured_i};
+        snapshots[c.id] = ConnSnapshot{st, measured_power_kw, measured_i, module_health_valid, module_unavailable_fault};
     }
 
     if (!trip_global && global_fault_latched_) {
@@ -2392,6 +2431,9 @@ void OcppAdapter::apply_power_plan() {
         bool disabled_by_csms{false};
         bool paused{false};
         bool local_fault{false};
+        bool module_health_valid{true};
+        bool module_unavailable_fault{false};
+        bool modules_healthy{true};
         int modules_final{0};
         uint8_t mask_final{0};
         ContactorState desired_mc_state{ContactorState::Closed};
@@ -2421,6 +2463,10 @@ void OcppAdapter::apply_power_plan() {
         info.meas_current = snap_it != snapshots.end() ? snap_it->second.measured_current_a : 0.0;
         info.meas_voltage = snap_it != snapshots.end() ? snap_it->second.status.present_voltage_v.value_or(last_voltage_v_[c.id])
                                                        : last_voltage_v_[c.id];
+        if (snap_it != snapshots.end()) {
+            info.module_health_valid = snap_it->second.module_health_valid;
+            info.module_unavailable_fault = snap_it->second.module_unavailable_fault;
+        }
         info.gun_state = gun_lookup.count(c.id) ? gun_lookup.at(c.id) : GunState{};
         info.disabled_by_csms = evse_disabled_.count(c.id) ? evse_disabled_[c.id] : false;
         info.paused = paused_evse_[c.id] || info.disabled_by_csms;
@@ -2431,6 +2477,24 @@ void OcppAdapter::apply_power_plan() {
                 runtime_healthy_modules++;
             }
         }
+        info.modules_healthy = runtime_healthy_modules > 0;
+        const int grace_ms = std::max(0, cfg_.module_health_grace_ms);
+        bool module_health_ok = info.modules_healthy;
+        if (info.module_health_valid && info.modules_healthy) {
+            last_module_health_ok_[slot->id] = now;
+        }
+        if (!info.module_health_valid) {
+            const auto it = last_module_health_ok_.find(slot->id);
+            if (it != last_module_health_ok_.end() &&
+                (now - it->second) <= std::chrono::milliseconds(grace_ms)) {
+                module_health_ok = true;
+            } else {
+                module_health_ok = false;
+            }
+        }
+        if (info.module_unavailable_fault) {
+            module_health_ok = false;
+        }
 
         if (info.status.gc_welded) info.fault_reason = "GCWelded";
         if (info.status.mc_welded) info.fault_reason = "MCWelded";
@@ -2438,9 +2502,15 @@ void OcppAdapter::apply_power_plan() {
         if (info.status.overtemp_fault && info.fault_reason.empty()) info.fault_reason = "Overtemp";
         if (info.status.overcurrent_fault && info.fault_reason.empty()) info.fault_reason = "Overcurrent";
         if (info.status.comm_fault && info.fault_reason.empty()) info.fault_reason = "CommFault";
-        info.local_fault = !info.gun_state.safety_ok || runtime_healthy_modules <= 0 || info.status.gc_welded ||
-                           info.status.mc_welded || info.status.isolation_fault || info.status.overtemp_fault ||
-                           info.status.overcurrent_fault || info.status.comm_fault;
+        const bool modules_known_bad = info.module_health_valid && runtime_healthy_modules <= 0;
+        if (modules_known_bad && info.fault_reason.empty()) info.fault_reason = "ModuleOffline";
+        if (info.module_unavailable_fault && info.fault_reason.empty()) info.fault_reason = "ModuleUnavailable";
+        info.local_fault = !info.gun_state.safety_ok || modules_known_bad || info.module_unavailable_fault ||
+                           info.status.gc_welded || info.status.mc_welded || info.status.isolation_fault ||
+                           info.status.overtemp_fault || info.status.overcurrent_fault || info.status.comm_fault;
+
+        // Persist module health decision for downstream command logic.
+        info.modules_healthy = module_health_ok;
 
         if (info.selection.gun_id > 0 && info.selection.module_count > 0 && !info.local_fault &&
             !info.disabled_by_csms && info.desired_mc_state == ContactorState::Closed) {
@@ -2646,8 +2716,10 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
+        const bool module_health_ok = info.modules_healthy;
         const bool modules_allowed = in_island && status.plugged_in && !local_fault && !info.disabled_by_csms &&
-                                     isolation_ready && dispatch.modules_assigned > 0 && mc_closed_cmd;
+                                     isolation_ready && dispatch.modules_assigned > 0 && mc_closed_cmd &&
+                                     module_health_ok;
         const int slot_module_cmd = modules_allowed ? info.modules_final : 0;
         const uint8_t slot_mask_cmd = modules_allowed ? info.mask_final : 0;
         const uint8_t slot_cfg_mask =
@@ -2708,11 +2780,25 @@ void OcppAdapter::apply_power_plan() {
             // During warmup we keep module relays closed (via the PLC) but leave module output OFF (0V/0A standby).
             ModuleCommandRequest mreq;
             mreq.slot_id = slot->id;
-            mreq.enable = modules_allowed;
-            mreq.mask = modules_allowed ? slot_mask_cmd : 0u;
-            mreq.voltage_v = modules_allowed ? dispatch.voltage_set_v : 0.0;
-            mreq.current_a = modules_allowed ? dispatch.current_limit_a : 0.0;
-            mreq.power_kw = modules_allowed ? dispatch.p_set_kw : 0.0;
+            bool enable = modules_allowed;
+            uint8_t mask = modules_allowed ? slot_mask_cmd : 0u;
+            double voltage_v = modules_allowed ? dispatch.voltage_set_v : 0.0;
+            double current_a = modules_allowed ? dispatch.current_limit_a : 0.0;
+            double power_kw = modules_allowed ? dispatch.p_set_kw : 0.0;
+            if (warmup && warmup_mask != 0u) {
+                enable = true;
+                mask = warmup_mask;
+                voltage_v = dispatch.voltage_set_v > 0.0 ? dispatch.voltage_set_v
+                                                        : (info.meas_voltage > 0.0 ? info.meas_voltage
+                                                                                   : planner_cfg_.default_voltage_v);
+                current_a = 0.0;
+                power_kw = 0.0;
+            }
+            mreq.enable = enable;
+            mreq.mask = mask;
+            mreq.voltage_v = voltage_v;
+            mreq.current_a = current_a;
+            mreq.power_kw = power_kw;
             module_controller_->apply_command(mreq);
         }
 

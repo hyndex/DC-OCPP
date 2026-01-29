@@ -6,6 +6,7 @@
 #include "can_contract.hpp"
 
 #include <atomic>
+#include <array>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -140,6 +141,8 @@ private:
         uint8_t relay_enable_mask{0};
         bool relay_force_off{false};
         bool relay_clear_faults{false};
+        std::array<std::chrono::steady_clock::time_point, 3> relay_mismatch_since{};
+        uint64_t relay_conflict_count{0};
         // CP state from the CP voltage sampler (may be noisy on some harnesses).
         char cp_state_raw{'U'};
         uint8_t cp_duty_raw{0};

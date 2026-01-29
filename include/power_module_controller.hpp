@@ -17,11 +17,23 @@ struct ModuleSpec {
     std::string can_interface;
     int address{-1};
     int group{0};
+    int monitor_address{1};
+    int production_day{0};
+    int serial_low{0};
+    int source_address{0xA0};
+    int input_mode{-1};
+    int hi_lo_mode{-1};
+    int silent_mode{-1};
     double rated_power_kw{0.0};
     double rated_current_a{0.0};
     int poll_interval_ms{500};
     int cmd_interval_ms{500};
+    int telemetry_stale_ms{0};
     bool broadcast{false}; // send via broadcast DST (0xFE or extended)
+    bool probe_on_startup{true};
+    bool readback_limits{false};
+    bool send_output_current{false};
+    bool send_output_power{false};
 };
 
 struct ModuleCommandRequest {
@@ -35,6 +47,7 @@ struct ModuleCommandRequest {
 
 struct ModuleHealthSnapshot {
     bool valid{false};
+    bool health_valid{false};
     uint8_t healthy_mask{0};
     uint8_t fault_mask{0};
     std::array<double, 2> temperatures_c{{0.0, 0.0}};

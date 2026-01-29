@@ -879,6 +879,36 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     } else {
         gs.relay_closed = st.last_relay.relay[0];
     }
+    const bool relay_fresh =
+        st.last_relay_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() <=
+            telemetry_timeout_ms_;
+    if (relay_fresh && cfg_.plc_module_relays_enabled) {
+        struct RelayBit {
+            uint8_t mask;
+            int idx;
+        };
+        const RelayBit module_bits[] = {
+            {kRelayModule0Mask, 1},
+            {kRelayModule1Mask, 2},
+        };
+        for (const auto& bit : module_bits) {
+            const bool expected_on =
+                (st.relay_enable_mask & bit.mask) && (st.relay_cmd_mask & bit.mask) && !st.relay_force_off;
+            const bool actual_on = st.last_relay.relay[bit.idx] && !st.last_relay.relay_fault[bit.idx];
+            if (expected_on != actual_on) {
+                if (st.relay_mismatch_since[bit.idx].time_since_epoch().count() == 0) {
+                    st.relay_mismatch_since[bit.idx] = now;
+                } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - st.relay_mismatch_since[bit.idx])
+                               .count() >= 500) {
+                    st.relay_conflict_count++;
+                    st.relay_mismatch_since[bit.idx] = now;
+                }
+            } else {
+                st.relay_mismatch_since[bit.idx] = std::chrono::steady_clock::time_point{};
+            }
+        }
+    }
     const bool cp_session_fresh =
         st.last_session_rx.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_session_rx).count() <=
@@ -977,6 +1007,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     if (st.last_relay_rx.time_since_epoch().count() != 0 && st.last_safety_rx.time_since_epoch().count() != 0) {
         gs.last_telemetry = std::min(st.last_relay_rx, st.last_safety_rx);
     }
+    gs.relay_conflict_count = st.relay_conflict_count;
     const bool meter_expected = (st.cfg.meter_source == "plc") && st.meter_available;
     const bool have_meter_sample = st.last_meter_rx.time_since_epoch().count() != 0;
     const bool meter_flagged_stale = have_meter_sample && (st.last_meter.comm_error || st.last_meter.stale);

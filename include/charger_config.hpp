@@ -30,15 +30,27 @@ struct ConnectorConfig {
 struct ModuleConfig {
     std::string id;
     std::string mn_id;
-    std::string type;           // e.g. "maxwell-mxr"
+    std::string type;           // e.g. "maxwell-mxr", "maxwell", "maxwell-max"
     std::string can_interface;  // optional override for module CAN bus
     int address{-1};            // module address on the bus (0-63 for Maxwell)
     int group{0};               // optional module group number
+    int monitor_address{1};     // optional monitor address (ENR/UUGreen)
+    int production_day{0};      // optional production day (ENR/UUGreen)
+    int serial_low{0};          // optional serial low part (ENR/UUGreen)
+    int source_address{0xA0};   // optional source address (Tonhe J1939)
+    int input_mode{-1};         // optional input mode (1=AC,2=DC,3=3-phase AC); -1 disables
+    int hi_lo_mode{-1};         // optional hi/lo/auto voltage mode (1=high,2=low,3=auto)
+    int silent_mode{-1};        // optional silent mode (UUGreen: 0-2)
     double rated_power_kw{0.0}; // optional per-module power rating
     double rated_current_a{0.0}; // optional per-module current rating
     int poll_interval_ms{500};
     int cmd_interval_ms{500};
+    int telemetry_stale_ms{0};   // override stale telemetry threshold (0 = auto)
     bool broadcast{false};
+    bool probe_on_startup{true};
+    bool readback_limits{false};
+    bool send_output_current{false}; // send 0x001B output current command
+    bool send_output_power{false};   // send 0x0020 output power command
 };
 
 struct SlotMapping {
@@ -99,6 +111,7 @@ struct ChargerConfig {
     bool upload_allow_file_targets{true};
     double precharge_voltage_tolerance_v{50.0};
     int precharge_timeout_ms{2000};
+    int module_health_grace_ms{2000};
     int auth_wait_timeout_s{1800};
     int power_request_timeout_s{60};
     int evse_limit_ack_timeout_ms{1500};

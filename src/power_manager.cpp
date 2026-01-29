@@ -81,7 +81,8 @@ int PowerManager::ideal_modules_for_gun(const GunState& g, double p_budget) cons
         return cfg_.min_modules_per_active_gun;
     }
     int n = 1;
-    if (p_budget <= cfg_.ideal_low_factor * cfg_.module_power_kw) {
+    // Prefer a single module until demand exceeds one-module capacity.
+    if (p_budget <= cfg_.module_power_kw) {
         n = 1;
     } else if (p_budget <= cfg_.ideal_high_factor * cfg_.module_power_kw) {
         n = 2;

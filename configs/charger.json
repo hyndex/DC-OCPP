@@ -22,8 +22,8 @@
       "id": 1,
       "label": "Gun 1",
       "lockInputSwitch": 3,
-      "maxCurrentA": 200,
-      "maxPowerW": 60000,
+      "maxCurrentA": 100,
+      "maxPowerW": 30000,
       "maxVoltageV": 1000,
       "meterOffsetWh": 0,
       "meterScale": 1,
@@ -155,6 +155,7 @@
           "group": 0,
           "id": "M1_0",
           "mn": "MN_1_0",
+          "ratedCurrentA": 100,
           "ratedPowerKW": 30,
           "type": "maxwell-mxr"
         }

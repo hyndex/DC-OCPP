@@ -78,11 +78,23 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             mc.can_interface = m.value("canInterface", "");
             mc.address = m.value("address", -1);
             mc.group = m.value("group", 0);
+            mc.monitor_address = m.value("monitorAddress", 1);
+            mc.production_day = m.value("productionDay", 0);
+            mc.serial_low = m.value("serialLow", 0);
+            mc.source_address = m.value("sourceAddress", 0xA0);
+            mc.input_mode = m.value("inputMode", -1);
+            mc.hi_lo_mode = m.value("hiLoMode", -1);
+            mc.silent_mode = m.value("silentMode", -1);
             mc.rated_power_kw = m.value("ratedPowerKW", 0.0);
             mc.rated_current_a = m.value("ratedCurrentA", 0.0);
             mc.poll_interval_ms = m.value("pollMs", 500);
             mc.cmd_interval_ms = m.value("cmdIntervalMs", 500);
+            mc.telemetry_stale_ms = m.value("telemetryStaleMs", 0);
             mc.broadcast = m.value("broadcast", false);
+            mc.probe_on_startup = m.value("probeOnStartup", true);
+            mc.readback_limits = m.value("readbackLimits", false);
+            mc.send_output_current = m.value("sendOutputCurrent", false);
+            mc.send_output_power = m.value("sendOutputPower", false);
             slot.modules.push_back(mc);
         }
     }
@@ -249,6 +261,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.meter_sample_interval_s = json.value("meterSampleIntervalSeconds", cfg.meter_sample_interval_s);
     cfg.meter_keepalive_s = json.value("meterKeepAliveSeconds", cfg.meter_keepalive_s);
     cfg.minimum_status_duration_s = json.value("minimumStatusDurationSeconds", cfg.minimum_status_duration_s);
+    cfg.module_health_grace_ms = json.value("moduleHealthGraceMs", cfg.module_health_grace_ms);
 
     const auto controller = json.value("controller", nlohmann::json::object());
     cfg.free_mode = controller.value("freeMode", json.value("FreeMode", cfg.free_mode));
@@ -334,22 +347,68 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                 if (m.can_interface.empty()) {
                     m.can_interface = cfg.can_interface;
                 }
+                const bool is_rectifier = (m.type == "maxwell-enr" || m.type == "enr" ||
+                                           m.type == "uugreen" || m.type == "uugreenpower");
+                const bool is_tonhe = (m.type == "tonhe");
                 if (m.group < 0) {
                     m.group = 0;
                 }
-                if (m.group > 60) {
+                if (is_rectifier) {
+                    if (m.group > 0x0F) {
+                        m.group = 0x0F;
+                    }
+                } else if (m.group > 60) {
                     m.group = 60;
+                }
+                if (m.monitor_address < 0) m.monitor_address = 1;
+                if (m.monitor_address > 0x0F) m.monitor_address = 0x0F;
+                if (m.production_day < 0) m.production_day = 0;
+                if (m.production_day > 31) m.production_day = 0;
+                if (m.serial_low < 0) m.serial_low = 0;
+                if (m.serial_low > 0x1FF) m.serial_low = 0x1FF;
+                if (m.source_address < 0) m.source_address = 0xA0;
+                if (m.source_address > 0xFF) m.source_address = 0xA0;
+                if (m.input_mode < -1 || (m.input_mode > 0 && m.input_mode != 1 && m.input_mode != 2 && m.input_mode != 3)) {
+                    m.input_mode = -1;
+                }
+                if (is_tonhe && m.input_mode == 3) {
+                    // Tonhe supports only AC/DC; map 3-phase to AC.
+                    m.input_mode = 1;
+                }
+                if (m.hi_lo_mode < -1 || (m.hi_lo_mode > 0 && m.hi_lo_mode != 1 && m.hi_lo_mode != 2 && m.hi_lo_mode != 3)) {
+                    m.hi_lo_mode = -1;
+                }
+                if (m.silent_mode < -1 || m.silent_mode > 2) {
+                    m.silent_mode = -1;
                 }
                 if (!m.type.empty()) {
                     std::transform(m.type.begin(), m.type.end(), m.type.begin(),
                                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (is_tonhe && m.broadcast) {
+                        throw std::runtime_error("Module " + m.id + " uses broadcast mode, which is not supported for Tonhe");
+                    }
                     if (!m.broadcast) {
-                        if (m.address < 0 || m.address > 63) {
-                            throw std::runtime_error("Module " + m.id + " has invalid address (expected 0-63)");
+                        if (is_rectifier) {
+                            if (m.address < 1 || m.address > 0x7F) {
+                                throw std::runtime_error("Module " + m.id + " has invalid address (expected 1-127)");
+                            }
+                        } else if (is_tonhe) {
+                            if (m.address < 1 || m.address > 0xFF) {
+                                throw std::runtime_error("Module " + m.id + " has invalid address (expected 1-255)");
+                            }
+                        } else {
+                            if (m.address < 0 || m.address > 63) {
+                                throw std::runtime_error("Module " + m.id + " has invalid address (expected 0-63)");
+                            }
                         }
                     } else {
-                        // Broadcast allows 0xFE (group broadcast) or 0xFF (global)
-                        if (m.address < 0) m.address = 0xFE;
+                        if (is_rectifier) {
+                            if (m.address < 0) m.address = 0;
+                            if (m.address > 0x7F) m.address = 0x7F;
+                        } else {
+                            // Broadcast allows 0xFE (group broadcast) or 0xFF (global)
+                            if (m.address < 0) m.address = 0xFE;
+                        }
                     }
                     if (m.rated_power_kw <= 0.0) {
                         m.rated_power_kw = cfg.module_power_kw;
@@ -359,6 +418,9 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                     }
                     m.poll_interval_ms = std::max(100, m.poll_interval_ms);
                     m.cmd_interval_ms = std::max(100, m.cmd_interval_ms);
+                    if (m.telemetry_stale_ms < 0) {
+                        m.telemetry_stale_ms = 0;
+                    }
                     const auto key = std::make_tuple(m.can_interface, m.group, m.address);
                     if (!m.broadcast) {
                         if (!seen_addresses.insert(key).second) {

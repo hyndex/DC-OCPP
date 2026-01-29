@@ -175,6 +175,7 @@ private:
     std::string global_fault_reason_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
+    std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
     std::map<int, AuthorizationState> auth_state_cache_;
     std::map<int, int> telemetry_mismatch_count_;
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
