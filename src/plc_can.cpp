@@ -103,6 +103,13 @@ bool limits_equal(const EvseLimits& a, const EvseLimits& b) {
 PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     use_crc_ = cfg_.plc_use_crc8;
     telemetry_timeout_ms_ = cfg_.telemetry_timeout_ms > 0 ? cfg_.telemetry_timeout_ms : 2000;
+    if (cfg_.autocharge_id_source == "evccid") {
+        autocharge_source_ = AutochargeIdSource::Evccid;
+    } else if (cfg_.autocharge_id_source == "emaid") {
+        autocharge_source_ = AutochargeIdSource::Emaid;
+    } else {
+        autocharge_source_ = AutochargeIdSource::Evmac;
+    }
     for (const auto& c : cfg_.connectors) {
         auto& st = connectors_[c.id]; // default construct in-place (std::atomic is not copyable)
         st.cfg = c;
@@ -459,18 +466,50 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         const auto seg = can_contract::decode_identity_segment(data);
         std::vector<uint8_t> payload;
         if (assemble_identity_segment(st->evmac, seg, now, payload)) {
-            AuthToken token;
-            token.id_token = format_mac_token(payload);
-            token.source = AuthTokenSource::Autocharge;
-            token.connector_hint = st->connector_id;
-            token.received_at = now;
-            std::lock_guard<std::mutex> tok_lock(token_mutex_);
-            pending_tokens_.push_back(std::move(token));
+            if (autocharge_source_ == AutochargeIdSource::Evmac) {
+                emit_autocharge_token(*st, format_mac_token(payload), now);
+            } else {
+                EVLOG_debug << "Ignoring EVMAC identity (autochargeIdSource=" << cfg_.autocharge_id_source << ")";
+            }
         }
-    } else if (can_id == can_contract::evccid_id(plc_id) ||
-               can_id == can_contract::evemaid0_id(plc_id) ||
-               can_id == can_contract::evemaid1_id(plc_id)) {
-        EVLOG_debug << "Ignoring EVCCID/EMAID identity for Autocharge; MAC id is required";
+    } else if (can_id == can_contract::evccid_id(plc_id)) {
+        const auto seg = can_contract::decode_identity_segment(data);
+        std::vector<uint8_t> payload;
+        if (assemble_identity_segment(st->evccid, seg, now, payload)) {
+            if (autocharge_source_ == AutochargeIdSource::Evccid) {
+                emit_autocharge_token(*st, format_token_bytes(payload), now);
+            } else {
+                EVLOG_debug << "Ignoring EVCCID identity (autochargeIdSource=" << cfg_.autocharge_id_source << ")";
+            }
+        }
+    } else if (can_id == can_contract::evemaid0_id(plc_id)) {
+        const auto seg = can_contract::decode_identity_segment(data);
+        std::vector<uint8_t> payload;
+        if (assemble_identity_segment(st->evemaid0, seg, now, payload)) {
+            if (autocharge_source_ == AutochargeIdSource::Emaid) {
+                st->emaid0_cache = payload;
+                st->emaid0_rx = now;
+                maybe_emit_emaid(*st, now);
+            } else {
+                EVLOG_debug << "Ignoring EMAID0 identity (autochargeIdSource=" << cfg_.autocharge_id_source << ")";
+            }
+        }
+    } else if (can_id == can_contract::evemaid1_id(plc_id)) {
+        const auto seg = can_contract::decode_identity_segment(data);
+        std::vector<uint8_t> payload;
+        if (assemble_identity_segment(st->evemaid1, seg, now, payload)) {
+            if (autocharge_source_ == AutochargeIdSource::Emaid) {
+                st->emaid1_cache = payload;
+                st->emaid1_rx = now;
+                maybe_emit_emaid(*st, now);
+            } else {
+                EVLOG_debug << "Ignoring EMAID1 identity (autochargeIdSource=" << cfg_.autocharge_id_source << ")";
+            }
+        }
+    }
+    if (autocharge_source_ == AutochargeIdSource::Emaid &&
+        (!st->emaid0_cache.empty() || !st->emaid1_cache.empty())) {
+        maybe_emit_emaid(*st, now);
     }
 }
 
@@ -619,6 +658,48 @@ void PlcCanHardware::update_relay_tx(PlcState& st, std::chrono::steady_clock::ti
     (void)send_frame(st, can_contract::relay_control_id(static_cast<uint8_t>(st.plc_id)), payload);
     st.last_relay_tx = now;
     st.relay_clear_faults = false;
+}
+
+void PlcCanHardware::emit_autocharge_token(PlcState& st, const std::string& id_token,
+                                           std::chrono::steady_clock::time_point now) {
+    if (id_token.empty()) {
+        return;
+    }
+    AuthToken token;
+    token.id_token = id_token;
+    token.source = AuthTokenSource::Autocharge;
+    token.connector_hint = st.connector_id;
+    token.received_at = now;
+    std::lock_guard<std::mutex> tok_lock(token_mutex_);
+    pending_tokens_.push_back(std::move(token));
+}
+
+void PlcCanHardware::maybe_emit_emaid(PlcState& st, std::chrono::steady_clock::time_point now) {
+    if (autocharge_source_ != AutochargeIdSource::Emaid) {
+        return;
+    }
+    const bool have0 = !st.emaid0_cache.empty();
+    const bool have1 = !st.emaid1_cache.empty();
+    if (have0 && have1) {
+        std::vector<uint8_t> combined = st.emaid0_cache;
+        combined.insert(combined.end(), st.emaid1_cache.begin(), st.emaid1_cache.end());
+        st.emaid0_cache.clear();
+        st.emaid1_cache.clear();
+        emit_autocharge_token(st, format_token_bytes(combined), now);
+        return;
+    }
+    const auto timeout = std::chrono::milliseconds(kSegmentTimeoutMs);
+    if (have0 && (now - st.emaid0_rx) > timeout) {
+        auto token = format_token_bytes(st.emaid0_cache);
+        st.emaid0_cache.clear();
+        emit_autocharge_token(st, token, now);
+        return;
+    }
+    if (have1 && (now - st.emaid1_rx) > timeout) {
+        auto token = format_token_bytes(st.emaid1_cache);
+        st.emaid1_cache.clear();
+        emit_autocharge_token(st, token, now);
+    }
 }
 
 bool PlcCanHardware::assemble_identity_segment(IdentityAssembly& asmbl,
@@ -869,17 +950,19 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         st.last_status_rx.time_since_epoch().count() == 0 ||
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_status_rx).count() >
             telemetry_timeout_ms_;
-    gs.comm_fault = comm_stale || st.last_relay.comm_fault || !st.protocol_ok;
-    gs.safety_ok = st.last_relay.safety_ok && st.last_safety.safety_ok && !st.last_relay.earth_fault &&
-                   !st.last_safety.earth_fault && !comm_stale;
-    gs.estop = st.last_relay.estop_latched || st.last_safety.estop_latched;
-    gs.earth_fault = st.last_relay.earth_fault || st.last_safety.earth_fault;
-    if (cfg_.plc_owns_gun_relay) {
+    const bool relay_feedback = cfg_.plc_relay_feedback;
+    gs.comm_fault = comm_stale || (!relay_feedback ? false : st.last_relay.comm_fault) || !st.protocol_ok;
+    const bool relay_safety_ok = relay_feedback ? (st.last_relay.safety_ok && !st.last_relay.earth_fault) : true;
+    gs.safety_ok = relay_safety_ok && st.last_safety.safety_ok && !st.last_safety.earth_fault && !comm_stale;
+    gs.estop = (relay_feedback ? st.last_relay.estop_latched : false) || st.last_safety.estop_latched;
+    gs.earth_fault = (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
+    if (cfg_.plc_owns_gun_relay || !relay_feedback) {
         gs.relay_closed = st.output_enabled || st.regulating;
     } else {
         gs.relay_closed = st.last_relay.relay[0];
     }
     const bool relay_fresh =
+        relay_feedback &&
         st.last_relay_rx.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() <=
             telemetry_timeout_ms_;
@@ -1004,8 +1087,11 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 &&
                            !gs.hlc_precharge_active && !gs.hlc_charge_complete;
     gs.hlc_power_ready = hlc_ready;
-    if (st.last_relay_rx.time_since_epoch().count() != 0 && st.last_safety_rx.time_since_epoch().count() != 0) {
+    if (relay_feedback && st.last_relay_rx.time_since_epoch().count() != 0 &&
+        st.last_safety_rx.time_since_epoch().count() != 0) {
         gs.last_telemetry = std::min(st.last_relay_rx, st.last_safety_rx);
+    } else if (st.last_safety_rx.time_since_epoch().count() != 0) {
+        gs.last_telemetry = st.last_safety_rx;
     }
     gs.relay_conflict_count = st.relay_conflict_count;
     const bool meter_expected = (st.cfg.meter_source == "plc") && st.meter_available;

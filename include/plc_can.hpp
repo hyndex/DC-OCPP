@@ -60,6 +60,12 @@ public:
     bool supports_cross_slot_islands() const override;
 
 private:
+    enum class AutochargeIdSource {
+        Evmac,
+        Evccid,
+        Emaid
+    };
+
     struct IdentityAssembly {
         uint8_t len{0};
         uint8_t seg_cnt{0};
@@ -174,12 +180,17 @@ private:
         IdentityAssembly evemaid0;
         IdentityAssembly evemaid1;
         IdentityAssembly evmac;
+        std::vector<uint8_t> emaid0_cache;
+        std::vector<uint8_t> emaid1_cache;
+        std::chrono::steady_clock::time_point emaid0_rx{};
+        std::chrono::steady_clock::time_point emaid1_rx{};
         RfidAssembly rfid;
     };
 
     ChargerConfig cfg_;
     bool use_crc_{true};
     int telemetry_timeout_ms_{2000};
+    AutochargeIdSource autocharge_source_{AutochargeIdSource::Evmac};
     std::map<std::int32_t, PlcState> connectors_;
     std::map<std::string, int> sockets_;
     std::mutex sockets_mutex_;
@@ -205,6 +216,9 @@ private:
     void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now);
     bool set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
+    void emit_autocharge_token(PlcState& st, const std::string& id_token,
+                               std::chrono::steady_clock::time_point now);
+    void maybe_emit_emaid(PlcState& st, std::chrono::steady_clock::time_point now);
     static bool assemble_identity_segment(IdentityAssembly& asmbl,
                                           const can_contract::IdentitySegment& seg,
                                           std::chrono::steady_clock::time_point now,

@@ -92,6 +92,9 @@ struct ChargerConfig {
     bool plc_use_crc8{true};
     bool plc_owns_gun_relay{false}; // When true, controller will not command GC relay; PLC owns it
     bool plc_module_relays_enabled{true}; // Allow PLC module relay control; disable when external module drivers used
+    bool plc_three_relay_mode{false}; // PLC has only GC + 2 module relays; disable MC/island switching
+    bool plc_relay_feedback{true}; // When false, assume relay commands succeed (no relay feedback available)
+    std::string autocharge_id_source{"evmac"}; // "evmac", "evccid", or "emaid"
     bool require_https_uploads{true};
     double module_power_kw{30.0};
     double grid_limit_kw{1000.0};

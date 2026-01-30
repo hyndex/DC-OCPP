@@ -126,8 +126,11 @@
     "prechargeVoltageToleranceV": 50
   },
   "plc": {
+    "autochargeIdSource": "evmac",
     "gunRelayOwnedByPlc": false,
     "moduleRelaysEnabled": true,
+    "relayFeedbackAvailable": false,
+    "threeRelayMode": true,
     "requireHttpsUploads": true,
     "useCRC8": true
   },

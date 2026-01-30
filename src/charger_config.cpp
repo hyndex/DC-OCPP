@@ -36,6 +36,25 @@ std::string trim_copy(std::string s) {
     return s;
 }
 
+std::string normalize_autocharge_source(std::string s) {
+    s = trim_copy(std::move(s));
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s == "mac") {
+        return "evmac";
+    }
+    if (s == "evcc") {
+        return "evccid";
+    }
+    if (s == "ema") {
+        return "emaid";
+    }
+    if (s != "evmac" && s != "evccid" && s != "emaid") {
+        return "evmac";
+    }
+    return s;
+}
+
 ConnectorConfig parse_connector(const nlohmann::json& connector_json, int default_interval) {
     ConnectorConfig connector;
     connector.id = connector_json.value("id", 1);
@@ -171,6 +190,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
+    cfg.plc_three_relay_mode = plc_cfg.value("threeRelayMode", false);
+    cfg.plc_relay_feedback = plc_cfg.value("relayFeedbackAvailable", true);
+    cfg.autocharge_id_source = normalize_autocharge_source(
+        plc_cfg.value("autochargeIdSource", cfg.autocharge_id_source));
     cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
     const auto uploads = json.value("uploads", nlohmann::json::object());
     cfg.upload_max_bytes = uploads.value("maxBytes", cfg.upload_max_bytes);
@@ -235,6 +258,11 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.max_modules_per_gun > 2) {
         throw std::runtime_error("maxModulesPerGun > 2 is not supported by this build (PLC relay mask and telemetry "
                                  "arrays are sized for 2 modules per gun)");
+    }
+    if (cfg.plc_three_relay_mode) {
+        cfg.allow_cross_slot_islands = false;
+        cfg.max_modules_per_gun = std::min(cfg.max_modules_per_gun, 2);
+        cfg.max_island_radius = 1;
     }
 
     if (json.contains("ocpp") && json["ocpp"].is_object()) {

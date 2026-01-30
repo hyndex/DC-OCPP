@@ -2456,6 +2456,9 @@ void OcppAdapter::apply_power_plan() {
         info.selection = slot_selections.count(slot->id) ? slot_selections[slot->id] : SlotModuleSelection{};
         const auto mc_it = plan.mc_commands.find(slot->mc_id);
         info.desired_mc_state = mc_it != plan.mc_commands.end() ? mc_it->second : ContactorState::Closed;
+        if (cfg_.plc_three_relay_mode) {
+            info.desired_mc_state = ContactorState::Closed;
+        }
         const auto gc_it = plan.gc_commands.find(slot->gc_id);
         info.desired_gc_state = gc_it != plan.gc_commands.end() ? gc_it->second : ContactorState::Open;
         const auto snap_it = snapshots.find(c.id);
@@ -2587,54 +2590,60 @@ void OcppAdapter::apply_power_plan() {
         }
 
         // MC sequencing: honor open-on-charge islands but gate opens on low current with a short timeout.
-        const double mc_open_thresh = planner_cfg_.mc_open_current_a > 0.0 ? planner_cfg_.mc_open_current_a : 0.5;
-        bool mc_closed_cmd = (info.desired_mc_state == ContactorState::Closed);
+        bool mc_closed_cmd = true;
         bool isolation_ready = true;
-        const bool mc_change_requested = last_mc_state_.count(slot->mc_id) &&
-            info.desired_mc_state != last_mc_state_[slot->mc_id];
-        if (mc_change_requested &&
-            ((status.relay_closed || std::fabs(meas_i) >= mc_open_thresh))) {
-            mc_closed_cmd = (last_mc_state_[slot->mc_id] == ContactorState::Closed);
-            power_constrained_[c.id] = true;
-            EVLOG_debug << "Deferring MC change for slot " << slot->id << " while charging is active";
-            isolation_ready = false;
-        } else if (info.desired_mc_state == ContactorState::Open && !local_fault) {
-            const bool already_isolated =
-                (last_mc_state_[slot->mc_id] == ContactorState::Open) &&
-                (!mc_open_pending_.count(slot->id) || !mc_open_pending_[slot->id]);
-            if (!already_isolated) {
-                const bool safe_to_open = (std::fabs(meas_i) < mc_open_thresh) || !status.relay_closed;
-                if (!safe_to_open) {
-                    mc_closed_cmd = true;
-                    mc_open_pending_[slot->id] = true;
-                    auto& ts = mc_open_request_time_[slot->id];
-                    if (ts.time_since_epoch().count() == 0) {
-                        ts = now;
-                    } else if ((now - ts) > MC_OPEN_TIMEOUT_MS) {
-                        local_fault = true;
-                        info.fault_reason = info.fault_reason.empty() ? "MCOpenTimeout" : info.fault_reason;
-                        EVLOG_warning << "MC open timeout for slot " << slot->id << " (gun " << gun_for_slot
-                                      << "); locking out connector";
+        if (!cfg_.plc_three_relay_mode) {
+            const double mc_open_thresh = planner_cfg_.mc_open_current_a > 0.0 ? planner_cfg_.mc_open_current_a : 0.5;
+            mc_closed_cmd = (info.desired_mc_state == ContactorState::Closed);
+            const bool mc_change_requested = last_mc_state_.count(slot->mc_id) &&
+                info.desired_mc_state != last_mc_state_[slot->mc_id];
+            if (mc_change_requested &&
+                ((status.relay_closed || std::fabs(meas_i) >= mc_open_thresh))) {
+                mc_closed_cmd = (last_mc_state_[slot->mc_id] == ContactorState::Closed);
+                power_constrained_[c.id] = true;
+                EVLOG_debug << "Deferring MC change for slot " << slot->id << " while charging is active";
+                isolation_ready = false;
+            } else if (info.desired_mc_state == ContactorState::Open && !local_fault) {
+                const bool already_isolated =
+                    (last_mc_state_[slot->mc_id] == ContactorState::Open) &&
+                    (!mc_open_pending_.count(slot->id) || !mc_open_pending_[slot->id]);
+                if (!already_isolated) {
+                    const bool safe_to_open = (std::fabs(meas_i) < mc_open_thresh) || !status.relay_closed;
+                    if (!safe_to_open) {
+                        mc_closed_cmd = true;
+                        mc_open_pending_[slot->id] = true;
+                        auto& ts = mc_open_request_time_[slot->id];
+                        if (ts.time_since_epoch().count() == 0) {
+                            ts = now;
+                        } else if ((now - ts) > MC_OPEN_TIMEOUT_MS) {
+                            local_fault = true;
+                            info.fault_reason = info.fault_reason.empty() ? "MCOpenTimeout" : info.fault_reason;
+                            EVLOG_warning << "MC open timeout for slot " << slot->id << " (gun " << gun_for_slot
+                                          << "); locking out connector";
+                        }
+                        isolation_ready = false;
+                    } else {
+                        mc_closed_cmd = false;
+                        mc_open_pending_.erase(slot->id);
+                        mc_open_request_time_.erase(slot->id);
                     }
-                    isolation_ready = false;
                 } else {
                     mc_closed_cmd = false;
-                    mc_open_pending_.erase(slot->id);
-                    mc_open_request_time_.erase(slot->id);
                 }
             } else {
+                mc_open_pending_.erase(slot->id);
+                mc_open_request_time_.erase(slot->id);
+                mc_closed_cmd = (info.desired_mc_state == ContactorState::Closed);
+            }
+            if (local_fault) {
+                isolation_ready = false;
+                mc_open_pending_.erase(slot->id);
+                mc_open_request_time_.erase(slot->id);
                 mc_closed_cmd = false;
             }
         } else {
             mc_open_pending_.erase(slot->id);
             mc_open_request_time_.erase(slot->id);
-            mc_closed_cmd = (info.desired_mc_state == ContactorState::Closed);
-        }
-        if (local_fault) {
-            isolation_ready = false;
-            mc_open_pending_.erase(slot->id);
-            mc_open_request_time_.erase(slot->id);
-            mc_closed_cmd = false;
         }
 
         // GC: avoid opening under load unless forced; rely on PLC to ramp to zero.

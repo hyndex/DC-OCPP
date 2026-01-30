@@ -18,15 +18,28 @@ This list tracks the end-to-end work required to align the controller and PLC (R
 - [x] Use CAN EVSE present/regulating as PSU readiness to unblock HLC PowerDelivery when hardware PSU is external.
 - [x] Propagate CAN fault bits into PSU fault status (avoid false-ready on faults).
 - [x] Validate protocol version handshake via ConfigCmd/ConfigAck (PARAM_PROTO_VERSION).
-- [ ] Wire module telemetry as the authoritative meter source (controller-side) and verify EnergyMeterData accuracy.
+- [x] Wire module telemetry as the authoritative meter source (controller-side) and verify EnergyMeterData accuracy.
 
 ## Stage 2 — Security + Auth (Controller/OCPP)
 - [x] Require valid CA bundles by default; allow insecure only via explicit opt-in flag/env var.
 - [ ] (Deferred) Implement ISO15118/PnC DataTransfer handling if/when Plug-and-Charge is required.
+- [x] Add configurable Autocharge id source selection (EVCCID/EMAID/EVMAC).
 - [ ] Confirm idToken mapping strategy for Autocharge (EVCCID/EMAID/EVMAC) with CSMS.
 
 ## Stage 3 — System Tests + HIL
-- [ ] Run CAN protocol tests (CRC + vector + end-to-end) against updated controller + PLC.
-- [ ] Execute HIL plan (`tests/HIL_PLAN.md`) with PLC hardware and CSMS.
-- [ ] Execute soak plan (`docs/soak_test_plan.md`) and record stability/telemetry results.
-- [ ] Verify security profile compliance (TLS, cert provisioning, revoke/renewal flows).
+- [ ] Run CAN protocol tests (CRC + vector + end-to-end) against updated controller + PLC. (blocked: needs hardware)
+- [ ] Execute HIL plan (`tests/HIL_PLAN.md`) with PLC hardware and CSMS. (blocked: needs hardware)
+- [ ] Execute soak plan (`docs/soak_test_plan.md`) and record stability/telemetry results. (blocked: needs hardware)
+- [ ] Verify security profile compliance (TLS, cert provisioning, revoke/renewal flows). (blocked: needs hardware/certs)
+
+## Stage 4 — 3‑Relay PLC Hardware Alignment (GC + 2 Modules Only)
+- [x] Add config flag to force 3‑relay mode and disable cross‑slot islands.
+- [x] Ensure MC contactor logic is bypassed when only GC + 2 module relays exist.
+- [x] Enforce adjacency-only module selection (per‑slot mask) with warmup support.
+- [ ] Validate relay behavior on PLC with real hardware (GC + MN0 + MN1 only). (blocked: needs hardware)
+
+## Stage 5 — Split‑Bus / ZC Topology Support (Future)
+- [ ] Add JSON schema for bus segments + ZC contactors + module‑segment mapping.
+- [ ] Extend PLC relay protocol to multi‑frame relay masks (ZC1..ZC2N).
+- [ ] Implement segment‑graph planner and safe ZC sequencing.
+- [ ] Add bus‑segment voltage sampling and mismatch protection.
