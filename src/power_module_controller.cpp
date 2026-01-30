@@ -280,15 +280,6 @@ public:
     void apply(const ModuleSetpoint& sp) override {
         desired_ = sp;
         const auto now = std::chrono::steady_clock::now();
-        if (confirm_pending_ && now > confirm_deadline_ && !confirm_received_) {
-            confirm_pending_ = false;
-            confirm_miss_count_++;
-            if (confirm_miss_count_ >= 3) {
-                EVLOG_warning << "Tonhe module " << spec_.id
-                              << " did not confirm start/stop command after retries";
-                confirm_miss_count_ = 0;
-            }
-        }
         if (sp.enable && !last_desired_enable_) {
             enable_requested_at_ = now;
         } else if (!sp.enable && last_desired_enable_) {
