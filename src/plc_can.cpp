@@ -178,6 +178,26 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
         return false;
     }
 
+    // Filter out high-traffic power-module frames (e.g. Maxwell 0x060xxxxx) so PLC telemetry like EVDC_TARGETS
+    // is less likely to be dropped under load. All PLC/contract frames live in the low-ID space where the
+    // protocol field (bits 20..28) is 0.
+    {
+        struct can_filter filter {};
+        filter.can_id = CAN_EFF_FLAG; // Require extended frames.
+        filter.can_mask = CAN_EFF_FLAG | (0x1FFu << 20);
+        if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)) < 0) {
+            EVLOG_warning << "Failed to set CAN filter on " << iface << ": " << std::strerror(errno);
+        }
+    }
+
+    // Enlarge receive buffer to reduce frame loss when multiple processes are listening.
+    {
+        const int rcvbuf = 512 * 1024;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+            EVLOG_warning << "Failed to set SO_RCVBUF on " << iface << ": " << std::strerror(errno);
+        }
+    }
+
     int recv_own = 0;
     (void)setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own));
     int flags = fcntl(fd, F_GETFL, 0);

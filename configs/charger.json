@@ -155,7 +155,7 @@
       "modules": [
         {
           "address": 1,
-          "group": 0,
+          "group": 1,
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedCurrentA": 100,
