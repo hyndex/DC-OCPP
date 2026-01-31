@@ -10,6 +10,11 @@ namespace charger {
 
 namespace fs = std::filesystem;
 
+enum class PlcRelayMode {
+    Modules, // Relay bits: GC + module0 + module1 (legacy/default)
+    Ties     // Relay bits: GC + tieCW + tieCCW (bus sectionalizers)
+};
+
 struct ConnectorConfig {
     int id{1};
     int plc_id{0};                 // PLC node id (low nibble in command IDs)
@@ -93,6 +98,7 @@ struct ChargerConfig {
     bool plc_owns_gun_relay{false}; // When true, controller will not command GC relay; PLC owns it
     bool plc_module_relays_enabled{true}; // Allow PLC module relay control; disable when external module drivers used
     bool plc_three_relay_mode{false}; // PLC has only GC + 2 module relays; disable MC/island switching
+    PlcRelayMode plc_relay_mode{PlcRelayMode::Modules}; // Meaning of relay bits [1..2] on the PLC
     bool plc_relay_feedback{true}; // When false, assume relay commands succeed (no relay feedback available)
     std::string autocharge_id_source{"evmac"}; // "evmac", "evccid", or "emaid"
     bool require_https_uploads{true};
@@ -108,6 +114,9 @@ struct ChargerConfig {
     int min_gc_hold_ms{500};
     double mc_open_current_a{1.0};
     double gc_open_current_a{1.0};
+    double tie_close_max_delta_v{20.0};
+    double switch_max_current_a{2.0};
+    int switch_stable_time_ms{200};
     std::size_t upload_max_bytes{100 * 1024 * 1024}; // 100 MB safety cap
     int upload_connect_timeout_s{10};
     int upload_transfer_timeout_s{60};

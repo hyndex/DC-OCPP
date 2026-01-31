@@ -146,8 +146,8 @@
   "sharePath": "../libocpp/config/v16",
   "slots": [
     {
-      "ccw": 12,
-      "cw": 2,
+      "ccw": 0,
+      "cw": 0,
       "gc": "GC_1",
       "gunId": 1,
       "id": 1,

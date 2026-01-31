@@ -55,6 +55,19 @@ std::string normalize_autocharge_source(std::string s) {
     return s;
 }
 
+PlcRelayMode parse_plc_relay_mode(std::string s) {
+    s = trim_copy(std::move(s));
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s.empty() || s == "modules" || s == "module") {
+        return PlcRelayMode::Modules;
+    }
+    if (s == "ties" || s == "tie" || s == "island" || s == "islanding" || s == "bus") {
+        return PlcRelayMode::Ties;
+    }
+    throw std::runtime_error("Invalid plc.relayMode: " + s + " (expected 'modules' or 'ties')");
+}
+
 ConnectorConfig parse_connector(const nlohmann::json& connector_json, int default_interval) {
     ConnectorConfig connector;
     connector.id = connector_json.value("id", 1);
@@ -191,6 +204,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
     cfg.plc_three_relay_mode = plc_cfg.value("threeRelayMode", false);
+    cfg.plc_relay_mode = parse_plc_relay_mode(plc_cfg.value("relayMode", "modules"));
     cfg.plc_relay_feedback = plc_cfg.value("relayFeedbackAvailable", true);
     cfg.autocharge_id_source = normalize_autocharge_source(
         plc_cfg.value("autochargeIdSource", cfg.autocharge_id_source));
@@ -228,6 +242,9 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.min_gc_hold_ms = planner_value("minGcHoldMs", cfg.min_gc_hold_ms);
     cfg.mc_open_current_a = planner_value("mcOpenCurrentA", cfg.mc_open_current_a);
     cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
+    cfg.tie_close_max_delta_v = planner_value("tieCloseMaxDeltaV", cfg.tie_close_max_delta_v);
+    cfg.switch_max_current_a = planner_value("switchMaxCurrentA", cfg.switch_max_current_a);
+    cfg.switch_stable_time_ms = planner_value("switchStableTimeMs", cfg.switch_stable_time_ms);
     cfg.precharge_voltage_tolerance_v = planner_value("prechargeVoltageToleranceV", cfg.precharge_voltage_tolerance_v);
     cfg.precharge_timeout_ms = planner_value("prechargeTimeoutMs", cfg.precharge_timeout_ms);
     if (cfg.module_power_kw <= 0.0) {
@@ -255,14 +272,34 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.telemetry_timeout_ms <= 0) {
         cfg.telemetry_timeout_ms = 2000;
     }
-    if (cfg.max_modules_per_gun > 2) {
-        throw std::runtime_error("maxModulesPerGun > 2 is not supported by this build (PLC relay mask and telemetry "
-                                 "arrays are sized for 2 modules per gun)");
+    if (cfg.tie_close_max_delta_v < 0.0) {
+        cfg.tie_close_max_delta_v = 0.0;
+    }
+    if (cfg.switch_max_current_a < 0.0) {
+        cfg.switch_max_current_a = 0.0;
+    }
+    if (cfg.switch_stable_time_ms < 0) {
+        cfg.switch_stable_time_ms = 0;
     }
     if (cfg.plc_three_relay_mode) {
+        if (cfg.plc_relay_mode != PlcRelayMode::Modules) {
+            throw std::runtime_error("plc.threeRelayMode=true requires plc.relayMode='modules'");
+        }
         cfg.allow_cross_slot_islands = false;
         cfg.max_modules_per_gun = std::min(cfg.max_modules_per_gun, 2);
         cfg.max_island_radius = 1;
+    }
+    if (cfg.plc_relay_mode == PlcRelayMode::Ties) {
+        if (!cfg.plc_module_relays_enabled) {
+            throw std::runtime_error(
+                "plc.relayMode='ties' requires plc.moduleRelaysEnabled=true (relay bits 1..2 drive tie contactors)");
+        }
+        if (cfg.plc_owns_gun_relay) {
+            throw std::runtime_error(
+                "plc.relayMode='ties' requires plc.gunRelayOwnedByPlc=false (controller must enforce one-gun-per-island)");
+        }
+        // Islanding requires MC switching; never force the legacy three-relay (GC+modules) mode.
+        cfg.plc_three_relay_mode = false;
     }
 
     if (json.contains("ocpp") && json["ocpp"].is_object()) {
@@ -356,6 +393,108 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             ModuleConfig m1{"M" + std::to_string(conn.id) + "_1", "MN_" + std::to_string(conn.id) + "_1"};
             sm.modules = {m0, m1};
             cfg.slots.push_back(sm);
+        }
+    }
+
+    // Validate topology and identity mapping.
+    {
+        std::set<int> connector_ids;
+        for (const auto& c : cfg.connectors) {
+            if (c.id <= 0) {
+                throw std::runtime_error("Connector id must be > 0 (got " + std::to_string(c.id) + ")");
+            }
+            if (!connector_ids.insert(c.id).second) {
+                throw std::runtime_error("Duplicate connector id=" + std::to_string(c.id));
+            }
+        }
+
+        std::set<int> slot_ids;
+        std::map<int, SlotMapping*> slot_lookup;
+        std::set<std::string> contactor_ids;
+        std::set<std::string> module_ids;
+        std::set<std::string> mn_ids;
+        std::set<int> mapped_gun_ids;
+
+        auto require_unique_id = [&](std::set<std::string>& seen, const std::string& id, const std::string& kind,
+                                     const std::string& ctx) {
+            if (id.empty()) {
+                throw std::runtime_error("Empty " + kind + " id for " + ctx);
+            }
+            if (!seen.insert(id).second) {
+                throw std::runtime_error("Duplicate " + kind + " id '" + id + "' for " + ctx);
+            }
+        };
+
+        for (auto& slot : cfg.slots) {
+            if (slot.id <= 0) {
+                throw std::runtime_error("Slot id must be > 0 (got " + std::to_string(slot.id) + ")");
+            }
+            if (!slot_ids.insert(slot.id).second) {
+                throw std::runtime_error("Duplicate slot id=" + std::to_string(slot.id));
+            }
+            slot_lookup[slot.id] = &slot;
+
+            require_unique_id(contactor_ids, slot.gc_id, "contactor", "slot id=" + std::to_string(slot.id) + " gc");
+            require_unique_id(contactor_ids, slot.mc_id, "contactor", "slot id=" + std::to_string(slot.id) + " mc");
+
+            if (slot.gun_id <= 0) {
+                throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " gunId must be > 0");
+            }
+            if (!connector_ids.count(slot.gun_id)) {
+                throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " references unknown gunId=" +
+                                         std::to_string(slot.gun_id));
+            }
+            if (!mapped_gun_ids.insert(slot.gun_id).second) {
+                throw std::runtime_error("Multiple slots map to the same gunId=" + std::to_string(slot.gun_id));
+            }
+
+            for (std::size_t idx = 0; idx < slot.modules.size(); ++idx) {
+                auto& m = slot.modules[idx];
+                if (m.id.empty()) {
+                    throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " has a module with empty id");
+                }
+                if (!module_ids.insert(m.id).second) {
+                    throw std::runtime_error("Duplicate module id '" + m.id + "'");
+                }
+                if (m.mn_id.empty()) {
+                    m.mn_id = "MN_" + std::to_string(slot.id) + "_" + std::to_string(idx);
+                }
+                if (!mn_ids.insert(m.mn_id).second) {
+                    throw std::runtime_error("Duplicate module contactor id '" + m.mn_id + "'");
+                }
+            }
+        }
+
+        for (int cid : connector_ids) {
+            if (!mapped_gun_ids.count(cid)) {
+                throw std::runtime_error("Connector id=" + std::to_string(cid) + " has no matching slot (by gunId)");
+            }
+        }
+
+        // Validate CW/CCW neighbor consistency (allow 0 for line ends).
+        for (const auto& slot : cfg.slots) {
+            if (slot.cw_id != 0) {
+                const auto it = slot_lookup.find(slot.cw_id);
+                if (it == slot_lookup.end()) {
+                    throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " cw references unknown slot id=" +
+                                             std::to_string(slot.cw_id));
+                }
+                if (it->second->ccw_id != slot.id) {
+                    throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " cw=" + std::to_string(slot.cw_id) +
+                                             " but that slot's ccw=" + std::to_string(it->second->ccw_id));
+                }
+            }
+            if (slot.ccw_id != 0) {
+                const auto it = slot_lookup.find(slot.ccw_id);
+                if (it == slot_lookup.end()) {
+                    throw std::runtime_error("Slot id=" + std::to_string(slot.id) +
+                                             " ccw references unknown slot id=" + std::to_string(slot.ccw_id));
+                }
+                if (it->second->cw_id != slot.id) {
+                    throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " ccw=" + std::to_string(slot.ccw_id) +
+                                             " but that slot's cw=" + std::to_string(it->second->cw_id));
+                }
+            }
         }
     }
 

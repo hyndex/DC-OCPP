@@ -154,6 +154,7 @@ private:
     std::map<std::string, ContactorState> last_mc_state_;
     std::map<int, bool> mc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> mc_open_request_time_;
+    std::map<std::string, std::chrono::steady_clock::time_point> mc_switch_ready_since_;
     std::map<int, bool> gc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_command_change_time_;

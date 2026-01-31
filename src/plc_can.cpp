@@ -977,7 +977,16 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.estop = (relay_feedback ? st.last_relay.estop_latched : false) || st.last_safety.estop_latched;
     gs.earth_fault = (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
     if (cfg_.plc_owns_gun_relay || !relay_feedback) {
-        gs.relay_closed = st.output_enabled || st.regulating;
+        // When no relay feedback is available, fall back to our own commanded state.
+        //
+        // In plc.relayMode='ties' the auxiliary relays drive bus tie contactors, so `regulating`
+        // can be true even when the gun contactor is open. For HLC and safety logic, `relay_closed`
+        // should reflect the gun contactor state (KG/GC) whenever the controller commands it.
+        if (cfg_.plc_relay_mode == PlcRelayMode::Ties && !cfg_.plc_owns_gun_relay) {
+            gs.relay_closed = st.output_enabled;
+        } else {
+            gs.relay_closed = st.output_enabled || st.regulating;
+        }
     } else {
         gs.relay_closed = st.last_relay.relay[0];
     }
@@ -1241,13 +1250,18 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     auto it = connectors_.find(cmd.connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
-    uint8_t module_mask = cmd.module_mask;
-    if (!cmd.mc_closed) {
-        module_mask = 0;
+    // `cmd.module_mask` is interpreted by the PLC backend as "the two auxiliary relay outputs":
+    // - plc.relayMode=modules: module contactors (slot-local)
+    // - plc.relayMode=ties: bus tie contactors (CW/CCW sectionalizers)
+    //
+    // In legacy `modules` mode, MC open gates module relays OFF.
+    // In `ties` mode, MC state is modeled separately and must not clobber the auxiliary relay mask.
+    uint8_t relay_mask = static_cast<uint8_t>(cmd.module_mask & 0x03u);
+    if (cfg_.plc_relay_mode == PlcRelayMode::Modules && !cmd.mc_closed) {
+        relay_mask = 0;
     }
-    module_mask &= 0x03u;
     const bool gun_on = cmd.gc_closed;
-    const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && module_mask != 0);
+    const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && relay_mask != 0);
     st.output_enabled = gun_on;
     st.regulating = any_relays;
     if (any_relays && st.cfg.require_lock) {
@@ -1261,7 +1275,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
         st.limits = limits;
         st.last_limits_tx = std::chrono::steady_clock::time_point{};
     }
-    const bool relay_changed = set_relay_command(st, gun_on, module_mask, !any_relays);
+    const bool relay_changed = set_relay_command(st, gun_on, relay_mask, !any_relays);
     if (relay_changed) {
         update_relay_tx(st, std::chrono::steady_clock::now());
     }
@@ -1348,6 +1362,6 @@ std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() {
     return tokens;
 }
 
-bool PlcCanHardware::supports_cross_slot_islands() const { return false; }
+bool PlcCanHardware::supports_cross_slot_islands() const { return cfg_.plc_relay_mode == PlcRelayMode::Ties; }
 
 } // namespace charger

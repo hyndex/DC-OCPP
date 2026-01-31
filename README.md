@@ -6,10 +6,10 @@ This project wires up a multi‑gun DC charger against libocpp (https://github.c
 Architecture at a glance
 ------------------------
 - One controller (this repo) ↔ multiple PLC nodes, one PLC per connector/gun.
-- Each PLC (Ref/Basic firmware) exposes 1 gun relay + 2 module relays; controller treats each PLC as one connector.
-- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (via PLC relays).
+- Each PLC (Ref/Basic firmware) exposes 1 gun relay + 2 auxiliary relays; controller treats each PLC as one connector.
+- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (CAN, or PLC relays in legacy mode).
 - Controller owns OCPP, auth, session lifecycle, and power planning; PLC owns IEC61851/SLAC/ISO15118 timing and safety IO.
-- Ring/islanding: controller planner can model multi-slot islands, but Basic PLC interface only actuates the two module relays per PLC and cannot switch MC/MN/ring contactors; cross-slot/island routing is blocked until PLC exposes those actuators.
+- Ring/islanding + module sharing: set `plc.relayMode=ties` to use the 2 auxiliary relays as TieCW/TieCCW bus sectionalizers (one gun per island enforced in software). Without aux feedback, contactor switching is gated by module telemetry (ΔV + low current).
 
 What’s here
 -----------
@@ -196,15 +196,17 @@ Configuration notes
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
 - `plc` block: `useCRC8` (retained for compatibility; host enforces CRC8 on required frames) and
   `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles), `moduleRelaysEnabled`
-  (drive PLC module relays; set false when external module CAN drivers manage power modules directly).
+  (drive PLC auxiliary relays), `relayMode` (`modules` = module contactors, `ties` = TieCW/TieCCW bus sectionalizers),
+  and `relayFeedbackAvailable` (set false when no aux feedback is wired; controller assumes actuation succeeded).
 - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
   `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
-  `meterSource` (`plc` or `shunt`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
+  `meterSource` (`plc`, `shunt`, or `module`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
 - `slots[]` (optional explicit ring topology): `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`, and `modules[]` each with
     `id` and `mn` contactor id. Modules can also carry a `type` (e.g. `"maxwell-mxr"`), `address` (0–63),
     `group`, optional per-module `canInterface`, and optional `ratedPowerKW`/`ratedCurrentA` to drive vendor-specific
     CAN drivers. Additional optional fields: `pollMs`, `cmdIntervalMs` (min 100 ms), `broadcast` (send via group/global
-    broadcast DST), `moduleRelaysEnabled` (PLC relays). If omitted, slots/modules are auto-generated per connector.
+    broadcast DST). If omitted, slots/modules are auto-generated per connector. CW/CCW neighbors must reference existing
+    slot IDs (or be 0 for line ends / single-slot systems).
   - `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
   allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
   - Sample config maps 24 Maxwell MXR modules on `can0`, group `0`, addresses `0`–`23` (two per slot).
@@ -231,7 +233,8 @@ Operational playbooks
 Known gaps / TODO for production
 --------------------------------
 - PLC firmware must be validated to map AuthorizationState::Pending to ISO15118 AuthorizationRes=Ongoing on-device.
-- Ring/islanding and cross-slot module routing remain blocked until PLC exposes MC/MN/ring actuators; current interface only supports two module relays per PLC.
+- Islanding/cross-slot module routing is supported in `plc.relayMode=ties`, but without relay aux feedback the controller
+  assumes contactor actuation; add aux feedback for weld detection and definitive topology verification.
 - V2G/PnC flows are not supported in this release; Autocharge via EVCCID/EMAID/EVMAC is available.
 - Run the soak test plan (`docs/soak_test_plan.md`) and HIL plan (`tests/HIL_PLAN.md`) before production rollout to validate long-haul stability.
 

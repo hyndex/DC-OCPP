@@ -605,4 +605,11 @@ if(BUILD_APP_TESTS)
   target_link_libraries(island_manager_tests PRIVATE pthread)
   target_compile_definitions(island_manager_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(charger_config_tests
+    tests/charger_config_tests.cpp
+    src/charger_config.cpp
+  )
+  target_include_directories(charger_config_tests PRIVATE include)
+  target_compile_definitions(charger_config_tests PRIVATE CHARGER_UNIT_TESTS)
+
 endif()
