@@ -2735,8 +2735,18 @@ void OcppAdapter::apply_power_plan() {
             slot->modules.size() >= 8 ? 0xFFu : static_cast<uint8_t>((1u << slot->modules.size()) - 1u);
         // Warmup should not be blocked by module telemetry health; warmup powers the module relays so the
         // module can come online. Only block on safety/CP faults and welded contactors.
-        const bool warmup_safe = status.plugged_in && !info.disabled_by_csms && !status.cp_fault &&
-                                 info.gun_state.safety_ok && !status.gc_welded && !status.mc_welded;
+        //
+        // After a transaction/session ends while the EV remains plugged in, do not keep the power modules energized:
+        // leave relays open and command the modules OFF until the next session begins.
+        bool post_stop_plugged = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            const auto it = post_stop_plugged_.find(c.id);
+            post_stop_plugged = it != post_stop_plugged_.end() && it->second;
+        }
+        const bool warmup_safe = status.plugged_in && !status.hlc_charge_complete && !post_stop_plugged &&
+                                 !info.disabled_by_csms && !status.cp_fault && info.gun_state.safety_ok &&
+                                 !status.gc_welded && !status.mc_welded;
         const bool warmup = warmup_safe && !modules_allowed;
         const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
         const int gc_module_count = is_home ? dispatch.modules_assigned : slot_module_cmd;
@@ -2910,6 +2920,7 @@ void OcppAdapter::apply_zero_power_plan() {
     gc_open_pending_.clear();
     gc_open_request_time_.clear();
     for (const auto& c : cfg_.connectors) {
+        const Slot* slot = find_slot_for_gun(c.id);
         PowerCommand cmd;
         cmd.connector = c.id;
         cmd.module_count = 0;
@@ -2931,6 +2942,16 @@ void OcppAdapter::apply_zero_power_plan() {
         if (charge_point_) {
             charge_point_->on_max_current_offered(c.id, 0);
             charge_point_->on_max_power_offered(c.id, 0);
+        }
+        if (module_controller_ && slot) {
+            ModuleCommandRequest mreq;
+            mreq.slot_id = slot->id;
+            mreq.enable = false;
+            mreq.mask = 0;
+            mreq.voltage_v = 0.0;
+            mreq.current_a = 0.0;
+            mreq.power_kw = 0.0;
+            module_controller_->apply_command(mreq);
         }
     }
 }

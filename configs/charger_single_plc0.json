@@ -128,6 +128,7 @@
   "plc": {
     "gunRelayOwnedByPlc": false,
     "moduleRelaysEnabled": true,
+    "threeRelayMode": true,
     "requireHttpsUploads": true,
     "useCRC8": true
   },
