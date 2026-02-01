@@ -1002,7 +1002,64 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                                                          : 0);
             auto hw_tokens = hardware_->poll_auth_tokens();
             if (!hw_tokens.empty()) {
-                ingest_auth_tokens(hw_tokens, now);
+                std::set<std::int32_t> rfid_active_connectors;
+                std::vector<AuthToken> ingest_tokens;
+                ingest_tokens.reserve(hw_tokens.size());
+                for (const auto& token : hw_tokens) {
+                    if (token.source == AuthTokenSource::RFID && token.connector_hint > 0) {
+                        if (rfid_active_connectors.count(token.connector_hint)) {
+                            continue;
+                        }
+                        std::optional<std::string> active_token;
+                        bool tx_started = false;
+                        {
+                            std::lock_guard<std::mutex> lock(session_mutex_);
+                            const auto it = sessions_.find(token.connector_hint);
+                            if (it != sessions_.end()) {
+                                tx_started = it->second.transaction_started;
+                                active_token = it->second.id_token;
+                            }
+                        }
+                        if (tx_started) {
+                            rfid_active_connectors.insert(token.connector_hint);
+                            const auto trimmed = clamp_id_token(token.id_token);
+                            if (active_token && trimmed == *active_token) {
+                                EVLOG_info << "RFID token matched active session on connector "
+                                           << token.connector_hint << "; stopping transaction";
+                                const bool ok = hardware_->stop_transaction(token.connector_hint,
+                                                                            ocpp::v16::Reason::Local);
+                                if (ok) {
+                                    std::optional<ocpp::CiString<20>> id_tag_end;
+                                    if (!trimmed.empty()) {
+                                        id_tag_end = ocpp::CiString<20>(trimmed);
+                                    }
+                                    finish_transaction(token.connector_hint, ocpp::v16::Reason::Local, id_tag_end);
+                                    const auto st = hardware_->get_status(token.connector_hint);
+                                    std::lock_guard<std::mutex> lock(state_mutex_);
+                                    if (st.plugged_in) {
+                                        post_stop_plugged_[token.connector_hint] = true;
+                                        post_stop_time_[token.connector_hint] = now;
+                                    } else {
+                                        post_stop_plugged_[token.connector_hint] = false;
+                                        post_stop_time_[token.connector_hint] =
+                                            std::chrono::steady_clock::time_point{};
+                                    }
+                                } else {
+                                    EVLOG_warning << "RFID stop request failed on connector "
+                                                  << token.connector_hint;
+                                }
+                            } else {
+                                EVLOG_debug << "Ignoring RFID token on connector " << token.connector_hint
+                                            << " (active session uses a different id token)";
+                            }
+                            continue;
+                        }
+                    }
+                    ingest_tokens.push_back(token);
+                }
+                if (!ingest_tokens.empty()) {
+                    ingest_auth_tokens(ingest_tokens, now);
+                }
             }
             auto status = sanitize_status_for_lab(hardware_->get_status(connector));
             record_presence_state(connector, status.plugged_in, now);
