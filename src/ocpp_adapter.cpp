@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -21,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <everest/logging.hpp>
+#include <ocpp/common/types.hpp>
 #include <ocpp/common/evse_security_impl.hpp>
 #include <ocpp/v16/ocpp_enums.hpp>
 
@@ -531,6 +533,7 @@ bool OcppAdapter::start() {
     const auto config_str = load_and_patch_ocpp_config(cfg_);
 
     int security_profile = 0;
+    bool autocharge_enabled = true;
     try {
         const auto cfg_json = nlohmann::json::parse(config_str);
         if (cfg_json.contains("Security") && cfg_json["Security"].is_object()) {
@@ -548,8 +551,29 @@ bool OcppAdapter::start() {
                 }
             }
         }
+        if (cfg_json.contains("Custom") && cfg_json["Custom"].is_object()) {
+            const auto& custom = cfg_json["Custom"];
+            if (custom.contains("AutochargeEnabled")) {
+                const auto& val = custom["AutochargeEnabled"];
+                if (val.is_boolean()) {
+                    autocharge_enabled = val.get<bool>();
+                } else if (val.is_number_integer()) {
+                    autocharge_enabled = val.get<int>() != 0;
+                } else if (val.is_string()) {
+                    std::string v = val.get<std::string>();
+                    std::transform(v.begin(), v.end(), v.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (v == "true" || v == "1" || v == "yes" || v == "on") {
+                        autocharge_enabled = true;
+                    } else if (v == "false" || v == "0" || v == "no" || v == "off") {
+                        autocharge_enabled = false;
+                    }
+                }
+            }
+        }
     } catch (const std::exception&) {
         security_profile = 0;
+        autocharge_enabled = true;
     }
     if (security_profile < 0) {
         security_profile = 0;
@@ -563,6 +587,8 @@ bool OcppAdapter::start() {
                     << " requested, but this build supports only SecurityProfile=0 (no certificate provisioning).";
         return false;
     }
+
+    set_autocharge_enabled(autocharge_enabled, "config");
 
     const bool permissive = should_use_stub_security(cfg_);
     if (permissive) {
@@ -1835,8 +1861,14 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
     }
     const bool auth_timeout_enabled = cfg_.auth_wait_timeout_s > 0;
     const auto ttl = auth_timeout_enabled ? std::chrono::seconds(cfg_.auth_wait_timeout_s) : std::chrono::seconds(0);
+    const bool allow_autocharge = autocharge_enabled_.load();
+    std::size_t autocharge_dropped = 0;
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (auto token : tokens) {
+        if (token.source == AuthTokenSource::Autocharge && !allow_autocharge) {
+            ++autocharge_dropped;
+            continue;
+        }
         const auto dedup_it = recent_token_cache_.find(token.id_token);
         if (dedup_it != recent_token_cache_.end() && (now - dedup_it->second) < RECENT_TOKEN_DEDUP_WINDOW) {
             continue;
@@ -1852,7 +1884,46 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
         const int target = select_connector_for_token(pending.token);
         pending_tokens_[target].push_back(std::move(pending));
     }
+    if (autocharge_dropped > 0) {
+        const auto log_now = now;
+        if (last_autocharge_drop_log_.time_since_epoch().count() == 0 ||
+            (log_now - last_autocharge_drop_log_) > std::chrono::seconds(10)) {
+            EVLOG_info << "Autocharge disabled; ignored " << autocharge_dropped << " autocharge token(s)";
+            last_autocharge_drop_log_ = log_now;
+        }
+    }
     persist_pending_tokens_locked();
+}
+
+void OcppAdapter::set_autocharge_enabled(bool enabled, const std::string& source) {
+    const bool prev = autocharge_enabled_.exchange(enabled);
+    if (prev == enabled) {
+        return;
+    }
+    EVLOG_info << "Autocharge " << (enabled ? "enabled" : "disabled") << " (source=" << source << ")";
+    if (!enabled) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        clear_pending_autocharge_tokens_locked();
+    }
+}
+
+void OcppAdapter::clear_pending_autocharge_tokens_locked() {
+    bool removed = false;
+    for (auto& kv : pending_tokens_) {
+        auto& queue = kv.second;
+        const auto before = queue.size();
+        queue.erase(std::remove_if(queue.begin(), queue.end(),
+                                   [](const PendingToken& p) {
+                                       return p.token.source == AuthTokenSource::Autocharge;
+                                   }),
+                    queue.end());
+        if (queue.size() != before) {
+            removed = true;
+        }
+    }
+    if (removed) {
+        persist_pending_tokens_locked();
+    }
 }
 
 int OcppAdapter::select_connector_for_token(const AuthToken& token) const {
@@ -1898,12 +1969,21 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
         }
     };
     const bool csms_offline = charge_point_ && !csms_connected_.load();
+    const bool allow_autocharge = autocharge_enabled_.load();
+    bool removed = false;
     for (auto qit = queue.begin(); qit != queue.end();) {
         if (qit->expires_at <= now) {
+            removed = true;
+            qit = queue.erase(qit);
+        } else if (!allow_autocharge && qit->token.source == AuthTokenSource::Autocharge) {
+            removed = true;
             qit = queue.erase(qit);
         } else {
             ++qit;
         }
+    }
+    if (removed) {
+        persist_pending_tokens_locked();
     }
     if (queue.empty()) {
         return std::nullopt;
@@ -1918,8 +1998,8 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
     std::optional<std::size_t> best_idx;
     int best_prio = std::numeric_limits<int>::max();
     for (std::size_t idx = 0; idx < queue.size(); ++idx) {
-        if (queue[idx].token.source == AuthTokenSource::Autocharge &&
-            !queue[idx].token.prevalidated && csms_offline) {
+        if (csms_offline && queue[idx].token.source == AuthTokenSource::Autocharge &&
+            queue[idx].defer_until_online) {
             continue;
         }
         if (!matches_reservation(queue[idx])) continue;
@@ -1943,6 +2023,10 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
                                                          const PendingToken& pending) {
     if (session.authorized) {
         return AuthorizationState::Granted;
+    }
+    if (pending.token.source == AuthTokenSource::Autocharge && !autocharge_enabled_.load()) {
+        set_auth_state(connector, AuthorizationState::Pending);
+        return AuthorizationState::Pending;
     }
     const auto trimmed = clamp_id_token(pending.token.id_token);
     bool accepted = pending.token.prevalidated;
@@ -1975,6 +2059,10 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
                                                             const std::string& session_id,
                                                             const PendingToken& pending) {
     const auto now = std::chrono::steady_clock::now();
+    if (pending.token.source == AuthTokenSource::Autocharge && !autocharge_enabled_.load()) {
+        set_auth_state(connector, AuthorizationState::Pending);
+        return AuthorizationState::Pending;
+    }
     const auto trimmed = clamp_id_token(pending.token.id_token);
     bool accepted = pending.token.prevalidated;
     if (!accepted && charge_point_) {
@@ -1983,10 +2071,18 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
     }
 
     AuthorizationState new_state = accepted ? AuthorizationState::Granted : AuthorizationState::Denied;
+    const bool csms_offline = charge_point_ && !csms_connected_.load();
     if (!accepted && pending.token.source == AuthTokenSource::Autocharge) {
         new_state = AuthorizationState::Pending;
         EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
                    << "; keeping auth pending to allow RemoteStart";
+        if (autocharge_enabled_.load() && csms_offline && pending.expires_at > now && !pending.defer_until_online) {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            PendingToken retry = pending;
+            retry.defer_until_online = true;
+            pending_tokens_[connector].push_back(std::move(retry));
+            persist_pending_tokens_locked();
+        }
     }
 
     bool session_present = false;
@@ -3859,7 +3955,6 @@ void OcppAdapter::handle_configuration_key_change(const ocpp::v16::KeyValue& key
             return fallback;
         }
     };
-
     if (key == "MeterValueSampleInterval") {
         const int interval = std::max(1, parse_int(cfg_.meter_sample_interval_s));
         std::lock_guard<std::mutex> lock(plan_mutex_);
@@ -3870,6 +3965,13 @@ void OcppAdapter::handle_configuration_key_change(const ocpp::v16::KeyValue& key
         cfg_.minimum_status_duration_s = parse_int(cfg_.minimum_status_duration_s);
     } else if (key == "ConnectionTimeOut") {
         hardware_->set_connection_timeout(parse_int(0));
+    } else if (key == "AutochargeEnabled") {
+        if (key_value.value) {
+            const bool enabled = ocpp::conversions::string_to_bool(value);
+            set_autocharge_enabled(enabled, "ChangeConfiguration");
+        } else {
+            EVLOG_warning << "Ignoring AutochargeEnabled change: missing value";
+        }
     }
 }
 
@@ -3891,6 +3993,7 @@ void OcppAdapter::persist_pending_tokens_locked() {
                 entry["source"] = token_source_to_string(pending.token.source);
                 entry["connectorHint"] = pending.token.connector_hint;
                 entry["prevalidated"] = pending.token.prevalidated;
+                entry["deferUntilOnline"] = pending.defer_until_online;
                 entry["receivedAt"] =
                     std::chrono::duration_cast<std::chrono::seconds>(to_system(pending.token.received_at).time_since_epoch()).count();
                 if (pending.expires_at == std::chrono::steady_clock::time_point::max()) {
@@ -3949,6 +4052,7 @@ void OcppAdapter::load_pending_tokens_from_disk() {
                     now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(recv_delta);
                 PendingToken pending;
                 pending.token = token;
+                pending.defer_until_online = entry.value("deferUntilOnline", false);
                 if (exp_epoch.count() > 0) {
                     const auto exp_sys = std::chrono::system_clock::time_point(exp_epoch);
                     if (exp_sys <= now_sys) continue;

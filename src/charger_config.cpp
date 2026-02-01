@@ -11,6 +11,7 @@
 #include <cstddef>
 
 #include <nlohmann/json.hpp>
+#include <iostream>
 
 namespace charger {
 
@@ -620,9 +621,66 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     return cfg;
 }
 
+namespace {
+void merge_json(nlohmann::json& base, const nlohmann::json& override) {
+    if (!override.is_object()) {
+        base = override;
+        return;
+    }
+    if (!base.is_object()) {
+        base = nlohmann::json::object();
+    }
+    for (auto it = override.begin(); it != override.end(); ++it) {
+        const auto& key = it.key();
+        const auto& val = it.value();
+        if (base.contains(key)) {
+            merge_json(base[key], val);
+        } else {
+            base[key] = val;
+        }
+    }
+}
+} // namespace
+
 std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
     auto json = load_ocpp_base_config(cfg);
 
+    // Apply local defaults before user overrides (ChangeConfiguration should persist).
+    if (cfg.minimum_status_duration_s > 0) {
+        json["Core"]["MinimumStatusDuration"] = cfg.minimum_status_duration_s;
+    }
+    if (cfg.meter_sample_interval_s > 0) {
+        json["Core"]["MeterValueSampleInterval"] = cfg.meter_sample_interval_s;
+    }
+    if (!json.contains("Custom") || !json["Custom"].is_object()) {
+        json["Custom"] = nlohmann::json::object();
+    }
+    if (!json["Custom"].contains("AutochargeEnabled")) {
+        json["Custom"]["AutochargeEnabled"] = true;
+    }
+
+    // Merge persisted user config (ChangeConfiguration) as overrides.
+    if (!cfg.user_config.empty() && fs::exists(cfg.user_config)) {
+        try {
+            std::ifstream in(cfg.user_config);
+            if (in) {
+                nlohmann::json user_cfg;
+                in >> user_cfg;
+                if (user_cfg.is_object()) {
+                    merge_json(json, user_cfg);
+                } else {
+                    std::cerr << "User config is not an object; ignoring overrides from "
+                              << cfg.user_config.string() << "\n";
+                }
+            }
+        } catch (const std::exception&) {
+            // Ignore invalid user_config to avoid bricking boot; defaults still apply.
+            std::cerr << "Failed to parse user config; ignoring overrides from "
+                      << cfg.user_config.string() << "\n";
+        }
+    }
+
+    // Enforce immutable identity/runtime settings from charger config.
     json["Internal"]["ChargePointId"] = cfg.charge_point_id;
     json["Internal"]["ChargeBoxSerialNumber"] = cfg.charge_point_id;
     json["Internal"]["ChargePointModel"] = cfg.model;
@@ -654,11 +712,11 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
     if (json.contains("Core") && json["Core"].is_object() && !json["Core"].contains("WebSocketPingInterval")) {
         json["Core"]["WebSocketPingInterval"] = 10;
     }
-    if (cfg.minimum_status_duration_s > 0) {
-        json["Core"]["MinimumStatusDuration"] = cfg.minimum_status_duration_s;
+    if (!json.contains("Custom") || !json["Custom"].is_object()) {
+        json["Custom"] = nlohmann::json::object();
     }
-    if (cfg.meter_sample_interval_s > 0) {
-        json["Core"]["MeterValueSampleInterval"] = cfg.meter_sample_interval_s;
+    if (!json["Custom"].contains("AutochargeEnabled")) {
+        json["Custom"]["AutochargeEnabled"] = true;
     }
 
     return json.dump();

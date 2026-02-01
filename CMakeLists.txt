@@ -610,6 +610,7 @@ if(BUILD_APP_TESTS)
     src/charger_config.cpp
   )
   target_include_directories(charger_config_tests PRIVATE include)
+  target_link_libraries(charger_config_tests PRIVATE nlohmann_json::nlohmann_json)
   target_compile_definitions(charger_config_tests PRIVATE CHARGER_UNIT_TESTS)
 
 endif()

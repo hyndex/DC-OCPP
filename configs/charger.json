@@ -4,15 +4,9 @@
     "freeMode": false
   },
   "chargePoint": {
-    "apn": "cmnet",
-    "canInterface": "can0",
     "centralSystemURI": "ws://ocpp.joulepoint.com:80",
-    "chargePointSerialNumber": "",
     "firmwareVersion": "0.0.1",
-    "iccid": "",
     "id": "jyotisman",
-    "imei": "",
-    "imsi": "",
     "model": "Joulepoint-DC",
     "usePLC": true,
     "vendor": "JoulePoint"
@@ -20,26 +14,18 @@
   "connectors": [
     {
       "id": 1,
-      "label": "Gun 1",
-      "lockInputSwitch": 3,
-      "maxCurrentA": 100,
-      "maxPowerW": 30000,
+      "maxCurrentA": 200,
+      "maxPowerW": 60000,
       "maxVoltageV": 1000,
-      "meterOffsetWh": 0,
-      "meterScale": 1,
-      "meterSource": "module",
       "minVoltageV": 200,
-      "plcId": 0,
+      "meterSource": "module",
       "requireLock": false
     }
   ],
   "databaseDir": "../data/db",
-  "defaultVoltageV": 800,
   "gridLimitKW": 720,
   "loggingConfig": "../libocpp/config/logging.ini",
   "messageLogPath": "../logs",
-  "meterSampleIntervalSeconds": 15,
-  "modulePowerKW": 30,
   "ocpp": {
     "Core": {
       "AllowOfflineTxForUnknownId": false,
@@ -74,23 +60,10 @@
       "UnlockConnectorOnEVSideDisconnect": true,
       "WebSocketPingInterval": 0
     },
-    "CostAndPrice": {
-      "CustomDisplayCostAndPrice": false
-    },
     "FirmwareManagement": {
       "SupportedFileTransferProtocols": "FTP,HTTP,HTTPS"
     },
-    "Reservation": {
-      "ReserveConnectorZeroSupported": true
-    },
     "Internal": {
-      "CentralSystemURI": "ws://ocpp.joulepoint.com:80",
-      "ChargeBoxSerialNumber": "jyotisman",
-      "ChargePointId": "jyotisman",
-      "ChargePointModel": "Joulepoint-DC",
-      "ChargePointVendor": "JoulePoint",
-      "FirmwareVersion": "0.0.1",
-      "LogMessages": true,
       "LogMessagesFormat": [
         "log",
         "console_detailed"
@@ -102,10 +75,8 @@
       "LocalAuthListMaxLength": 10000,
       "SendLocalListMaxLength": 20
     },
-    "PnC": {
-      "ContractValidationOffline": false,
-      "ISO15118CertificateManagementEnabled": false,
-      "ISO15118PnCEnabled": false
+    "Reservation": {
+      "ReserveConnectorZeroSupported": true
     },
     "Security": {
       "AuthorizationKey": "DEADBEEFDEADBEEF",
@@ -121,18 +92,10 @@
     }
   },
   "planner": {
-    "allowCrossSlotIslands": true,
-    "prechargeTimeoutMs": 2000,
-    "prechargeVoltageToleranceV": 50
+    "allowCrossSlotIslands": true
   },
   "plc": {
-    "autochargeIdSource": "evmac",
-    "gunRelayOwnedByPlc": false,
-    "moduleRelaysEnabled": true,
-    "relayFeedbackAvailable": false,
-    "threeRelayMode": true,
-    "requireHttpsUploads": true,
-    "useCRC8": true
+    "threeRelayMode": true
   },
   "security": {
     "clientCertDir": "../data/certs/client/csms",
@@ -143,7 +106,7 @@
     "seccKeyDir": "../data/certs/client/cso",
     "v2gCaBundle": "../data/certs/ca/v2g/V2G_ROOT_CA.pem"
   },
-  "sharePath": "../libocpp/config/v16",
+  "sharePath": "../configs/ocpp/v16",
   "slots": [
     {
       "ccw": 0,
@@ -158,7 +121,6 @@
           "group": 1,
           "id": "M1_0",
           "mn": "MN_1_0",
-          "ratedCurrentA": 100,
           "ratedPowerKW": 30,
           "type": "maxwell-mxr"
         }
@@ -167,14 +129,7 @@
   ],
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
-    "authorizationSeconds": 1800,
     "powerRequestSeconds": 600
-  },
-  "uploads": {
-    "allowFileTargets": true,
-    "connectTimeoutSeconds": 10,
-    "maxBytes": 104857600,
-    "transferTimeoutSeconds": 60
   },
   "userConfig": "../data/user_config.json"
 }

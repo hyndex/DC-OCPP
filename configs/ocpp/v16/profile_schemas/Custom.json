@@ -1,0 +1,15 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "description": "Json schema for Custom configuration keys",
+    "$comment": "Extend with vendor-specific ChangeConfiguration keys",
+    "type": "object",
+    "required": [],
+    "properties": {
+        "AutochargeEnabled": {
+            "type": "boolean",
+            "readOnly": false,
+            "default": true
+        }
+    }
+  }
+  

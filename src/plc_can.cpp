@@ -3,6 +3,7 @@
 
 #include <everest/logging.hpp>
 
+#ifdef __linux__
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
@@ -1365,3 +1366,61 @@ std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() {
 bool PlcCanHardware::supports_cross_slot_islands() const { return cfg_.plc_relay_mode == PlcRelayMode::Ties; }
 
 } // namespace charger
+
+#else
+
+namespace charger {
+
+PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
+    EVLOG_warning << "PLC CAN backend disabled: unsupported platform";
+    init_ok_ = false;
+}
+
+PlcCanHardware::~PlcCanHardware() = default;
+
+bool PlcCanHardware::enable(std::int32_t) { return false; }
+bool PlcCanHardware::disable(std::int32_t) { return false; }
+bool PlcCanHardware::pause_charging(std::int32_t) { return false; }
+bool PlcCanHardware::resume_charging(std::int32_t) { return false; }
+bool PlcCanHardware::stop_transaction(std::int32_t, ocpp::v16::Reason) { return false; }
+ocpp::v16::UnlockStatus PlcCanHardware::unlock(std::int32_t) { return ocpp::v16::UnlockStatus::NotSupported; }
+ocpp::v16::ReservationStatus PlcCanHardware::reserve(std::int32_t, std::int32_t, ocpp::DateTime,
+                                                     const std::string&, const std::optional<std::string>&) {
+    return ocpp::v16::ReservationStatus::Rejected;
+}
+bool PlcCanHardware::cancel_reservation(std::int32_t) { return false; }
+ocpp::v16::GetLogResponse PlcCanHardware::upload_diagnostics(const ocpp::v16::GetDiagnosticsRequest&) {
+    ocpp::v16::GetLogResponse response;
+    response.status = ocpp::v16::LogStatusEnumType::Rejected;
+    return response;
+}
+ocpp::v16::GetLogResponse PlcCanHardware::upload_logs(const ocpp::v16::GetLogRequest&) {
+    ocpp::v16::GetLogResponse response;
+    response.status = ocpp::v16::LogStatusEnumType::Rejected;
+    return response;
+}
+bool PlcCanHardware::update_firmware(const ocpp::v16::UpdateFirmwareRequest&) { return false; }
+ocpp::v16::UpdateFirmwareStatusEnumType
+PlcCanHardware::update_firmware_signed(const ocpp::v16::SignedUpdateFirmwareRequest&) {
+    return ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
+}
+void PlcCanHardware::set_connection_timeout(std::int32_t) {}
+bool PlcCanHardware::is_reset_allowed(const ocpp::v16::ResetType&) { return false; }
+void PlcCanHardware::reset(const ocpp::v16::ResetType&) {}
+void PlcCanHardware::on_remote_start_token(const std::string&, const std::vector<std::int32_t>&, bool) {}
+ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t) { return {}; }
+GunStatus PlcCanHardware::get_status(std::int32_t) { return {}; }
+void PlcCanHardware::set_authorization_state(std::int32_t, bool) {}
+void PlcCanHardware::set_authorization_state(std::int32_t, AuthorizationState) {}
+void PlcCanHardware::apply_power_command(const PowerCommand&) {}
+void PlcCanHardware::apply_power_allocation(std::int32_t, int) {}
+void PlcCanHardware::set_evse_limits(std::int32_t, const EvseLimits&) {}
+void PlcCanHardware::publish_evse_present(std::int32_t, double, double, double, bool, bool) {}
+void PlcCanHardware::publish_fault_state(std::int32_t, uint8_t) {}
+void PlcCanHardware::clear_faults(std::int32_t) {}
+std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() { return {}; }
+bool PlcCanHardware::supports_cross_slot_islands() const { return false; }
+
+} // namespace charger
+
+#endif

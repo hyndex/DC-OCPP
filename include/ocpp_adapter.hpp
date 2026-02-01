@@ -60,6 +60,7 @@ private:
     struct PendingToken {
         AuthToken token;
         std::chrono::steady_clock::time_point expires_at;
+        bool defer_until_online{false};
     };
 
 #ifdef CHARGER_UNIT_TESTS
@@ -178,6 +179,8 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
     std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
     std::map<int, AuthorizationState> auth_state_cache_;
+    std::atomic<bool> autocharge_enabled_{true};
+    std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::map<int, int> telemetry_mismatch_count_;
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
     std::map<int, int> connector_meter_intervals_;
@@ -203,6 +206,8 @@ private:
                                const std::chrono::steady_clock::time_point& now);
     void ingest_auth_tokens(const std::vector<AuthToken>& tokens,
                             const std::chrono::steady_clock::time_point& now);
+    void set_autocharge_enabled(bool enabled, const std::string& source);
+    void clear_pending_autocharge_tokens_locked();
     int select_connector_for_token(const AuthToken& token) const;
     std::optional<PendingToken> pop_next_pending_token(std::int32_t connector,
                                                        const std::chrono::steady_clock::time_point& now,
