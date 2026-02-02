@@ -102,6 +102,7 @@ bool limits_equal(const EvseLimits& a, const EvseLimits& b) {
 } // namespace
 
 PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
+    started_at_ = std::chrono::steady_clock::now();
     use_crc_ = cfg_.plc_use_crc8;
     telemetry_timeout_ms_ = cfg_.telemetry_timeout_ms > 0 ? cfg_.telemetry_timeout_ms : 2000;
     if (cfg_.autocharge_id_source == "evccid") {
@@ -401,12 +402,34 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->authorized = info.auth_granted;
         st->auth_pending = info.auth_pending;
     } else if (can_id == can_contract::relay_status_id(plc_id)) {
-        st->last_relay = can_contract::decode_relay_status(data, use_crc_);
+        const auto decoded = can_contract::decode_relay_status(data, use_crc_);
+        if (use_crc_ && !decoded.crc_ok) {
+            st->relay_status_crc_fail_count++;
+            if (st->last_relay_crc_warn.time_since_epoch().count() == 0 ||
+                (now - st->last_relay_crc_warn) > std::chrono::seconds(2)) {
+                EVLOG_warning << "RelayStatus CRC fail from PLC " << static_cast<int>(plc_id)
+                              << " count=" << st->relay_status_crc_fail_count;
+                st->last_relay_crc_warn = now;
+            }
+            return;
+        }
+        st->last_relay = decoded;
         st->last_relay_rx = now;
         st->last_status_rx = now;
         st->output_enabled = st->last_relay.relay[0];
     } else if (can_id == can_contract::safety_status_id(plc_id)) {
-        st->last_safety = can_contract::decode_safety_status(data, use_crc_);
+        const auto decoded = can_contract::decode_safety_status(data, use_crc_);
+        if (use_crc_ && !decoded.crc_ok) {
+            st->safety_status_crc_fail_count++;
+            if (st->last_safety_crc_warn.time_since_epoch().count() == 0 ||
+                (now - st->last_safety_crc_warn) > std::chrono::seconds(2)) {
+                EVLOG_warning << "SafetyStatus CRC fail from PLC " << static_cast<int>(plc_id)
+                              << " count=" << st->safety_status_crc_fail_count;
+                st->last_safety_crc_warn = now;
+            }
+            return;
+        }
+        st->last_safety = decoded;
         st->last_safety_rx = now;
         st->last_status_rx = now;
     } else if (can_id == can_contract::energy_meter_id(plc_id)) {
@@ -431,7 +454,14 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
     } else if (can_id == can_contract::config_ack_id(plc_id)) {
         auto ack = can_contract::decode_config_ack(data, use_crc_);
         if (!ack.crc_ok) {
-            EVLOG_warning << "ConfigAck CRC fail from PLC " << static_cast<int>(plc_id);
+            st->config_ack_crc_fail_count++;
+            if (st->last_config_ack_crc_warn.time_since_epoch().count() == 0 ||
+                (now - st->last_config_ack_crc_warn) > std::chrono::seconds(10)) {
+                EVLOG_warning << "ConfigAck CRC fail from PLC " << static_cast<int>(plc_id)
+                              << " count=" << st->config_ack_crc_fail_count;
+                st->last_config_ack_crc_warn = now;
+            }
+            return;
         } else if (ack.param_id == can_contract::PARAM_EVSE_LIMIT_ACK) {
             EVLOG_debug << "EVSE limits ack plc=" << static_cast<int>(plc_id) << " count=" << ack.value;
             st->evse_limit_ack_count = ack.value;
@@ -808,12 +838,14 @@ bool PlcCanHardware::enable(std::int32_t connector) {
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return false;
     auto& st = it->second;
-    st.output_enabled = true;
-    st.regulating = true;
+    // "Enable EVSE" should not energize contactors/modules. Power delivery is handled by apply_power_command()
+    // when a session is ready and the planner requests relays.
+    st.output_enabled = false;
+    st.regulating = false;
     if (st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    const bool relay_changed = set_relay_command(st, true, 0x03u, false);
+    const bool relay_changed = set_relay_command(st, false, 0x00u, false);
     if (relay_changed) {
         update_relay_tx(st, std::chrono::steady_clock::now());
     }
@@ -967,16 +999,72 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     if (it == connectors_.end()) return gs;
     auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
-    const bool comm_stale =
-        st.last_status_rx.time_since_epoch().count() == 0 ||
+    const bool relay_feedback = cfg_.plc_relay_feedback;
+
+    const bool status_seen = st.last_status_rx.time_since_epoch().count() != 0;
+    const bool status_stale =
+        status_seen &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_status_rx).count() >
             telemetry_timeout_ms_;
-    const bool relay_feedback = cfg_.plc_relay_feedback;
-    gs.comm_fault = comm_stale || (!relay_feedback ? false : st.last_relay.comm_fault) || !st.protocol_ok;
-    const bool relay_safety_ok = relay_feedback ? (st.last_relay.safety_ok && !st.last_relay.earth_fault) : true;
-    gs.safety_ok = relay_safety_ok && st.last_safety.safety_ok && !st.last_safety.earth_fault && !comm_stale;
-    gs.estop = (relay_feedback ? st.last_relay.estop_latched : false) || st.last_safety.estop_latched;
-    gs.earth_fault = (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
+
+    const bool relay_seen = relay_feedback && st.last_relay_rx.time_since_epoch().count() != 0;
+    const bool relay_stale =
+        relay_seen &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() >
+            telemetry_timeout_ms_;
+
+    const bool safety_seen = st.last_safety_rx.time_since_epoch().count() != 0;
+    const bool safety_stale =
+        safety_seen &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_safety_rx).count() >
+            telemetry_timeout_ms_;
+
+    const auto startup_grace = std::chrono::milliseconds(std::max(3000, telemetry_timeout_ms_));
+    const bool within_startup_grace =
+        started_at_.time_since_epoch().count() != 0 && (now - started_at_) < startup_grace;
+
+    // Treat "never received any status yet" as unknown during startup grace rather than a comm fault.
+    // After the grace window, missing/stale frames become actionable.
+    const bool comm_missing = !status_seen && !within_startup_grace;
+    const bool raw_comm_fault = status_stale || comm_missing || relay_stale || safety_stale ||
+                                (relay_feedback ? st.last_relay.comm_fault : false) || !st.protocol_ok;
+
+    // Safety inputs are only authoritative when their respective telemetry is fresh.
+    const bool relay_status_fresh = relay_feedback && relay_seen && !relay_stale;
+    const bool safety_fresh = safety_seen && !safety_stale;
+    const bool relay_safety_ok =
+        (!relay_feedback || !relay_status_fresh) ? true : (st.last_relay.safety_ok && !st.last_relay.earth_fault);
+    const bool safety_status_ok =
+        !safety_fresh ? true : (st.last_safety.safety_ok && !st.last_safety.earth_fault);
+    const bool raw_safety_ok = relay_safety_ok && safety_status_ok;
+    const bool raw_estop =
+        (relay_feedback ? (st.last_relay.estop_latched || st.last_relay.estop_input) : false) ||
+        st.last_safety.estop_latched || st.last_safety.estop_input;
+    const bool raw_earth_fault = (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
+
+    auto debounced_active = [&](bool active, std::chrono::steady_clock::time_point& since,
+                                std::chrono::milliseconds debounce) -> bool {
+        if (!active) {
+            since = std::chrono::steady_clock::time_point{};
+            return false;
+        }
+        if (since.time_since_epoch().count() == 0) {
+            since = now;
+            return false;
+        }
+        return (now - since) >= debounce;
+    };
+
+    constexpr std::chrono::milliseconds kSafetyTripDebounceMs(200);
+    constexpr std::chrono::milliseconds kCriticalTripDebounceMs(100);
+    const bool safety_trip = debounced_active(!raw_safety_ok, st.safety_trip_since, kSafetyTripDebounceMs);
+    const bool estop_trip = debounced_active(raw_estop, st.estop_trip_since, kCriticalTripDebounceMs);
+    const bool earth_trip = debounced_active(raw_earth_fault, st.earth_trip_since, kCriticalTripDebounceMs);
+
+    gs.comm_fault = raw_comm_fault;
+    gs.safety_ok = !safety_trip;
+    gs.estop = estop_trip;
+    gs.earth_fault = earth_trip;
     if (cfg_.plc_owns_gun_relay || !relay_feedback) {
         // When no relay feedback is available, fall back to our own commanded state.
         //
@@ -1009,7 +1097,10 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
             const bool expected_on =
                 (st.relay_enable_mask & bit.mask) && (st.relay_cmd_mask & bit.mask) && !st.relay_force_off;
             const bool actual_on = st.last_relay.relay[bit.idx] && !st.last_relay.relay_fault[bit.idx];
-            if (expected_on != actual_on) {
+            // Only treat "expected OFF but still ON" as a critical weld/stuck contactor condition.
+            // "expected ON but still OFF" can occur transiently during power-up sequencing (e.g., contactor supply
+            // comes up after the PLC/EVSE) and should not immediately trip OCPP Faulted.
+            if (!expected_on && actual_on) {
                 if (st.relay_mismatch_since[bit.idx].time_since_epoch().count() == 0) {
                     st.relay_mismatch_since[bit.idx] = now;
                 } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - st.relay_mismatch_since[bit.idx])

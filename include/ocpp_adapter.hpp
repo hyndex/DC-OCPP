@@ -175,7 +175,7 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
-    std::map<int, std::chrono::steady_clock::time_point> precharge_start_;
+    std::chrono::steady_clock::time_point global_fault_clear_since_{};
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
     std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
     std::map<int, AuthorizationState> auth_state_cache_;
@@ -225,7 +225,9 @@ private:
     std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
     void sync_ocpp_error(std::int32_t connector, const std::string& uuid, ocpp::v16::ChargePointErrorCode error_code,
-                         bool is_fault, bool active, const std::optional<std::string>& info = std::nullopt);
+                         bool is_fault, bool active, const std::optional<std::string>& info = std::nullopt,
+                         const std::optional<std::string>& vendor_id = std::nullopt,
+                         const std::optional<std::string>& vendor_error_code = std::nullopt);
     static std::string token_source_to_string(AuthTokenSource src);
     static std::string auth_state_to_string(AuthorizationState state);
     static AuthTokenSource token_source_from_string(const std::string& s);

@@ -176,6 +176,17 @@ private:
         bool protocol_ok{true};
         bool protocol_sent{false};
         std::chrono::steady_clock::time_point last_protocol_tx{};
+        // Track CAN-level protocol health.
+        uint64_t relay_status_crc_fail_count{0};
+        uint64_t safety_status_crc_fail_count{0};
+        uint64_t config_ack_crc_fail_count{0};
+        std::chrono::steady_clock::time_point last_relay_crc_warn{};
+        std::chrono::steady_clock::time_point last_safety_crc_warn{};
+        std::chrono::steady_clock::time_point last_config_ack_crc_warn{};
+        // Debounce safety-related trips to avoid flapping on single-frame glitches.
+        std::chrono::steady_clock::time_point safety_trip_since{};
+        std::chrono::steady_clock::time_point estop_trip_since{};
+        std::chrono::steady_clock::time_point earth_trip_since{};
         IdentityAssembly evccid;
         IdentityAssembly evemaid0;
         IdentityAssembly evemaid1;
@@ -199,6 +210,7 @@ private:
     std::atomic<bool> running_{false};
     bool init_ok_{false};
     int connection_timeout_s_{0};
+    std::chrono::steady_clock::time_point started_at_{};
     mutable std::mutex state_mutex_;
     std::mutex token_mutex_;
     std::vector<AuthToken> pending_tokens_;

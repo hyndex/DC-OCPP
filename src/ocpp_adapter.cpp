@@ -1459,10 +1459,54 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 fault = true;
             }
+            uint8_t module_healthy_mask = status.module_healthy_mask;
+            uint8_t module_fault_mask = status.module_fault_mask;
+            if (module_controller_) {
+                const Slot* slot = find_slot_for_gun(connector);
+                if (slot) {
+                    const auto snap = module_controller_->snapshot_for_slot(slot->id);
+                    if (snap.valid) {
+                        module_healthy_mask = snap.healthy_mask;
+                        module_fault_mask = snap.fault_mask;
+                    } else {
+                        module_healthy_mask = 0;
+                        module_fault_mask = 0;
+                    }
+                }
+            }
             const uint8_t usable_modules =
-                static_cast<uint8_t>(status.module_healthy_mask &
-                                     static_cast<uint8_t>(~status.module_fault_mask));
-            if (!fault && usable_modules == 0) {
+                static_cast<uint8_t>(module_healthy_mask & static_cast<uint8_t>(~module_fault_mask));
+            // Only fault on missing modules when we actually need them (precharge/power delivery).
+            const bool have_ev_targets = status.target_voltage_v && status.target_voltage_v.value() > 0.0;
+            const bool precharge_hint = status.plugged_in && !post_stop_plugged && !status.hlc_charge_complete &&
+                                        (status.hlc_precharge_active || have_ev_targets) &&
+                                        !disabled && !paused;
+            const bool power_ready_hint = had_session && session.authorized &&
+                (status.relay_closed || power_delivery_requested(status, lock_required)) && !disabled;
+            const bool need_modules = power_ready_hint || precharge_hint;
+            bool module_unavailable_fault = false;
+            if (!fault) {
+                if (need_modules && usable_modules == 0) {
+                    bool expired = false;
+                    {
+                        std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                        auto& ts = module_missing_since_[connector];
+                        if (ts.time_since_epoch().count() == 0) {
+                            ts = now;
+                        } else {
+                            const auto timeout_ms = std::max({2000, cfg_.precharge_timeout_ms, cfg_.telemetry_timeout_ms});
+                            if ((now - ts) > std::chrono::milliseconds(timeout_ms)) {
+                                expired = true;
+                            }
+                        }
+                    }
+                    module_unavailable_fault = expired;
+                } else {
+                    std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                    module_missing_since_.erase(connector);
+                }
+            }
+            if (!fault && module_unavailable_fault) {
                 bool already_faulted = false;
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1470,7 +1514,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     connector_faulted_[connector] = true;
                 }
                 if (!already_faulted) {
-                    finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
+                    EVLOG_error << "No healthy power modules available on connector " << connector
+                                << " during precharge/power delivery; stopping session";
+                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
                     hardware_->disable(connector);
                     had_session = false;
                 }
@@ -1556,15 +1602,18 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const bool ocpp_overcurrent = status.overcurrent_fault;
             const bool ocpp_gc_welded = status.gc_welded;
             const bool ocpp_mc_welded = status.mc_welded;
-            const bool ocpp_module_fault = usable_modules == 0;
-            const bool ocpp_module_degraded = !ocpp_module_fault && status.module_fault_mask != 0;
+            const bool ocpp_module_fault = module_unavailable_fault;
+            const bool ocpp_module_degraded = !ocpp_module_fault && module_fault_mask != 0;
             const bool ocpp_lock_fault = lock_required && !status.lock_engaged && (status.plugged_in || had_session);
 
             sync_ocpp_error(connector, "cp_fault", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_cp_fault);
-            sync_ocpp_error(connector, "estop", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true, ocpp_estop);
+            // OCPP 1.6 has no dedicated "EmergencyStop" error code; avoid mislabeling it as PowerSwitchFailure.
+            sync_ocpp_error(connector, "estop", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_estop,
+                            "EmergencyStop", cfg_.vendor, "ESTOP");
             sync_ocpp_error(connector, "comm", ocpp::v16::ChargePointErrorCode::InternalError, true, ocpp_comm);
             sync_ocpp_error(connector, "earth", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_earth);
-            sync_ocpp_error(connector, "safety", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_safety);
+            sync_ocpp_error(connector, "safety", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_safety,
+                            "SafetyTrip", cfg_.vendor, "SAFETY");
             sync_ocpp_error(connector, "isolation_fault", ocpp::v16::ChargePointErrorCode::GroundFailure, true,
                             ocpp_isolation);
             sync_ocpp_error(connector, "overtemp", ocpp::v16::ChargePointErrorCode::HighTemperature, true,
@@ -1575,8 +1624,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                             ocpp_gc_welded);
             sync_ocpp_error(connector, "mc_welded", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
                             ocpp_mc_welded);
-            sync_ocpp_error(connector, "module_fault", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
-                            ocpp_module_fault);
+            sync_ocpp_error(connector, "module_fault", ocpp::v16::ChargePointErrorCode::OtherError, true,
+                            ocpp_module_fault, "ModulesUnavailable", cfg_.vendor, "MODULES");
             sync_ocpp_error(connector, "module_degraded", ocpp::v16::ChargePointErrorCode::OtherError, false,
                             ocpp_module_degraded);
             sync_ocpp_error(connector, "lock_fault", ocpp::v16::ChargePointErrorCode::ConnectorLockFailure, true,
@@ -1815,7 +1864,8 @@ void OcppAdapter::clear_faults(std::int32_t connector) {
 
 void OcppAdapter::sync_ocpp_error(std::int32_t connector, const std::string& uuid,
                                  ocpp::v16::ChargePointErrorCode error_code, bool is_fault, bool active,
-                                 const std::optional<std::string>& info) {
+                                 const std::optional<std::string>& info, const std::optional<std::string>& vendor_id,
+                                 const std::optional<std::string>& vendor_error_code) {
     if (!charge_point_) {
         return;
     }
@@ -1836,7 +1886,7 @@ void OcppAdapter::sync_ocpp_error(std::int32_t connector, const std::string& uui
     }
 
     if (raise) {
-        ocpp::v16::ErrorInfo err(uuid, error_code, is_fault, info);
+        ocpp::v16::ErrorInfo err(uuid, error_code, is_fault, info, vendor_id, vendor_error_code);
         charge_point_->on_error(connector, err);
     } else if (clear) {
         charge_point_->on_error_cleared(connector, uuid);
@@ -2396,7 +2446,7 @@ void OcppAdapter::apply_power_plan() {
                 if (st.estop) {
                     global_reason = "estop";
                 } else if (st.earth_fault) {
-                    global_reason = "earth_fault";
+                    global_reason = "earth";
                 } else {
                     global_reason = "safety";
                 }
@@ -2710,10 +2760,22 @@ void OcppAdapter::apply_power_plan() {
         snapshots[c.id] = snap;
     }
 
-    if (!trip_global && global_fault_latched_) {
-        global_fault_latched_ = false;
-        global_fault_reason_.clear();
-        EVLOG_info << "Global fault cleared";
+    // Avoid relay flip-flopping on noisy / intermittently-powered safety inputs by requiring the
+    // global trip condition to be cleared continuously for a short window before unlatching.
+    constexpr std::chrono::milliseconds kGlobalFaultClearDebounceMs(2000);
+    if (trip_global) {
+        global_fault_clear_since_ = std::chrono::steady_clock::time_point{};
+    } else if (global_fault_latched_) {
+        if (global_fault_clear_since_.time_since_epoch().count() == 0) {
+            global_fault_clear_since_ = now;
+        } else if ((now - global_fault_clear_since_) >= kGlobalFaultClearDebounceMs) {
+            global_fault_latched_ = false;
+            global_fault_reason_.clear();
+            global_fault_clear_since_ = std::chrono::steady_clock::time_point{};
+            EVLOG_info << "Global fault cleared";
+        }
+    } else {
+        global_fault_clear_since_ = std::chrono::steady_clock::time_point{};
     }
 
     if (trip_global || global_fault_latched_) {
@@ -3338,41 +3400,6 @@ void OcppAdapter::apply_power_plan() {
                                               planner_cfg_.min_gc_hold_ms, true);
         gc_closed_cmd = (enforced_gc == ContactorState::Closed);
 
-        // Precharge/voltage match before closing GC (home slot only).
-        bool precharge_ok = true;
-        if (is_home) {
-            const double v_target = dispatch.voltage_set_v;
-            double v_meas = status.present_voltage_v ? status.present_voltage_v.value() : last_voltage_v_[c.id];
-            if (v_meas <= 0.0) v_meas = last_voltage_v_[c.id];
-            if (v_meas <= 0.0) v_meas = planner_cfg_.default_voltage_v;
-            const bool precharge_needed = dispatch.modules_assigned > 0 && gc_closed_cmd &&
-                                          !info.disabled_by_csms && !local_fault;
-            if (precharge_needed) {
-                const double dv = std::fabs(v_meas - v_target);
-                precharge_ok = dv <= cfg_.precharge_voltage_tolerance_v;
-                if (!precharge_ok) {
-                    auto& ts = precharge_start_[c.id];
-                    if (ts.time_since_epoch().count() == 0) {
-                        ts = now;
-                    } else if ((now - ts) > std::chrono::milliseconds(cfg_.precharge_timeout_ms)) {
-                        local_fault = true;
-                        info.fault_reason = info.fault_reason.empty() ? "PrechargeTimeout" : info.fault_reason;
-                        EVLOG_warning << "Precharge timeout for connector " << c.id;
-                    }
-                } else {
-                    precharge_start_.erase(c.id);
-                }
-            } else {
-                precharge_start_.erase(c.id);
-            }
-            if (!precharge_ok) {
-                gc_closed_cmd = false;
-            }
-            if (local_fault) {
-                precharge_start_.erase(c.id);
-            }
-        }
-
         const bool module_health_ok = info.modules_healthy;
         const bool island_modules_allowed = in_island && !local_fault && !info.disabled_by_csms &&
                                             isolation_ready && dispatch.modules_assigned > 0 && module_health_ok;
@@ -3400,7 +3427,10 @@ void OcppAdapter::apply_power_plan() {
         const int gc_module_count = is_home ? dispatch.modules_assigned : slot_module_cmd;
         if (is_home && gun_for_slot > 0) {
             gun_drive_modules[gun_for_slot] = island_modules_allowed;
-            gun_allow_energy[gun_for_slot] = island_modules_allowed && gc_closed_cmd && precharge_ok;
+            // Allow energy whenever modules are assigned and the gun contactor is commanded closed.
+            // Precharge is handled by the ISO15118 state machine (EV/PLC); we should not hold GC open waiting for
+            // a "no-load voltage match" because some harnesses/modules only settle after physical connection.
+            gun_allow_energy[gun_for_slot] = island_modules_allowed && gc_closed_cmd;
         }
         const bool drive_modules_for_gun =
             gun_for_slot > 0 && gun_drive_modules.count(gun_for_slot) ? gun_drive_modules[gun_for_slot] : false;
@@ -3452,10 +3482,15 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
-        // Warm modules on plug-in (safe standby): close module relays but keep output contactor open,
-        // and command 0 current/power so the PLC can progress HLC cable-check/precharge.
+        // Warm modules on plug-in (safe standby): close module relays and command 0 current/power.
+        // When ISO15118 precharge is active (or EV targets are available), close GC so the EV can see the
+        // regulated voltage. Do not rely on a "no-load voltage match" with GC open, because some harnesses/modules
+        // only settle after physical connection.
         if (!tie_mode && warmup && warmup_mask != 0u) {
-            cmd.gc_closed = false;
+            const bool warmup_precharge =
+                status.hlc_precharge_active ||
+                (status.target_voltage_v.has_value() && status.target_voltage_v.value() > 0.0);
+            cmd.gc_closed = cmd.gc_closed || warmup_precharge;
             cmd.mc_closed = true;
             cmd.module_mask = warmup_mask;
             cmd.module_count = popcount(warmup_mask);
@@ -3546,7 +3581,20 @@ void OcppAdapter::apply_power_plan() {
             hardware_->disable(c.id);
             const std::string reason = !info.fault_reason.empty() ? info.fault_reason : "LocalFault";
             if (charge_point_) {
-                ocpp::v16::ErrorInfo err(reason, ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
+                ocpp::v16::ChargePointErrorCode error_code = ocpp::v16::ChargePointErrorCode::OtherError;
+                if (reason == "GCWelded" || reason == "MCWelded" ||
+                    reason == "GCOpenTimeout" || reason == "MCOpenTimeout") {
+                    error_code = ocpp::v16::ChargePointErrorCode::PowerSwitchFailure;
+                } else if (reason == "Isolation") {
+                    error_code = ocpp::v16::ChargePointErrorCode::GroundFailure;
+                } else if (reason == "Overtemp") {
+                    error_code = ocpp::v16::ChargePointErrorCode::HighTemperature;
+                } else if (reason == "Overcurrent") {
+                    error_code = ocpp::v16::ChargePointErrorCode::OverCurrentFailure;
+                } else if (reason == "CommFault") {
+                    error_code = ocpp::v16::ChargePointErrorCode::InternalError;
+                }
+                ocpp::v16::ErrorInfo err(reason, error_code, true, "LocalFault", cfg_.vendor, reason);
                 charge_point_->on_error(c.id, err);
             }
             {
@@ -3574,13 +3622,22 @@ void OcppAdapter::enter_global_fault(const std::string& reason, ocpp::v16::Reaso
     }
     global_fault_reason_ = reason;
     EVLOG_error << "Global fault latched: " << reason;
+    ocpp::v16::ChargePointErrorCode error_code = ocpp::v16::ChargePointErrorCode::OtherError;
+    std::string vendor_error = "FAULT";
+    if (reason == "estop") {
+        error_code = ocpp::v16::ChargePointErrorCode::OtherError;
+        vendor_error = "ESTOP";
+    } else if (reason == "earth") {
+        error_code = ocpp::v16::ChargePointErrorCode::GroundFailure;
+        vendor_error = "EARTH";
+    } else if (reason == "safety") {
+        error_code = ocpp::v16::ChargePointErrorCode::OtherError;
+        vendor_error = "SAFETY";
+    }
     for (const auto& c : cfg_.connectors) {
         finish_transaction(c.id, stop_reason, std::nullopt);
         hardware_->disable(c.id);
-        if (charge_point_) {
-            ocpp::v16::ErrorInfo err(reason, ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true);
-            charge_point_->on_error(c.id, err);
-        }
+        sync_ocpp_error(c.id, reason, error_code, true, true, "GlobalFault", cfg_.vendor, vendor_error);
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             connector_faulted_[c.id] = true;

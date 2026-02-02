@@ -26,71 +26,8 @@
   "gridLimitKW": 720,
   "loggingConfig": "../libocpp/config/logging.ini",
   "messageLogPath": "../logs",
-  "ocpp": {
-    "Core": {
-      "AllowOfflineTxForUnknownId": false,
-      "AuthorizationCacheEnabled": true,
-      "AuthorizeRemoteTxRequests": false,
-      "ClockAlignedDataInterval": 0,
-      "ConnectionTimeOut": 120,
-      "ConnectorPhaseRotation": "0.RST,1.RST",
-      "GetConfigurationMaxKeys": 1024,
-      "HeartbeatInterval": 60,
-      "LocalAuthorizeOffline": true,
-      "LocalPreAuthorize": true,
-      "MaxEnergyOnInvalidId": 2000,
-      "MeterValueSampleInterval": 15,
-      "MeterValuesAlignedData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
-      "MeterValuesAlignedDataMaxLength": 1024,
-      "MeterValuesSampledData": "Energy.Active.Import.Register,Voltage,Temperature,Current.Import,Power.Active.Import,SoC,Current.Offered,Frequency",
-      "MeterValuesSampledDataMaxLength": 1024,
-      "MinimumStatusDuration": 0,
-      "NumberOfConnectors": 1,
-      "ResetRetries": 5,
-      "StopTransactionOnEVSideDisconnect": true,
-      "StopTransactionOnInvalidId": true,
-      "StopTxnAlignedData": "Energy.Active.Import.Register",
-      "StopTxnAlignedDataMaxLength": 1024,
-      "StopTxnSampledData": "Energy.Active.Import.Register",
-      "StopTxnSampledDataMaxLength": 1024,
-      "SupportedFeatureProfiles": "Core,FirmwareManagement,RemoteTrigger,Reservation,LocalAuthListManagement,SmartCharging",
-      "SupportedFeatureProfilesMaxLength": 1024,
-      "TransactionMessageAttempts": 2,
-      "TransactionMessageRetryInterval": 40,
-      "UnlockConnectorOnEVSideDisconnect": true,
-      "WebSocketPingInterval": 0
-    },
-    "FirmwareManagement": {
-      "SupportedFileTransferProtocols": "FTP,HTTP,HTTPS"
-    },
-    "Internal": {
-      "LogMessagesFormat": [
-        "log",
-        "console_detailed"
-      ],
-      "WebsocketPongTimeout": 0
-    },
-    "LocalAuthListManagement": {
-      "LocalAuthListEnabled": true,
-      "LocalAuthListMaxLength": 10000,
-      "SendLocalListMaxLength": 20
-    },
-    "Reservation": {
-      "ReserveConnectorZeroSupported": true
-    },
-    "Security": {
-      "AuthorizationKey": "DEADBEEFDEADBEEF",
-      "DisableSecurityEventNotifications": true,
-      "SecurityProfile": 0
-    },
-    "SmartCharging": {
-      "ChargeProfileMaxStackLevel": 10,
-      "ChargingScheduleAllowedChargingRateUnit": "Current,Power",
-      "ChargingScheduleMaxPeriods": 10,
-      "ConnectorSwitch3to1PhaseSupported": false,
-      "MaxChargingProfilesInstalled": 20
-    }
-  },
+  "meterSampleIntervalSeconds": 15,
+  "ocppConfig": "ocpp/v16/config.json",
   "planner": {
     "allowCrossSlotIslands": true
   },

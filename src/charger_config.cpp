@@ -652,6 +652,13 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
     if (cfg.meter_sample_interval_s > 0) {
         json["Core"]["MeterValueSampleInterval"] = cfg.meter_sample_interval_s;
     }
+    // Ensure Authorization Cache is enabled so ClearCache can be accepted (libocpp rejects ClearCache when disabled).
+    if (!json.contains("Core") || !json["Core"].is_object()) {
+        json["Core"] = nlohmann::json::object();
+    }
+    if (!json["Core"].contains("AuthorizationCacheEnabled")) {
+        json["Core"]["AuthorizationCacheEnabled"] = true;
+    }
     if (!json.contains("Custom") || !json["Custom"].is_object()) {
         json["Custom"] = nlohmann::json::object();
     }
