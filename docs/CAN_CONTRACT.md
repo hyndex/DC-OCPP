@@ -39,7 +39,8 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 - **Gun contactor (GC) ownership is PLC-only when `plc.gunRelayOwnedByPlc=true` (default).**
   - Controller will not set GC bits in `RELAY_CMD` when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
-- Module relays (RLY2/RLY3) may be driven by PLC when `plc.moduleRelaysEnabled=true` else controller/hardware driver manages modules directly.
+- Auxiliary relays (RLY2/RLY3) are used as KM_A/KM_B bus sectionalizers when `plc.moduleRelaysEnabled=true`
+  (module‑level ring cuts; bit0=KM_A, bit1=KM_B).
 - When both RELAY_CMD and mirrored GCMC_CMD are present, PLC gives priority to RELAY_CMD updates received within 50 ms; GCMC_CMD is used only as a legacy fallback when no fresh RELAY_CMD is seen.
 - `CLEAR_FAULTS` in RELAY_CMD/GCMC_CMD is asserted only on explicit operator/service request (no auto-clear on any fault).
 

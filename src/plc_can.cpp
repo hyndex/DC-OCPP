@@ -1067,15 +1067,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.earth_fault = earth_trip;
     if (cfg_.plc_owns_gun_relay || !relay_feedback) {
         // When no relay feedback is available, fall back to our own commanded state.
-        //
-        // In plc.relayMode='ties' the auxiliary relays drive bus tie contactors, so `regulating`
-        // can be true even when the gun contactor is open. For HLC and safety logic, `relay_closed`
-        // should reflect the gun contactor state (KG/GC) whenever the controller commands it.
-        if (cfg_.plc_relay_mode == PlcRelayMode::Ties && !cfg_.plc_owns_gun_relay) {
-            gs.relay_closed = st.output_enabled;
-        } else {
-            gs.relay_closed = st.output_enabled || st.regulating;
-        }
+        gs.relay_closed = st.output_enabled;
     } else {
         gs.relay_closed = st.last_relay.relay[0];
     }
@@ -1342,16 +1334,9 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     auto it = connectors_.find(cmd.connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
-    // `cmd.module_mask` is interpreted by the PLC backend as "the two auxiliary relay outputs":
-    // - plc.relayMode=modules: module contactors (slot-local)
-    // - plc.relayMode=ties: bus tie contactors (CW/CCW sectionalizers)
-    //
-    // In legacy `modules` mode, MC open gates module relays OFF.
-    // In `ties` mode, MC state is modeled separately and must not clobber the auxiliary relay mask.
+    // `cmd.module_mask` drives the two auxiliary relay outputs as KM_A/KM_B
+    // (module bus sectionalizers owned by this PLC).
     uint8_t relay_mask = static_cast<uint8_t>(cmd.module_mask & 0x03u);
-    if (cfg_.plc_relay_mode == PlcRelayMode::Modules && !cmd.mc_closed) {
-        relay_mask = 0;
-    }
     const bool gun_on = cmd.gc_closed;
     const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && relay_mask != 0);
     st.output_enabled = gun_on;
@@ -1454,7 +1439,7 @@ std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() {
     return tokens;
 }
 
-bool PlcCanHardware::supports_cross_slot_islands() const { return cfg_.plc_relay_mode == PlcRelayMode::Ties; }
+bool PlcCanHardware::supports_cross_slot_islands() const { return true; }
 
 } // namespace charger
 

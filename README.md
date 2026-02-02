@@ -7,9 +7,11 @@ Architecture at a glance
 ------------------------
 - One controller (this repo) ↔ multiple PLC nodes, one PLC per connector/gun.
 - Each PLC (Ref/Basic firmware) exposes 1 gun relay + 2 auxiliary relays; controller treats each PLC as one connector.
-- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (CAN, or PLC relays in legacy mode).
+- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (CAN).
 - Controller owns OCPP, auth, session lifecycle, and power planning; PLC owns IEC61851/SLAC/ISO15118 timing and safety IO.
-- Ring/islanding + module sharing: set `plc.relayMode=ties` to use the 2 auxiliary relays as TieCW/TieCCW bus sectionalizers (one gun per island enforced in software). Without aux feedback, contactor switching is gated by module telemetry (ΔV + low current).
+- Ring/islanding + module sharing: split charging uses the 2 auxiliary relays as **KM_A/KM_B**
+  bus sectionalizers (module-level cut points) so modules can be shared across guns. Without aux feedback,
+  contactor switching is gated by module telemetry (ΔV + low current).
 
 What’s here
 -----------
@@ -194,9 +196,9 @@ Configuration notes
 -------------------
 - `configs/charger.json` fields:
   - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
-- `plc` block: `useCRC8` (retained for compatibility; host enforces CRC8 on required frames) and
+- `plc` block: `useCRC8` (retained for compatibility; host enforces CRC8 on required frames),
   `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles), `moduleRelaysEnabled`
-  (drive PLC auxiliary relays), `relayMode` (`modules` = module contactors, `ties` = TieCW/TieCCW bus sectionalizers),
+  (drive PLC auxiliary relays as KM_A/KM_B bus cuts), `relayMode` (must be `ties` for split charging),
   and `relayFeedbackAvailable` (set false when no aux feedback is wired; controller assumes actuation succeeded).
 - `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
   `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
@@ -207,6 +209,16 @@ Configuration notes
     CAN drivers. Additional optional fields: `pollMs`, `cmdIntervalMs` (min 100 ms), `broadcast` (send via group/global
     broadcast DST). If omitted, slots/modules are auto-generated per connector. CW/CCW neighbors must reference existing
     slot IDs (or be 0 for line ends / single-slot systems).
+  - **Split charging topology**: modules are expanded into module‑level ring segments in CW order; `modules[0]` is the
+    gun’s home segment and `modules[1]` is the adjacent segment. KM_A maps to the `modules[0]` boundary (relay bit0),
+    KM_B maps to the `modules[1]` boundary (relay bit1). Opening either KM isolates that segment from the ring.
+  - **Missing modules**: if a PLC has only one module configured, the missing module slot is treated as a pass‑through
+    segment (no module capacity, no telemetry) while KM_A/KM_B topology control remains intact.
+  - **Telemetry fallback**: tie/GC switching gates use module telemetry when available, and fall back to the gun’s
+    PLC‑reported voltage/current when a module segment has no telemetry. Slots with no modules and no gun are kept
+    closed (no switching) to avoid unmeasured island boundaries.
+  - **mc field note**: in split‑charging mode the controller derives KM identifiers from module IDs; `slots[].mc` is
+    retained for schema compatibility but is not used to drive relay masks.
   - `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
   allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
   - Sample config maps 24 Maxwell MXR modules on `can0`, group `0`, addresses `0`–`23` (two per slot).
@@ -214,6 +226,43 @@ Configuration notes
     is clamped to 0–60; `ratedPowerKW` defaults to `modulePowerKW` when omitted. Broadcast mode allows addresses 0xFE/0xFF.
 - `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
 - PLC constraints: unique `plcId` per connector; a single CAN interface is enforced by the host driver.
+
+Example split‑charging config (4 guns / 8 modules)
+--------------------------------------------------
+```json
+{
+  "plc": {
+    "relayMode": "ties",
+    "moduleRelaysEnabled": true,
+    "gunRelayOwnedByPlc": false,
+    "relayFeedbackAvailable": false
+  },
+  "planner": {
+    "allowCrossSlotIslands": true,
+    "tieCloseMaxDeltaV": 20,
+    "switchMaxCurrentA": 2,
+    "switchStableTimeMs": 200
+  },
+  "connectors": [
+    { "id": 1, "plcId": 0 }, { "id": 2, "plcId": 1 },
+    { "id": 3, "plcId": 2 }, { "id": 4, "plcId": 3 }
+  ],
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 2, "ccw": 4, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "mn": "MN_1_0", "address": 0, "group": 0, "type": "maxwell-mxr" },
+                   { "id": "M1_1", "mn": "MN_1_1", "address": 1, "group": 0, "type": "maxwell-mxr" } ] },
+    { "id": 2, "gunId": 2, "cw": 3, "ccw": 1, "gc": "GC_2", "mc": "MC_2",
+      "modules": [ { "id": "M2_0", "mn": "MN_2_0", "address": 2, "group": 0, "type": "maxwell-mxr" },
+                   { "id": "M2_1", "mn": "MN_2_1", "address": 3, "group": 0, "type": "maxwell-mxr" } ] },
+    { "id": 3, "gunId": 3, "cw": 4, "ccw": 2, "gc": "GC_3", "mc": "MC_3",
+      "modules": [ { "id": "M3_0", "mn": "MN_3_0", "address": 4, "group": 0, "type": "maxwell-mxr" },
+                   { "id": "M3_1", "mn": "MN_3_1", "address": 5, "group": 0, "type": "maxwell-mxr" } ] },
+    { "id": 4, "gunId": 4, "cw": 1, "ccw": 3, "gc": "GC_4", "mc": "MC_4",
+      "modules": [ { "id": "M4_0", "mn": "MN_4_0", "address": 6, "group": 0, "type": "maxwell-mxr" },
+                   { "id": "M4_1", "mn": "MN_4_1", "address": 7, "group": 0, "type": "maxwell-mxr" } ] }
+  ]
+}
+```
 
 Planner/allocator overview
 --------------------------

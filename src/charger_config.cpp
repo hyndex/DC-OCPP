@@ -60,13 +60,10 @@ PlcRelayMode parse_plc_relay_mode(std::string s) {
     s = trim_copy(std::move(s));
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (s.empty() || s == "modules" || s == "module") {
-        return PlcRelayMode::Modules;
-    }
-    if (s == "ties" || s == "tie" || s == "island" || s == "islanding" || s == "bus") {
+    if (s.empty() || s == "ties" || s == "tie" || s == "island" || s == "islanding" || s == "bus") {
         return PlcRelayMode::Ties;
     }
-    throw std::runtime_error("Invalid plc.relayMode: " + s + " (expected 'modules' or 'ties')");
+    throw std::runtime_error("Invalid plc.relayMode: " + s + " (split charging only; expected 'ties')");
 }
 
 ConnectorConfig parse_connector(const nlohmann::json& connector_json, int default_interval) {
@@ -204,8 +201,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
-    cfg.plc_three_relay_mode = plc_cfg.value("threeRelayMode", false);
-    cfg.plc_relay_mode = parse_plc_relay_mode(plc_cfg.value("relayMode", "modules"));
+    cfg.plc_relay_mode = parse_plc_relay_mode(plc_cfg.value("relayMode", "ties"));
     cfg.plc_relay_feedback = plc_cfg.value("relayFeedbackAvailable", true);
     cfg.autocharge_id_source = normalize_autocharge_source(
         plc_cfg.value("autochargeIdSource", cfg.autocharge_id_source));
@@ -282,25 +278,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.switch_stable_time_ms < 0) {
         cfg.switch_stable_time_ms = 0;
     }
-    if (cfg.plc_three_relay_mode) {
-        if (cfg.plc_relay_mode != PlcRelayMode::Modules) {
-            throw std::runtime_error("plc.threeRelayMode=true requires plc.relayMode='modules'");
-        }
-        cfg.allow_cross_slot_islands = false;
-        cfg.max_modules_per_gun = std::min(cfg.max_modules_per_gun, 2);
-        cfg.max_island_radius = 1;
+    if (!cfg.plc_module_relays_enabled) {
+        throw std::runtime_error(
+            "Split charging requires plc.moduleRelaysEnabled=true (relay bits 1..2 drive tie contactors)");
     }
-    if (cfg.plc_relay_mode == PlcRelayMode::Ties) {
-        if (!cfg.plc_module_relays_enabled) {
-            throw std::runtime_error(
-                "plc.relayMode='ties' requires plc.moduleRelaysEnabled=true (relay bits 1..2 drive tie contactors)");
-        }
-        if (cfg.plc_owns_gun_relay) {
-            throw std::runtime_error(
-                "plc.relayMode='ties' requires plc.gunRelayOwnedByPlc=false (controller must enforce one-gun-per-island)");
-        }
-        // Islanding requires MC switching; never force the legacy three-relay (GC+modules) mode.
-        cfg.plc_three_relay_mode = false;
+    if (cfg.plc_owns_gun_relay) {
+        throw std::runtime_error(
+            "Split charging requires plc.gunRelayOwnedByPlc=false (controller must enforce one-gun-per-island)");
     }
 
     if (json.contains("ocpp") && json["ocpp"].is_object()) {
@@ -447,6 +431,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             }
             if (!mapped_gun_ids.insert(slot.gun_id).second) {
                 throw std::runtime_error("Multiple slots map to the same gunId=" + std::to_string(slot.gun_id));
+            }
+
+            if (slot.modules.empty()) {
+                throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " must define at least 1 module");
+            }
+            if (slot.modules.size() > 2) {
+                throw std::runtime_error("Slot id=" + std::to_string(slot.id) + " supports at most 2 modules");
             }
 
             for (std::size_t idx = 0; idx < slot.modules.size(); ++idx) {

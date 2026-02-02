@@ -143,6 +143,67 @@ int main() {
         assert(threw);
     }
 
+    // Split charging: allow 1 module per slot, reject >2 modules.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "plc": {
+    "relayMode": "ties",
+    "moduleRelaysEnabled": true,
+    "gunRelayOwnedByPlc": false,
+    "relayFeedbackAvailable": false
+  },
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(cfg.slots.size() == 1);
+        assert(cfg.slots.front().modules.size() == 1);
+    }
+
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "plc": {
+    "relayMode": "ties",
+    "moduleRelaysEnabled": true,
+    "gunRelayOwnedByPlc": false,
+    "relayFeedbackAvailable": false
+  },
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [
+        { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 },
+        { "id": "M1_1", "type": "maxwell-mxr", "address": 1, "group": 0 },
+        { "id": "M1_2", "type": "maxwell-mxr", "address": 2, "group": 0 }
+      ] }
+  ]
+}
+)JSON");
+        bool threw = false;
+        try {
+            (void)load_charger_config(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+
     std::cout << "charger_config_tests passed\n";
     return 0;
 }

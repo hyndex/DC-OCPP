@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "power_manager.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -155,6 +156,147 @@ int main() {
     assert(plan_big.guns.front().modules_assigned > 0);
     std::set<int> slots_used(plan_big.islands.front().slot_ids.begin(), plan_big.islands.front().slot_ids.end());
     assert(!slots_used.empty());
+
+    // Module-level ring topology: 2 guns, 4 module slots (gun taps on slot 1 and 3).
+    PlannerConfig cfg3 = cfg;
+    cfg3.allow_cross_slot_islands = true;
+    cfg3.grid_limit_kw = 500.0;
+    cfg3.module_power_kw = 30.0;
+    cfg3.max_modules_per_gun = 4;
+    PowerManager pm3(cfg3);
+    std::vector<Slot> module_slots;
+    auto make_module_slot = [](int id, int cw, int ccw, int gun_id) {
+        Slot s;
+        s.id = id;
+        s.gun_id = gun_id;
+        s.mc_id = "MC_" + std::to_string(id);
+        s.gc_id = gun_id > 0 ? "GC_" + std::to_string(gun_id) : "";
+        s.cw_id = cw;
+        s.ccw_id = ccw;
+        s.modules = {"M" + std::to_string(id)};
+        return s;
+    };
+    module_slots.push_back(make_module_slot(1, 2, 4, 1));
+    module_slots.push_back(make_module_slot(2, 3, 1, 0));
+    module_slots.push_back(make_module_slot(3, 4, 2, 2));
+    module_slots.push_back(make_module_slot(4, 1, 3, 0));
+    pm3.set_slots(module_slots);
+    std::vector<ModuleState> module_only;
+    for (const auto& s : module_slots) {
+        module_only.push_back(make_module(s.modules[0], s.id, true));
+    }
+    pm3.update_modules(module_only);
+    std::vector<GunState> guns3;
+    auto g1 = make_gun(1, 120.0, 240.0, true);
+    g1.slot_id = 1;
+    guns3.push_back(g1);
+    pm3.update_guns(guns3);
+    auto plan_single = pm3.compute_plan();
+    assert(plan_single.islands.size() == 1);
+    assert(plan_single.islands.front().slot_ids.size() == module_slots.size());
+    assert(plan_single.guns.front().modules_assigned == static_cast<int>(module_slots.size()));
+
+    // Single gun with low request still gets full island + all healthy modules.
+    PowerManager pm3_low(cfg3);
+    pm3_low.set_slots(module_slots);
+    pm3_low.update_modules(module_only);
+    guns3.clear();
+    g1 = make_gun(1, 10.0, 60.0, true);
+    g1.slot_id = 1;
+    guns3.push_back(g1);
+    pm3_low.update_guns(guns3);
+    auto plan_single_low = pm3_low.compute_plan();
+    assert(plan_single_low.islands.size() == 1);
+    assert(plan_single_low.islands.front().slot_ids.size() == module_slots.size());
+    assert(plan_single_low.guns.front().modules_assigned == static_cast<int>(module_slots.size()));
+
+    guns3.clear();
+    g1 = make_gun(1, 60.0, 120.0, true);
+    g1.slot_id = 1;
+    auto g2 = make_gun(2, 60.0, 120.0, true);
+    g2.slot_id = 3;
+    guns3.push_back(g1);
+    guns3.push_back(g2);
+    pm3.update_guns(guns3);
+    auto plan_two = pm3.compute_plan();
+    assert(plan_two.islands.size() == 2);
+    std::set<int> island_guns;
+    for (const auto& isl : plan_two.islands) {
+        if (isl.gun_id) {
+            island_guns.insert(isl.gun_id.value());
+        }
+    }
+    assert(island_guns.size() == 2);
+
+    // Split modules from the same PLC across guns (gun2 borrows slot 2).
+    guns3.clear();
+    g1 = make_gun(1, 30.0, 60.0, true);
+    g1.slot_id = 1;
+    g2 = make_gun(2, 90.0, 120.0, true);
+    g2.slot_id = 3;
+    guns3.push_back(g1);
+    guns3.push_back(g2);
+    pm3.update_guns(guns3);
+    auto plan_split = pm3.compute_plan();
+    bool gun2_has_slot2 = false;
+    for (const auto& isl : plan_split.islands) {
+        if (isl.gun_id && isl.gun_id.value() == 2) {
+            gun2_has_slot2 = std::find(isl.slot_ids.begin(), isl.slot_ids.end(), 2) != isl.slot_ids.end();
+            break;
+        }
+    }
+    assert(gun2_has_slot2);
+
+    // Pass-through empty slot: gun1 can traverse an empty segment to reach modules.
+    PlannerConfig cfg4 = cfg;
+    cfg4.allow_cross_slot_islands = true;
+    cfg4.grid_limit_kw = 200.0;
+    cfg4.module_power_kw = 30.0;
+    cfg4.max_modules_per_gun = 4;
+    PowerManager pm4(cfg4);
+    std::vector<Slot> pass_slots;
+    Slot s1;
+    s1.id = 1;
+    s1.gun_id = 1;
+    s1.mc_id = "MC_1";
+    s1.gc_id = "GC_1";
+    s1.cw_id = 2;
+    s1.ccw_id = 3;
+    s1.modules = {"M1"};
+    pass_slots.push_back(s1);
+    Slot s2;
+    s2.id = 2;
+    s2.gun_id = 0;
+    s2.mc_id = "MC_2";
+    s2.gc_id = "";
+    s2.cw_id = 3;
+    s2.ccw_id = 1;
+    s2.modules = {};
+    pass_slots.push_back(s2);
+    Slot s3;
+    s3.id = 3;
+    s3.gun_id = 0;
+    s3.mc_id = "MC_3";
+    s3.gc_id = "";
+    s3.cw_id = 1;
+    s3.ccw_id = 2;
+    s3.modules = {"M3"};
+    pass_slots.push_back(s3);
+    pm4.set_slots(pass_slots);
+    std::vector<ModuleState> pass_mods;
+    pass_mods.push_back(make_module("M1", 1, true));
+    pass_mods.push_back(make_module("M3", 3, true));
+    pm4.update_modules(pass_mods);
+    std::vector<GunState> guns4;
+    auto g4 = make_gun(1, 60.0, 120.0, true);
+    g4.slot_id = 1;
+    guns4.push_back(g4);
+    pm4.update_guns(guns4);
+    auto plan_pass = pm4.compute_plan();
+    assert(plan_pass.islands.size() == 1);
+    std::set<int> pass_island(plan_pass.islands.front().slot_ids.begin(),
+                              plan_pass.islands.front().slot_ids.end());
+    assert(pass_island.count(1) && pass_island.count(2) && pass_island.count(3));
 
     std::cout << "power_manager_tests passed\n";
     return 0;

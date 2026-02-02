@@ -14,6 +14,14 @@ I will assume the **latest architecture you described**:
 
 ---
 
+> **Implementation note (current repo):** the controller expands each slot into **module‑level ring segments**
+> and treats the two PLC auxiliary relays as **KM_A/KM_B bus sectionalizers**. This enables per‑module sharing
+> (modules from the same PLC can be split across islands) while preserving one‑gun‑per‑island safety. If a PLC
+> has only one module configured, the missing segment is treated as pass‑through (no module capacity) while KM
+> topology control remains intact. Tie/GC switching gates use module telemetry when available and fall back to
+> gun‑reported voltage/current when module telemetry is absent. Slots with no modules and no gun are kept closed
+> (no switching) to avoid unmeasured island boundaries.
+
 # 1. Goal & Scope
 
 ### 1.1 Goal
@@ -49,11 +57,12 @@ The result must be suitable to implement in:
 
 We standardize naming so it works in code, not just on paper.
 
-### 2.1.1 Slots
+### 2.1.1 Slots (conceptual view)
 
-There are 12 slots arranged on a ring:
+There are 12 slots arranged on a ring. The table below is a **logical** view; the implementation uses
+module‑level KM_A/KM_B boundaries (per module) and treats the slot‑level MC_i labels as conceptual cut points.
 
-| Slot ID | Modules (IDs) | Gun | GC contactor (NO) | Bus cut contactor (NC) | CW neighbor | CCW neighbor |
+| Slot ID | Modules (IDs) | Gun | GC contactor (NO) | Bus cut contactor (NC, conceptual) | CW neighbor | CCW neighbor |
 | ------: | ------------- | --- | ----------------- | ---------------------- | ----------- | ------------ |
 |       1 | M1_0, M1_1    | 1   | GC_1              | MC_1                   | 2           | 12           |
 |       2 | M2_0, M2_1    | 2   | GC_2              | MC_2                   | 3           | 1            |
@@ -85,7 +94,8 @@ Each module has its own contactor MN to connect to the local bus in the island:
 So per slot we have:
 
 * **GC_i** – Gun contactor, normally open, closes when EV is connected and island is ready.
-* **MC_i** – Bus cut contactor, normally closed, opens to split the ring into independent islands.
+* **MC_i** – Conceptual bus cut (slot boundary). In production builds, KM_A/KM_B (per module) are the actual bus
+  sectionalizers; MC_i is kept only as a logical label in documentation/config schema.
 * **MN_i_0, MN_i_1** – Module contactors, connect modules to the island’s bus.
 
 ## 2.2 Islands (virtual DC buses)

@@ -29,10 +29,20 @@
   "meterSampleIntervalSeconds": 15,
   "ocppConfig": "ocpp/v16/config.json",
   "planner": {
-    "allowCrossSlotIslands": true
+    "allowCrossSlotIslands": true,
+    "prechargeTimeoutMs": 15000,
+    "prechargeVoltageToleranceV": 50,
+    "tieCloseMaxDeltaV": 20,
+    "switchMaxCurrentA": 2,
+    "switchStableTimeMs": 200,
+    "minMcHoldMs": 500,
+    "minGcHoldMs": 500
   },
   "plc": {
-    "threeRelayMode": true
+    "gunRelayOwnedByPlc": false,
+    "moduleRelaysEnabled": true,
+    "relayFeedbackAvailable": false,
+    "relayMode": "ties"
   },
   "security": {
     "clientCertDir": "../data/certs/client/csms",
@@ -58,6 +68,14 @@
           "group": 1,
           "id": "M1_0",
           "mn": "MN_1_0",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        },
+        {
+          "address": 2,
+          "group": 1,
+          "id": "M1_1",
+          "mn": "MN_1_1",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr"
         }

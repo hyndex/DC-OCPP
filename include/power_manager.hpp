@@ -19,7 +19,7 @@ enum class GunFsmState { Idle, EvDetected, Ready, IslandReady, Charging, RampDow
 struct Slot {
     int id{0};
     std::vector<std::string> modules; // e.g. {"M1_0", "M1_1"}
-    int gun_id{0};                    // gun mapped to this slot
+    int gun_id{0};                    // gun mapped to this slot (0 => no gun)
     std::string gc_id;                // gun contactor id
     std::string mc_id;                // bus cut contactor id
     int cw_id{0};

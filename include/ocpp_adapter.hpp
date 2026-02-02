@@ -7,6 +7,7 @@
 #include "power_module_controller.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -114,6 +115,8 @@ private:
     PlannerConfig planner_cfg_{};
     PowerManager power_manager_;
     std::vector<Slot> slots_;
+    std::map<int, std::array<int, 2>> connector_module_slots_;
+    std::map<int, int> slot_owner_connector_;
     std::unique_ptr<PowerModuleController> module_controller_;
 
     std::atomic<bool> running_{false};
@@ -156,6 +159,7 @@ private:
     std::map<int, bool> mc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> mc_open_request_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_switch_ready_since_;
+    std::map<std::string, std::chrono::steady_clock::time_point> gc_switch_ready_since_;
     std::map<int, bool> gc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_command_change_time_;
