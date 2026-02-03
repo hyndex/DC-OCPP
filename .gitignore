@@ -17,6 +17,7 @@
 # Logs and runtime output
 /logs/
 *.log
+/dc_ocpp.pid
 
 # IDE/tooling
 .DS_Store

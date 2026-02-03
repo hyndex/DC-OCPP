@@ -6,7 +6,7 @@
   "chargePoint": {
     "centralSystemURI": "ws://ocpp.joulepoint.com:80",
     "firmwareVersion": "0.0.1",
-    "id": "example-1gun_1module",
+    "id": "jyotisman",
     "model": "Joulepoint-DC",
     "usePLC": true,
     "vendor": "JoulePoint"
@@ -70,7 +70,7 @@
       "modules": [
         {
           "address": 1,
-          "group": 0,
+          "group": 1,
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedPowerKW": 30,
