@@ -144,7 +144,10 @@
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -162,7 +165,10 @@
           "id": "M2_0",
           "mn": "MN_2_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -180,7 +186,10 @@
           "id": "M3_0",
           "mn": "MN_3_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -198,7 +207,10 @@
           "id": "M4_0",
           "mn": "MN_4_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -216,7 +228,10 @@
           "id": "M5_0",
           "mn": "MN_5_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -234,7 +249,10 @@
           "id": "M6_0",
           "mn": "MN_6_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -252,7 +270,10 @@
           "id": "M7_0",
           "mn": "MN_7_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -270,7 +291,10 @@
           "id": "M8_0",
           "mn": "MN_8_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     }

@@ -26,9 +26,10 @@ namespace charger {
 namespace {
 
 constexpr int kPollMs = 200;
-constexpr int kTxLimitsMs = 500;
-constexpr int kTxPresentMs = 300;
-constexpr int kTxRelayMs = 100;
+constexpr int kDefaultTxPresentMs = 100;
+constexpr int kMinTxLimitsMs = 200;
+constexpr int kMinTxPresentMs = 50;
+constexpr int kTxRelayMs = 1000;
 constexpr int kSegmentTimeoutMs = 2000;
 constexpr int kPlugInDebounceMs = 200;
 constexpr int kPlugOutDebounceMs = 1000;
@@ -105,6 +106,17 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     started_at_ = std::chrono::steady_clock::now();
     use_crc_ = cfg_.plc_use_crc8;
     telemetry_timeout_ms_ = cfg_.telemetry_timeout_ms > 0 ? cfg_.telemetry_timeout_ms : 2000;
+    auto clamp_ms = [](int value, int min_ms, int max_ms) {
+        return std::min(max_ms, std::max(min_ms, value));
+    };
+    const int warn_present_ms = cfg_.plc_present_warn_ms > 0 ? cfg_.plc_present_warn_ms : 1000;
+    const int warn_limits_ms = cfg_.plc_limits_warn_ms > 0 ? cfg_.plc_limits_warn_ms : 1500;
+    const int present_target_ms = std::max(1, warn_present_ms / 3);
+    const int limits_target_ms = std::max(1, warn_limits_ms / 2);
+    tx_present_ms_ = clamp_ms(std::min(kDefaultTxPresentMs, present_target_ms),
+                              kMinTxPresentMs, kDefaultTxPresentMs);
+    tx_limits_ms_ = clamp_ms(std::min(1000, limits_target_ms),
+                             kMinTxLimitsMs, 1000);
     if (cfg_.autocharge_id_source == "evccid") {
         autocharge_source_ = AutochargeIdSource::Evccid;
     } else if (cfg_.autocharge_id_source == "emaid") {
@@ -133,6 +145,8 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         rx_thread_ = std::thread(&PlcCanHardware::rx_loop, this);
         tx_thread_ = std::thread(&PlcCanHardware::tx_loop, this);
         init_ok_ = true;
+        EVLOG_info << "PLC CAN TX cadence: present=" << tx_present_ms_
+                   << "ms limits=" << tx_limits_ms_ << "ms relay=" << kTxRelayMs << "ms";
     } else {
         EVLOG_warning << "PLC CAN backend disabled: no CAN sockets opened";
     }
@@ -631,7 +645,7 @@ void PlcCanHardware::set_lock_command(PlcState& st, bool lock) {
 
 void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limits_tx).count();
-    if (elapsed >= kTxLimitsMs) {
+    if (elapsed >= tx_limits_ms_) {
         const double cfg_v = (st.cfg.max_voltage_v > 0.0) ? st.cfg.max_voltage_v
                                                          : (cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v
                                                                                           : kDefaultVoltageV);
@@ -666,7 +680,7 @@ void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::t
 
 void PlcCanHardware::update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_present_tx).count();
-    if (elapsed >= kTxPresentMs) {
+    if (elapsed >= tx_present_ms_) {
         // Publish physical telemetry as-is. Avoid synthesizing a "fake" voltage during idle because it can
         // break EV-side precharge logic (EV expects EVSEPresentVoltage to reflect actual output bus/inlet).
         double v_f = std::max(0.0, st.present_voltage_v);

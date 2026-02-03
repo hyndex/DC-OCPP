@@ -65,19 +65,25 @@
       "modules": [
         {
           "address": 1,
-          "group": 1,
+          "group": 0,
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         },
         {
           "address": 2,
-          "group": 1,
+          "group": 0,
           "id": "M1_1",
           "mn": "MN_1_1",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     }

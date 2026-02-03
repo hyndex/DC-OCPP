@@ -210,6 +210,8 @@ private:
     std::atomic<bool> running_{false};
     bool init_ok_{false};
     int connection_timeout_s_{0};
+    int tx_limits_ms_{500};
+    int tx_present_ms_{100};
     std::chrono::steady_clock::time_point started_at_{};
     mutable std::mutex state_mutex_;
     std::mutex token_mutex_;

@@ -84,7 +84,10 @@
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     },
@@ -102,7 +105,10 @@
           "id": "M2_0",
           "mn": "MN_2_0",
           "ratedPowerKW": 30,
-          "type": "maxwell-mxr"
+          "type": "maxwell-mxr",
+          "pollMs": 1000,
+          "cmdIntervalMs": 1000,
+          "telemetryStaleMs": 3000
         }
       ]
     }

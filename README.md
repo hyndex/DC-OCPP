@@ -156,7 +156,7 @@ Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/
 
 - **Bus**: 29-bit extended IDs, 125 kbps. Low nibble encodes `plcId` (0–15) on both TX and RX IDs. CRC8 (poly 0x07, init 0x00) is required on RelayControl/RelayStatus/SafetyStatus/GCMC_Command/GCMC_Status/ConfigCmd/ConfigAck and EVSE_DC_MAX_LIMITS/EVSE_DC_PRESENT (byte7).
 - **RX IDs (host → PLC)**  
-  - `RelayControl`: `0x0300 | ((0x4<<4)|plcId)` — safety-critical. Signals: `RLY1_CMD`, `SYS_ENABLE`, `FORCE_ALL_OFF`, `CLEAR_FAULTS`, `CMD_SEQ`, enable mask, mode, pulse_ms, CRC. Timeout ≈300 ms forces relays off and faults.
+  - `RelayControl`: `0x0300 | ((0x4<<4)|plcId)` — safety-critical. Signals: `RLY1_CMD`, `SYS_ENABLE`, `FORCE_ALL_OFF`, `CLEAR_FAULTS`, `CMD_SEQ`, enable mask, mode, pulse_ms, CRC. Timeout ≈3000 ms forces relays off and faults.
   - `ConfigCmd`: `0x0300 | ((0x8<<4)|plcId)` — runtime config get/set. Signals: `CFG_PARAM_ID`, `CFG_OP`, `CFG_VALUE`, reserved, CRC.
   - `GCMC_Command`: `0x0300 | ((0x9<<4)|plcId)` — GC/MC/MN command mask + force-off/clear (maps onto existing relays for current hardware).
 - **TX IDs (PLC → host)**  
@@ -219,13 +219,15 @@ Configuration notes
     closed (no switching) to avoid unmeasured island boundaries.
   - **mc field note**: in split‑charging mode the controller derives KM identifiers from module IDs; `slots[].mc` is
     retained for schema compatibility but is not used to drive relay masks.
-  - `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
+- `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
   allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
   - Sample config maps 24 Maxwell MXR modules on `can0`, group `0`, addresses `0`–`23` (two per slot).
   - Module config validation: when `type` is set, `address` must be 0–63 and unique per `canInterface`+`group`; `group`
     is clamped to 0–60; `ratedPowerKW` defaults to `modulePowerKW` when omitted. Broadcast mode allows addresses 0xFE/0xFF.
 - `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
 - PLC constraints: unique `plcId` per connector; a single CAN interface is enforced by the host driver.
+- `timeouts.plcPresentWarnMs` / `timeouts.plcLimitsWarnMs` also tune controller TX cadence for
+  `EVSE_DC_PRESENT` / `EVSE_DC_MAX_LIMITS` frames (controller sends at or faster than these warning windows).
 
 Example split‑charging config (4 guns / 8 modules)
 --------------------------------------------------
