@@ -1,0 +1,203 @@
+{
+  "controller": {
+    "defaultTag": "1234567890",
+    "freeMode": false
+  },
+  "chargePoint": {
+    "centralSystemURI": "ws://ocpp.joulepoint.com:80",
+    "firmwareVersion": "0.0.1",
+    "id": "example-4gun_8module",
+    "model": "Joulepoint-DC",
+    "usePLC": true,
+    "vendor": "JoulePoint"
+  },
+  "connectors": [
+    {
+      "id": 1,
+      "plcId": 0,
+      "maxCurrentA": 200,
+      "maxPowerW": 60000,
+      "maxVoltageV": 1000,
+      "minVoltageV": 200,
+      "meterSource": "module",
+      "requireLock": false
+    },
+    {
+      "id": 2,
+      "plcId": 1,
+      "maxCurrentA": 200,
+      "maxPowerW": 60000,
+      "maxVoltageV": 1000,
+      "minVoltageV": 200,
+      "meterSource": "module",
+      "requireLock": false
+    },
+    {
+      "id": 3,
+      "plcId": 2,
+      "maxCurrentA": 200,
+      "maxPowerW": 60000,
+      "maxVoltageV": 1000,
+      "minVoltageV": 200,
+      "meterSource": "module",
+      "requireLock": false
+    },
+    {
+      "id": 4,
+      "plcId": 3,
+      "maxCurrentA": 200,
+      "maxPowerW": 60000,
+      "maxVoltageV": 1000,
+      "minVoltageV": 200,
+      "meterSource": "module",
+      "requireLock": false
+    }
+  ],
+  "databaseDir": "../../data/db",
+  "gridLimitKW": 240,
+  "loggingConfig": "../../libocpp/config/logging.ini",
+  "messageLogPath": "../../logs",
+  "meterSampleIntervalSeconds": 15,
+  "modulePowerKW": 30,
+  "defaultVoltageV": 800,
+  "ocppConfig": "../ocpp/v16/config.json",
+  "planner": {
+    "allowCrossSlotIslands": true,
+    "maxModulesPerGun": 2,
+    "minModulesPerActiveGun": 1,
+    "prechargeTimeoutMs": 15000,
+    "prechargeVoltageToleranceV": 50,
+    "tieCloseMaxDeltaV": 20,
+    "switchMaxCurrentA": 2,
+    "switchStableTimeMs": 200,
+    "minMcHoldMs": 500,
+    "minGcHoldMs": 500
+  },
+  "plc": {
+    "gunRelayOwnedByPlc": false,
+    "moduleRelaysEnabled": true,
+    "relayFeedbackAvailable": false,
+    "relayMode": "ties"
+  },
+  "security": {
+    "clientCertDir": "../../data/certs/client/csms",
+    "clientKeyDir": "../../data/certs/client/csms",
+    "csmsCaBundle": "../../data/certs/ca/csms/CSMS_ROOT_CA.pem",
+    "moCaBundle": "../../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "seccCertDir": "../../data/certs/client/cso",
+    "seccKeyDir": "../../data/certs/client/cso",
+    "v2gCaBundle": "../../data/certs/ca/v2g/V2G_ROOT_CA.pem"
+  },
+  "sharePath": "../ocpp/v16",
+  "slots": [
+    {
+      "id": 1,
+      "gunId": 1,
+      "gc": "GC_1",
+      "mc": "MC_1",
+      "cw": 2,
+      "ccw": 4,
+      "modules": [
+        {
+          "address": 1,
+          "group": 0,
+          "id": "M1_0",
+          "mn": "MN_1_0",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        },
+        {
+          "address": 2,
+          "group": 0,
+          "id": "M1_1",
+          "mn": "MN_1_1",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "gunId": 2,
+      "gc": "GC_2",
+      "mc": "MC_2",
+      "cw": 3,
+      "ccw": 1,
+      "modules": [
+        {
+          "address": 3,
+          "group": 0,
+          "id": "M2_0",
+          "mn": "MN_2_0",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        },
+        {
+          "address": 4,
+          "group": 0,
+          "id": "M2_1",
+          "mn": "MN_2_1",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "gunId": 3,
+      "gc": "GC_3",
+      "mc": "MC_3",
+      "cw": 4,
+      "ccw": 2,
+      "modules": [
+        {
+          "address": 5,
+          "group": 0,
+          "id": "M3_0",
+          "mn": "MN_3_0",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        },
+        {
+          "address": 6,
+          "group": 0,
+          "id": "M3_1",
+          "mn": "MN_3_1",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "gunId": 4,
+      "gc": "GC_4",
+      "mc": "MC_4",
+      "cw": 1,
+      "ccw": 3,
+      "modules": [
+        {
+          "address": 7,
+          "group": 0,
+          "id": "M4_0",
+          "mn": "MN_4_0",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        },
+        {
+          "address": 8,
+          "group": 0,
+          "id": "M4_1",
+          "mn": "MN_4_1",
+          "ratedPowerKW": 30,
+          "type": "maxwell-mxr"
+        }
+      ]
+    }
+  ],
+  "sqlMigrationsPath": "../../libocpp/config/v16/core_migrations",
+  "timeouts": {
+    "powerRequestSeconds": 600
+  },
+  "userConfig": "../../data/user_config.json"
+}
