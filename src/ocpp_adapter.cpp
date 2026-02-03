@@ -38,6 +38,7 @@ constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power del
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
+constexpr std::chrono::seconds RFID_TAP_LATCH_WINDOW(3);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
 
@@ -1115,8 +1116,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         if (rfid_active_connectors.count(token.connector_hint)) {
                             continue;
                         }
+                        const auto trimmed = clamp_id_token(token.id_token);
                         std::optional<std::string> active_token;
                         bool tx_started = false;
+                        bool suppress_repeat = false;
+                        bool should_stop = false;
                         {
                             std::lock_guard<std::mutex> lock(session_mutex_);
                             const auto it = sessions_.find(token.connector_hint);
@@ -1124,11 +1128,34 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                 tx_started = it->second.transaction_started;
                                 active_token = it->second.id_token;
                             }
+
+                            auto& latch = rfid_tap_latch_[token.connector_hint];
+                            const bool has_prev = latch.last_seen.time_since_epoch().count() != 0;
+                            const bool same_token = latch.token == trimmed;
+                            const bool within_window = has_prev && (now - latch.last_seen) < RFID_TAP_LATCH_WINDOW;
+                            const bool same_presence = same_token && within_window;
+                            if (!same_presence) {
+                                latch.token = trimmed;
+                                latch.consumed = false;
+                            }
+                            latch.last_seen = now;
+
+                            should_stop = tx_started && active_token && trimmed == *active_token;
+                            const bool should_ingest = !tx_started;
+                            const bool actionable = should_stop || should_ingest;
+                            suppress_repeat = actionable && same_presence && latch.consumed;
+                            if (actionable && !suppress_repeat) {
+                                latch.consumed = true;
+                            }
                         }
+
+                        if (suppress_repeat) {
+                            continue;
+                        }
+
                         if (tx_started) {
                             rfid_active_connectors.insert(token.connector_hint);
-                            const auto trimmed = clamp_id_token(token.id_token);
-                            if (active_token && trimmed == *active_token) {
+                            if (should_stop) {
                                 EVLOG_info << "RFID token matched active session on connector "
                                            << token.connector_hint << "; stopping transaction";
                                 const bool ok = hardware_->stop_transaction(token.connector_hint,
@@ -1159,6 +1186,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                             }
                             continue;
                         }
+
+                        AuthToken token_copy = token;
+                        token_copy.id_token = trimmed;
+                        ingest_tokens.push_back(std::move(token_copy));
+                        continue;
                     }
                     ingest_tokens.push_back(token);
                 }

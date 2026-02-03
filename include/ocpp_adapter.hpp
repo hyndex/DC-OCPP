@@ -177,6 +177,12 @@ private:
     std::map<int, uint64_t> limit_ack_stale_events_;
     std::map<int, uint64_t> telemetry_timeout_events_;
     std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
+    struct RfidTapLatch {
+        std::string token;
+        std::chrono::steady_clock::time_point last_seen{};
+        bool consumed{false};
+    };
+    std::map<std::int32_t, RfidTapLatch> rfid_tap_latch_;
     std::atomic<bool> global_fault_latched_{false};
     std::string global_fault_reason_;
     std::chrono::steady_clock::time_point global_fault_clear_since_{};
