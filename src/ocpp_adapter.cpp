@@ -1541,16 +1541,34 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             uint8_t module_healthy_mask = status.module_healthy_mask;
             uint8_t module_fault_mask = status.module_fault_mask;
             if (module_controller_) {
-                const Slot* slot = find_slot_for_gun(connector);
-                if (slot) {
-                    const auto snap = module_controller_->snapshot_for_slot(slot->id);
-                    if (snap.valid) {
-                        module_healthy_mask = snap.healthy_mask;
-                        module_fault_mask = snap.fault_mask;
-                    } else {
-                        module_healthy_mask = 0;
-                        module_fault_mask = 0;
+                bool any_valid = false;
+                uint8_t healthy = 0;
+                uint8_t fault = 0;
+                const auto slot_it = connector_module_slots_.find(connector);
+                if (slot_it != connector_module_slots_.end()) {
+                    for (int idx = 0; idx < 2; ++idx) {
+                        const int slot_id = slot_it->second[idx];
+                        if (slot_id <= 0) continue;
+                        const auto snap = module_controller_->snapshot_for_slot(slot_id);
+                        if (!snap.valid) continue;
+                        any_valid = true;
+                        healthy |= snap.healthy_mask;
+                        fault |= snap.fault_mask;
                     }
+                } else {
+                    const Slot* slot = find_slot_for_gun(connector);
+                    if (slot) {
+                        const auto snap = module_controller_->snapshot_for_slot(slot->id);
+                        if (snap.valid) {
+                            any_valid = true;
+                            healthy = snap.healthy_mask;
+                            fault = snap.fault_mask;
+                        }
+                    }
+                }
+                if (any_valid) {
+                    module_healthy_mask = healthy;
+                    module_fault_mask = fault;
                 }
             }
             const uint8_t usable_modules =
@@ -1793,12 +1811,13 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
                 hardware_->disable(connector);
                 had_session = false;
-            } else if (had_session && power_ready && !session.transaction_started) {
-                // Start OCPP transaction aligned to power delivery readiness
+            } else if (had_session && session.authorized && session.ev_connected && !session.transaction_started) {
+                // Start OCPP transaction as soon as authorization is granted while the EV is connected.
+                // If the EV disconnects before power delivery starts, the CSMS still sees a consistent Start/Stop pair.
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 auto it = sessions_.find(connector);
                 if (it != sessions_.end() && !it->second.transaction_started && it->second.authorized &&
-                    it->second.id_token.has_value()) {
+                    it->second.ev_connected && it->second.id_token.has_value()) {
                     charge_point_->on_transaction_started(connector, it->second.session_id, it->second.id_token.value(),
                                                           it->second.meter_start_wh, std::nullopt, ocpp::DateTime(),
                                                           std::nullopt);
@@ -1840,11 +1859,8 @@ bool OcppAdapter::begin_transaction(std::int32_t connector, const std::string& i
 void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason reason,
                                      std::optional<ocpp::CiString<20>> id_tag_end) {
     std::string session_id;
-    std::optional<std::string> id_token;
-    double meter_start_wh = 0.0;
     std::optional<std::chrono::steady_clock::time_point> pending_started;
     std::optional<std::chrono::steady_clock::time_point> authorized_at;
-    bool need_start = false;
     bool was_started = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -1852,24 +1868,10 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         if (it == sessions_.end()) {
             return;
         }
-        const bool can_start = it->second.authorized && it->second.id_token.has_value();
         session_id = it->second.session_id;
-        id_token = it->second.id_token;
-        meter_start_wh = it->second.meter_start_wh;
         pending_started = it->second.pending_started;
         authorized_at = it->second.authorized_at;
         was_started = it->second.transaction_started;
-        need_start = (!was_started && can_start);
-        if (need_start) {
-            it->second.transaction_started = true;
-            was_started = true;
-        }
-    }
-
-    if (need_start && id_token) {
-        charge_point_->on_transaction_started(connector, session_id, *id_token,
-                                              meter_start_wh, std::nullopt, ocpp::DateTime(),
-                                              std::nullopt);
     }
 
     float energy_wh = 0.0f;
@@ -2551,25 +2553,77 @@ void OcppAdapter::apply_power_plan() {
         double module_current_a = 0.0;
         double module_power_kw = 0.0;
         bool module_health_valid = !module_controller_;
-        if (module_controller_ && slot_for_conn) {
-            auto snap_it = module_snapshot_by_slot.find(slot_for_conn->id);
-            const ModuleHealthSnapshot snap =
-                snap_it != module_snapshot_by_slot.end() ? snap_it->second : ModuleHealthSnapshot{};
-            if (snap.valid) {
-                st.module_healthy_mask = snap.healthy_mask;
-                st.module_fault_mask = snap.fault_mask;
-                for (std::size_t i = 0; i < snap.temperatures_c.size() && i < st.module_temp_c.size(); ++i) {
-                    st.module_temp_c[i] = snap.temperatures_c[i];
+        if (module_controller_) {
+            bool any_valid = false;
+            bool any_health_valid = false;
+            uint8_t healthy_mask = 0;
+            uint8_t fault_mask = 0;
+            std::array<double, 2> temps{{0.0, 0.0}};
+            double v_sum = 0.0;
+            int v_count = 0;
+            double i_sum = 0.0;
+            double p_sum = 0.0;
+
+            const auto module_slots_it = connector_module_slots_.find(c.id);
+            if (module_slots_it != connector_module_slots_.end()) {
+                for (int idx = 0; idx < 2; ++idx) {
+                    const int slot_id = module_slots_it->second[idx];
+                    if (slot_id <= 0) continue;
+                    const auto snap_it = module_snapshot_by_slot.find(slot_id);
+                    const ModuleHealthSnapshot snap =
+                        snap_it != module_snapshot_by_slot.end() ? snap_it->second : ModuleHealthSnapshot{};
+                    if (!snap.valid) continue;
+                    any_valid = true;
+                    healthy_mask |= snap.healthy_mask;
+                    fault_mask |= snap.fault_mask;
+                    if (idx >= 0 && idx < static_cast<int>(temps.size())) {
+                        temps[static_cast<std::size_t>(idx)] = snap.temperatures_c[static_cast<std::size_t>(idx)];
+                    }
+                    if (snap.health_valid) {
+                        any_health_valid = true;
+                    }
+                    if (snap.telemetry_valid) {
+                        module_telem_valid = true;
+                        v_sum += snap.voltage_v;
+                        v_count++;
+                        i_sum += snap.current_a;
+                        p_sum += snap.power_kw;
+                    }
                 }
-                module_health_valid = snap.health_valid;
+            } else if (slot_for_conn) {
+                auto snap_it = module_snapshot_by_slot.find(slot_for_conn->id);
+                const ModuleHealthSnapshot snap =
+                    snap_it != module_snapshot_by_slot.end() ? snap_it->second : ModuleHealthSnapshot{};
+                if (snap.valid) {
+                    any_valid = true;
+                    healthy_mask = snap.healthy_mask;
+                    fault_mask = snap.fault_mask;
+                    for (std::size_t i = 0; i < snap.temperatures_c.size() && i < temps.size(); ++i) {
+                        temps[i] = snap.temperatures_c[i];
+                    }
+                    any_health_valid = snap.health_valid;
+                    if (snap.telemetry_valid) {
+                        module_telem_valid = true;
+                        v_sum = snap.voltage_v;
+                        v_count = 1;
+                        i_sum = snap.current_a;
+                        p_sum = snap.power_kw;
+                    }
+                }
+            }
+
+            if (any_valid) {
+                st.module_healthy_mask = healthy_mask;
+                st.module_fault_mask = fault_mask;
+                st.module_temp_c = temps;
+                module_health_valid = any_health_valid;
             } else {
                 module_health_valid = false;
             }
-            if (snap.telemetry_valid) {
-                module_telem_valid = true;
-                module_voltage_v = snap.voltage_v;
-                module_current_a = snap.current_a;
-                module_power_kw = snap.power_kw;
+            if (module_telem_valid && v_count > 0) {
+                module_voltage_v = v_sum / static_cast<double>(v_count);
+                module_current_a = i_sum;
+                module_power_kw = p_sum > 0.0 ? p_sum : (module_voltage_v * module_current_a) / 1000.0;
             }
         }
         const bool have_telemetry = st.last_telemetry.time_since_epoch().count() != 0;
@@ -2742,7 +2796,7 @@ void OcppAdapter::apply_power_plan() {
                     if (mod.slot_id == slot_id) {
                         mod.temperature_c = module_temp;
                         if (module_health_valid_snap) {
-                            mod.healthy = healthy_bit && g.safety_ok && !fault_bit;
+                            mod.healthy = healthy_bit && !fault_bit;
                         } else if (module_unavailable_fault_snap) {
                             mod.healthy = false;
                         }
@@ -3001,6 +3055,7 @@ void OcppAdapter::apply_power_plan() {
         info.meas_voltage = snap_it != snapshots.end()
                                 ? snap_it->second.status.present_voltage_v.value_or(last_voltage_v_[owner_id])
                                 : last_voltage_v_[owner_id];
+        const bool slot_has_modules = !slot.modules.empty();
         if (snap_it != snapshots.end()) {
             info.module_health_valid = snap_it->second.module_health_valid;
             info.module_unavailable_fault = snap_it->second.module_unavailable_fault;
@@ -3008,6 +3063,24 @@ void OcppAdapter::apply_power_plan() {
             info.module_voltage_v = snap_it->second.module_voltage_v;
             info.module_current_a = snap_it->second.module_current_a;
             info.module_power_kw = snap_it->second.module_power_kw;
+        }
+        if (module_controller_ && slot_has_modules) {
+            const auto ms_it = module_snapshot_by_slot.find(slot.id);
+            const ModuleHealthSnapshot ms =
+                ms_it != module_snapshot_by_slot.end() ? ms_it->second : ModuleHealthSnapshot{};
+            if (ms.valid) {
+                info.module_health_valid = ms.health_valid;
+                info.module_telem_valid = ms.telemetry_valid;
+                info.module_voltage_v = ms.voltage_v;
+                info.module_current_a = ms.current_a;
+                info.module_power_kw = ms.power_kw;
+            } else {
+                info.module_health_valid = false;
+                info.module_telem_valid = false;
+                info.module_voltage_v = 0.0;
+                info.module_current_a = 0.0;
+                info.module_power_kw = 0.0;
+            }
         }
         info.gun_state = gun_lookup.count(owner_id) ? gun_lookup.at(owner_id) : GunState{};
         info.disabled_by_csms = evse_disabled_.count(owner_id) ? evse_disabled_[owner_id] : false;
@@ -3019,7 +3092,6 @@ void OcppAdapter::apply_power_plan() {
                 runtime_healthy_modules++;
             }
         }
-        const bool slot_has_modules = !slot.modules.empty();
         info.modules_healthy = slot_has_modules && runtime_healthy_modules > 0;
         const int grace_ms = std::max(0, cfg_.module_health_grace_ms);
         bool module_health_ok = info.modules_healthy;
@@ -3583,35 +3655,6 @@ void OcppAdapter::apply_power_plan() {
                                             isolation_ready && dispatch.modules_assigned > 0 && module_health_ok;
         const bool slot_modules_allowed = island_modules_allowed && info.modules_final > 0;
         const int slot_module_cmd = slot_modules_allowed ? info.modules_final : 0;
-        const uint8_t slot_mask_cmd = slot_modules_allowed ? info.mask_final : 0;
-        uint8_t slot_cfg_mask = 0u;
-        for (std::size_t idx = 0; idx < slot->modules.size(); ++idx) {
-            const auto& module_id = slot->modules[idx];
-            int bit = static_cast<int>(idx);
-            const auto it = module_slot_index.find(module_id);
-            if (it != module_slot_index.end()) {
-                bit = it->second;
-            }
-            if (bit >= 0 && bit < 8) {
-                slot_cfg_mask |= static_cast<uint8_t>(1U << bit);
-            }
-        }
-        // Warmup should not be blocked by module telemetry health; warmup powers the module relays so the
-        // module can come online. Only block on safety/CP faults and welded contactors.
-        //
-        // After a transaction/session ends while the EV remains plugged in, do not keep the power modules energized:
-        // leave relays open and command the modules OFF until the next session begins.
-        bool post_stop_plugged = false;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            const auto it = post_stop_plugged_.find(c.id);
-            post_stop_plugged = it != post_stop_plugged_.end() && it->second;
-        }
-        const bool warmup_safe = status.plugged_in && !status.hlc_charge_complete && !post_stop_plugged &&
-                                 !info.disabled_by_csms && !status.cp_fault && info.gun_state.safety_ok &&
-                                 !status.gc_welded && !status.mc_welded;
-        const bool warmup = warmup_safe && !slot_modules_allowed;
-        const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
         const int gc_module_count = is_home ? dispatch.modules_assigned : slot_module_cmd;
         if (is_home && gun_for_slot > 0) {
             gun_drive_modules[gun_for_slot] = island_modules_allowed;
@@ -3619,11 +3662,8 @@ void OcppAdapter::apply_power_plan() {
             // GC close itself is gated by ΔV/current stability (open-loop safety) before reaching this point.
             gun_allow_energy[gun_for_slot] = island_modules_allowed && gc_closed_cmd;
         }
-        const bool drive_modules_for_gun =
-            gun_for_slot > 0 && gun_drive_modules.count(gun_for_slot) ? gun_drive_modules[gun_for_slot] : false;
         const bool allow_energy_for_gun =
             gun_for_slot > 0 && gun_allow_energy.count(gun_for_slot) ? gun_allow_energy[gun_for_slot] : false;
-        const bool drive_modules = slot_modules_allowed && drive_modules_for_gun;
         const bool allow_energy = slot_modules_allowed && allow_energy_for_gun;
         const bool allow_energy_home = is_home && allow_energy_for_gun;
 
@@ -3661,35 +3701,14 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
-        if (module_controller_ && slot) {
-            // Only enable module output when the planner has allocated modules for power delivery.
-            // During warmup we keep module relays closed (via the PLC) but leave module output OFF (0V/0A standby).
-            ModuleCommandRequest mreq;
-            mreq.slot_id = slot->id;
-            const double share = (dispatch.modules_assigned > 0)
-                                     ? (static_cast<double>(slot_module_cmd) /
-                                        static_cast<double>(dispatch.modules_assigned))
-                                     : 0.0;
-            bool enable = drive_modules;
-            uint8_t mask = drive_modules ? slot_mask_cmd : 0u;
-            double voltage_v = drive_modules ? dispatch.voltage_set_v : 0.0;
-            double current_a = drive_modules ? (dispatch.current_limit_a * share) : 0.0;
-            double power_kw = drive_modules ? (dispatch.p_set_kw * share) : 0.0;
-            if (warmup && warmup_mask != 0u) {
-                enable = true;
-                mask = warmup_mask;
-                voltage_v = dispatch.voltage_set_v > 0.0 ? dispatch.voltage_set_v
-                                                        : (info.meas_voltage > 0.0 ? info.meas_voltage
-                                                                                   : planner_cfg_.default_voltage_v);
-                current_a = 0.0;
-                power_kw = 0.0;
+        // Persist dynamic home-slot fault decisions (e.g., GC open timeout) back into `slot_info`
+        // so module command generation sees the same final state.
+        if (is_home) {
+            const auto info_it = slot_info.find(slot->id);
+            if (info_it != slot_info.end()) {
+                info_it->second.local_fault = local_fault;
+                info_it->second.fault_reason = info.fault_reason;
             }
-            mreq.enable = enable;
-            mreq.mask = mask;
-            mreq.voltage_v = voltage_v;
-            mreq.current_a = current_a;
-            mreq.power_kw = power_kw;
-            module_controller_->apply_command(mreq);
         }
 
         last_current_limit_a_[c.id] = cmd.current_limit_a;
@@ -3773,6 +3792,103 @@ void OcppAdapter::apply_power_plan() {
                     << "A V_set=" << cmd.voltage_set_v << " GC=" << (cmd.gc_closed ? "C" : "O")
                     << " MC=" << (cmd.mc_closed ? "C" : "O");
     }
+
+    if (module_controller_) {
+        for (const auto& slot : slots_) {
+            if (slot.modules.empty()) {
+                continue;
+            }
+            const auto info_it = slot_info.find(slot.id);
+            if (info_it == slot_info.end()) {
+                continue;
+            }
+            const auto& info = info_it->second;
+
+            const int gun_id = info.selection.gun_id;
+            const int owner_id =
+                slot_owner_connector_.count(slot.id) ? slot_owner_connector_[slot.id] : slot.gun_id;
+
+            GunDispatch dispatch{};
+            const auto disp_it = adjusted_dispatch.find(gun_id);
+            if (disp_it != adjusted_dispatch.end()) {
+                dispatch = disp_it->second;
+            } else {
+                dispatch.gun_id = gun_id;
+                dispatch.voltage_set_v = info.meas_voltage > 0.0 ? info.meas_voltage : planner_cfg_.default_voltage_v;
+                dispatch.modules_assigned = 0;
+            }
+
+            bool post_stop_plugged = false;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                const auto it = post_stop_plugged_.find(owner_id);
+                post_stop_plugged = it != post_stop_plugged_.end() && it->second;
+            }
+
+            bool local_fault = info.local_fault;
+            if (gun_id > 0 && island_fault.count(gun_id) && island_fault.at(gun_id)) {
+                local_fault = true;
+            }
+
+            const bool in_island = info.selection.in_island && gun_id > 0;
+            const bool module_health_ok = info.modules_healthy;
+            const bool slot_modules_allowed =
+                in_island && info.modules_final > 0 && !local_fault && !info.disabled_by_csms && module_health_ok &&
+                dispatch.modules_assigned > 0 && !post_stop_plugged;
+
+            const int slot_module_cmd = slot_modules_allowed ? info.modules_final : 0;
+            const uint8_t slot_mask_cmd = slot_modules_allowed ? info.mask_final : 0u;
+            uint8_t slot_cfg_mask = 0u;
+            for (std::size_t idx = 0; idx < slot.modules.size(); ++idx) {
+                const auto& module_id = slot.modules[idx];
+                int bit = static_cast<int>(idx);
+                const auto it = module_slot_index.find(module_id);
+                if (it != module_slot_index.end()) {
+                    bit = it->second;
+                }
+                if (bit >= 0 && bit < 8) {
+                    slot_cfg_mask |= static_cast<uint8_t>(1U << bit);
+                }
+            }
+
+            const bool warmup_safe = info.status.plugged_in && !info.status.hlc_charge_complete && !post_stop_plugged &&
+                                     !info.disabled_by_csms && !info.status.cp_fault && info.gun_state.safety_ok &&
+                                     !info.status.gc_welded && !info.status.mc_welded;
+            const bool warmup = warmup_safe && !slot_modules_allowed;
+            const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
+
+            const bool drive_modules_for_gun =
+                gun_id > 0 && gun_drive_modules.count(gun_id) ? gun_drive_modules.at(gun_id) : false;
+            const bool drive_modules = slot_modules_allowed && drive_modules_for_gun;
+
+            ModuleCommandRequest mreq;
+            mreq.slot_id = slot.id;
+            const double share = (dispatch.modules_assigned > 0)
+                                     ? (static_cast<double>(slot_module_cmd) /
+                                        static_cast<double>(dispatch.modules_assigned))
+                                     : 0.0;
+            bool enable = drive_modules;
+            uint8_t mask = drive_modules ? slot_mask_cmd : 0u;
+            double voltage_v = drive_modules ? dispatch.voltage_set_v : 0.0;
+            double current_a = drive_modules ? (dispatch.current_limit_a * share) : 0.0;
+            double power_kw = drive_modules ? (dispatch.p_set_kw * share) : 0.0;
+            if (warmup && warmup_mask != 0u) {
+                enable = true;
+                mask = warmup_mask;
+                voltage_v = dispatch.voltage_set_v > 0.0 ? dispatch.voltage_set_v
+                                                        : (info.meas_voltage > 0.0 ? info.meas_voltage
+                                                                                   : planner_cfg_.default_voltage_v);
+                current_a = 0.0;
+                power_kw = 0.0;
+            }
+            mreq.enable = enable;
+            mreq.mask = mask;
+            mreq.voltage_v = voltage_v;
+            mreq.current_a = current_a;
+            mreq.power_kw = power_kw;
+            module_controller_->apply_command(mreq);
+        }
+    }
 }
 
 bool OcppAdapter::safety_trip_needed(const GunStatus& status) const {
@@ -3817,7 +3933,6 @@ void OcppAdapter::apply_zero_power_plan() {
     gc_open_request_time_.clear();
     gc_switch_ready_since_.clear();
     for (const auto& c : cfg_.connectors) {
-        const Slot* slot = find_slot_for_gun(c.id);
         PowerCommand cmd;
         cmd.connector = c.id;
         cmd.module_count = 0;
@@ -3840,9 +3955,14 @@ void OcppAdapter::apply_zero_power_plan() {
             charge_point_->on_max_current_offered(c.id, 0);
             charge_point_->on_max_power_offered(c.id, 0);
         }
-        if (module_controller_ && slot) {
+    }
+    if (module_controller_) {
+        for (const auto& slot : slots_) {
+            if (slot.modules.empty()) {
+                continue;
+            }
             ModuleCommandRequest mreq;
-            mreq.slot_id = slot->id;
+            mreq.slot_id = slot.id;
             mreq.enable = false;
             mreq.mask = 0;
             mreq.voltage_v = 0.0;
