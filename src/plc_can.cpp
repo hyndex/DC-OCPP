@@ -751,7 +751,9 @@ void PlcCanHardware::update_present_tx(PlcState& st, std::chrono::steady_clock::
     const auto payload = can_contract::build_evse_present(v, i, p, st.output_enabled, st.regulating, st.fault_bits,
                                                           use_crc_);
     const bool payload_changed = !st.last_present_payload_valid || (payload != st.last_present_payload);
-    constexpr int kPresentKeepaliveMs = 1000;
+    // Keep EVSE_PRESENT at the normal cadence even when values are steady.
+    // PLC-side comm watchdogs treat this as a heartbeat and can force relays open if frames jitter >1s.
+    const int kPresentKeepaliveMs = tx_present_ms_;
     const bool allow_change_tx = elapsed >= tx_present_ms_;
     const bool allow_keepalive_tx = elapsed >= kPresentKeepaliveMs;
     if (payload_changed ? allow_change_tx : allow_keepalive_tx) {
@@ -1080,7 +1082,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_status_rx).count() >
             telemetry_timeout_ms_;
 
-    const bool relay_seen = relay_feedback && st.last_relay_rx.time_since_epoch().count() != 0;
+    const bool relay_seen = st.last_relay_rx.time_since_epoch().count() != 0;
     const bool relay_stale =
         relay_seen &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() >
@@ -1111,8 +1113,11 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
             st.last_protocol_warn = now;
         }
     }
-    const bool raw_comm_fault = status_stale || comm_missing || relay_stale || safety_stale ||
-                                (relay_feedback ? st.last_relay.comm_fault : false) || protocol_fault;
+    // RelayStatus comm_fault is transport health (not contactor aux feedback), so honor it even when
+    // relay feedback contacts are unavailable on the harness.
+    const bool relay_comm_fault = relay_seen && !relay_stale && st.last_relay.comm_fault;
+    const bool raw_comm_fault =
+        status_stale || comm_missing || relay_stale || safety_stale || relay_comm_fault || protocol_fault;
 
     // Safety inputs are only authoritative when their respective telemetry is fresh.
     const bool relay_status_fresh = relay_feedback && relay_seen && !relay_stale;
