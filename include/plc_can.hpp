@@ -141,6 +141,10 @@ private:
         std::chrono::steady_clock::time_point last_meter_rx{};
         std::chrono::steady_clock::time_point last_limits_tx{};
         std::chrono::steady_clock::time_point last_present_tx{};
+        std::array<uint8_t, 8> last_limits_payload{};
+        bool last_limits_payload_valid{false};
+        std::array<uint8_t, 8> last_present_payload{};
+        bool last_present_payload_valid{false};
         std::chrono::steady_clock::time_point last_ev_targets_rx{};
         std::chrono::steady_clock::time_point last_relay_tx{};
         std::chrono::steady_clock::time_point last_evse_present_update{};
@@ -198,6 +202,7 @@ private:
         std::chrono::steady_clock::time_point safety_trip_since{};
         std::chrono::steady_clock::time_point estop_trip_since{};
         std::chrono::steady_clock::time_point earth_trip_since{};
+        std::chrono::steady_clock::time_point comm_trip_since{};
         IdentityAssembly evccid;
         IdentityAssembly evemaid0;
         IdentityAssembly evemaid1;

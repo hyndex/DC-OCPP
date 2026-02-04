@@ -457,7 +457,9 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
         flow.auth_pending_since = std::chrono::steady_clock::time_point{};
     }
 
-    out.desired_digital = status.plugged_in && !post_stop_plugged && (autocharge_start || session_authorized);
+    // Advertise digital communication (SLAC/ISO15118/DIN) as soon as the EV is plugged in so the PLC can
+    // reach the authorization stage and, for AutoCharge, publish the EV identity (e.g., MAC) early.
+    out.desired_digital = status.plugged_in && !post_stop_plugged;
     if (flow.pnc_blocked && !session_authorized) {
         out.desired_digital = false;
     }
@@ -3375,12 +3377,12 @@ void OcppAdapter::apply_power_plan() {
                 mc_open_pending_.erase(slot.id);
                 mc_open_request_time_.erase(slot.id);
                 gated = desired;
-            } else {
-                const Slot* cw = find_slot(slots_, slot.cw_id);
-                const int island_a =
-                    telemetry_slot_to_island.count(slot.id) ? telemetry_slot_to_island.at(slot.id) : 0;
-                const int island_b =
-                    cw && telemetry_slot_to_island.count(cw->id) ? telemetry_slot_to_island.at(cw->id) : 0;
+	            } else {
+	                const Slot* cw = find_slot(slots_, slot.cw_id);
+	                const int island_a =
+	                    telemetry_slot_to_island.count(slot.id) ? telemetry_slot_to_island.at(slot.id) : 0;
+	                const int island_b =
+	                    cw && telemetry_slot_to_island.count(cw->id) ? telemetry_slot_to_island.at(cw->id) : 0;
                 const auto isl_a_it = telemetry_by_island.find(island_a);
                 const auto isl_b_it = telemetry_by_island.find(island_b);
                 IslandTelemetryLite telem_a{};
@@ -3390,16 +3392,35 @@ void OcppAdapter::apply_power_plan() {
                     telem_a.voltage_v = isl_a_it->second.voltage_v;
                     telem_a.current_a = isl_a_it->second.current_a;
                 }
-                if (isl_b_it != telemetry_by_island.end()) {
-                    telem_b.complete = isl_b_it->second.telemetry_complete;
-                    telem_b.voltage_v = isl_b_it->second.voltage_v;
-                    telem_b.current_a = isl_b_it->second.current_a;
-                }
-                bool merge_ok = true;
-                if (desired == ContactorState::Closed && prev == ContactorState::Open &&
-                    island_a > 0 && island_b > 0 && island_a != island_b) {
-                    const int gc_a =
-                        island_gc_request_count.count(island_a) ? island_gc_request_count.at(island_a) : 0;
+	                if (isl_b_it != telemetry_by_island.end()) {
+	                    telem_b.complete = isl_b_it->second.telemetry_complete;
+	                    telem_b.voltage_v = isl_b_it->second.voltage_v;
+	                    telem_b.current_a = isl_b_it->second.current_a;
+	                }
+	                // Some topologies include "pass-through" slots that have neither modules nor a gun.
+	                // Those islands have no telemetry source of their own, but we still model an MC contactor
+	                // for the segment (e.g., a bus tie / bypass). If we require telemetry on both sides, the
+	                // MC can deadlock open forever, blocking GC closure and any charging attempt.
+	                //
+	                // Treat MC edges into telemetry-less islands as a single-sided switch: use the known-side
+	                // telemetry for both ends so we still enforce current gating and avoid dv checks against a
+	                // non-existent measurement point.
+	                const bool island_b_has_telem =
+	                    island_b != 0 && telemetry_island_slots.count(island_b) &&
+	                    std::any_of(telemetry_island_slots.at(island_b).begin(),
+	                                telemetry_island_slots.at(island_b).end(),
+	                                [&](int sid) {
+	                                    const Slot* s = find_slot(slots_, sid);
+	                                    return s && (!s->modules.empty() || s->gun_id > 0);
+	                                });
+	                if (!cw || island_b == 0 || !island_b_has_telem) {
+	                    telem_b = telem_a;
+	                }
+	                bool merge_ok = true;
+	                if (desired == ContactorState::Closed && prev == ContactorState::Open &&
+	                    island_a > 0 && island_b > 0 && island_a != island_b) {
+	                    const int gc_a =
+	                        island_gc_request_count.count(island_a) ? island_gc_request_count.at(island_a) : 0;
                     const int gc_b =
                         island_gc_request_count.count(island_b) ? island_gc_request_count.at(island_b) : 0;
                     if (gc_a + gc_b > 1) {
@@ -3743,18 +3764,39 @@ void OcppAdapter::apply_power_plan() {
                              dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
         if (gc_closed_cmd && is_home && !status.relay_closed) {
             if (!isolation_ready) {
+                static std::map<std::string, std::chrono::steady_clock::time_point> last_isolation_log;
+                auto& last_log = last_isolation_log[slot->gc_id];
+                const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
+                                       ((now - last_log) >= std::chrono::milliseconds(500));
+                if (allow_log) {
+                    EVLOG_info << "GC close blocked by isolation_ready=0"
+                               << " connector=" << c.id
+                               << " gc=" << slot->gc_id
+                               << " mc_desired=" << (info.desired_mc_state == ContactorState::Closed ? "C" : "O")
+                               << " mc_actual=" << (mc_closed_cmd ? "C" : "O")
+                               << " switching_island=" << (switching_islands.count(current_island) ? "1" : "0")
+                               << " island=" << current_island;
+                    last_log = now;
+                }
                 gc_closed_cmd = false;
                 power_constrained_[c.id] = true;
             }
             bool safe_close = false;
+            bool telem_complete = false;
+            double island_v = 0.0;
+            double island_i = 0.0;
+            double v_target = 0.0;
+            double dv = 0.0;
             if (tie_mode && current_island > 0) {
                 const auto telem_it = telemetry_by_island.find(current_island);
                 if (telem_it != telemetry_by_island.end() && telem_it->second.telemetry_complete) {
-                    const double v_target = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : info.meas_voltage;
+                    telem_complete = true;
+                    island_v = telem_it->second.voltage_v;
+                    island_i = telem_it->second.current_a;
+                    v_target = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : info.meas_voltage;
                     if (v_target > 0.0) {
-                        const double dv = std::fabs(telem_it->second.voltage_v - v_target);
-                        if (dv <= gc_close_max_dv &&
-                            std::fabs(telem_it->second.current_a) < switch_i_thresh) {
+                        dv = std::fabs(island_v - v_target);
+                        if (dv <= gc_close_max_dv && std::fabs(island_i) < switch_i_thresh) {
                             safe_close = true;
                         }
                     }
@@ -3781,6 +3823,37 @@ void OcppAdapter::apply_power_plan() {
                 gc_closed_cmd = false;
                 if (is_home) {
                     power_constrained_[c.id] = true;
+                }
+                const auto ready_it = gc_switch_ready_since_.find(slot->gc_id);
+                const double ready_ms =
+                    (ready_it != gc_switch_ready_since_.end() && ready_it->second.time_since_epoch().count() != 0)
+                        ? static_cast<double>(
+                              std::chrono::duration_cast<std::chrono::milliseconds>(now - ready_it->second).count())
+                        : 0.0;
+                // When the EV is requesting power but GC cannot be closed, log the gating inputs so we can
+                // diagnose deadlocks between ISO15118 precharge/current-demand and contactor control.
+                static std::map<std::string, std::chrono::steady_clock::time_point> last_gc_block_log;
+                auto& last_log = last_gc_block_log[slot->gc_id];
+                const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
+                                       ((now - last_log) >= std::chrono::milliseconds(500));
+                if (allow_log) {
+                    EVLOG_info << "GC close gated"
+                               << " connector=" << c.id
+                               << " gc=" << slot->gc_id
+                               << " desired=" << (info.desired_gc_state == ContactorState::Closed ? "C" : "O")
+                               << " isolation_ready=" << (isolation_ready ? "1" : "0")
+                               << " tie_mode=" << (tie_mode ? "1" : "0")
+                               << " island=" << current_island
+                               << " telem_complete=" << (telem_complete ? "1" : "0")
+                               << " V_island=" << island_v
+                               << " I_island=" << island_i
+                               << " V_target=" << v_target
+                               << " dv=" << dv
+                               << " dv_max=" << gc_close_max_dv
+                               << " i_max=" << switch_i_thresh
+                               << " stable_ms=" << stable_ms.count()
+                               << " ready_ms=" << ready_ms;
+                    last_log = now;
                 }
             }
         } else {
@@ -4031,15 +4104,15 @@ void OcppAdapter::apply_power_plan() {
                 }
             }
 
-            const bool warmup_safe = info.status.plugged_in && !info.status.hlc_charge_complete && !post_stop_plugged &&
-                                     !info.disabled_by_csms && !info.status.cp_fault && info.gun_state.safety_ok &&
-                                     !info.status.gc_welded && !info.status.mc_welded;
-            const bool warmup = warmup_safe && !slot_modules_allowed;
-            const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
-
             const bool drive_modules_for_gun =
                 gun_id > 0 && gun_drive_modules.count(gun_id) ? gun_drive_modules.at(gun_id) : false;
             const bool drive_modules = slot_modules_allowed && drive_modules_for_gun;
+
+            const bool warmup_safe = info.status.plugged_in && !info.status.hlc_charge_complete && !post_stop_plugged &&
+                                     !info.disabled_by_csms && !info.status.cp_fault && info.gun_state.safety_ok &&
+                                     !info.status.gc_welded && !info.status.mc_welded;
+            const bool warmup = warmup_safe && !drive_modules;
+            const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
 
             ModuleCommandRequest mreq;
             mreq.slot_id = slot.id;
