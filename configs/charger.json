@@ -15,7 +15,7 @@
     {
       "id": 1,
       "maxCurrentA": 200,
-      "maxPowerW": 60000,
+      "maxPowerW": 30000,
       "maxVoltageV": 1000,
       "minVoltageV": 200,
       "meterSource": "module",
@@ -23,7 +23,7 @@
     }
   ],
   "databaseDir": "../data/db",
-  "gridLimitKW": 720,
+  "gridLimitKW": 30,
   "loggingConfig": "../libocpp/config/logging.ini",
   "messageLogPath": "../logs",
   "meterSampleIntervalSeconds": 15,
@@ -73,24 +73,15 @@
           "pollMs": 1000,
           "cmdIntervalMs": 1000,
           "telemetryStaleMs": 3000
-        },
-        {
-          "address": 2,
-          "group": 0,
-          "id": "M1_1",
-          "mn": "MN_1_1",
-          "ratedPowerKW": 30,
-          "type": "maxwell-mxr",
-          "pollMs": 1000,
-          "cmdIntervalMs": 1000,
-          "telemetryStaleMs": 3000
         }
       ]
     }
   ],
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
-    "powerRequestSeconds": 600
+    "powerRequestSeconds": 600,
+    "hlcAuthorizationSeconds": 150,
+    "pncBlockSeconds": 1200
   },
   "userConfig": "../data/user_config.json"
 }

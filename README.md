@@ -1,296 +1,160 @@
-OCPP DC charger integration scaffold
-====================================
+# Joulepoint DC OCPP Controller (PLC/CAN)
 
-This project wires up a multi‑gun DC charger against libocpp (https://github.com/EVerest/libocpp) and provides a thin orchestration layer you can extend with real hardware controls. The focus is OCPP 1.6 with N connectors (“guns”) and a small simulated hardware backend so you can exercise the protocol end‑to‑end.
+This repo contains the DC charger controller that integrates libocpp (OCPP 1.6) with a PLC front-end over SocketCAN. It manages connector state, authorization, sessions, and module power planning for split-charging topologies.
 
-Architecture at a glance
-------------------------
-- One controller (this repo) ↔ multiple PLC nodes, one PLC per connector/gun.
-- Each PLC (Ref/Basic firmware) exposes 1 gun relay + 2 auxiliary relays; controller treats each PLC as one connector.
-- Vehicle ↔ PLC (CP/SLAC/ISO15118) ↔ Controller (OCPP/auth/energy planner) ↔ Modules (CAN).
-- Controller owns OCPP, auth, session lifecycle, and power planning; PLC owns IEC61851/SLAC/ISO15118 timing and safety IO.
-- Ring/islanding + module sharing: split charging uses the 2 auxiliary relays as **KM_A/KM_B**
-  bus sectionalizers (module-level cut points) so modules can be shared across guns. Without aux feedback,
-  contactor switching is gated by module telemetry (ΔV + low current).
+Highlights
+- OCPP 1.6 adapter (libocpp submodule, currently pinned to v0.31.1).
+- `dc_ocpp` runs only with the PLC CAN backend (no simulated hardware path in the current binary).
+- Multi-connector support; each connector maps to a PLC node via `plcId`.
+- Split charging with KM_A/KM_B tie contactors and module sharing.
+- Module CAN drivers: `maxwell-mxr`, `maxwell`, `maxwell-max`, `maxwell-enr`, `enr`, `uugreen`, `uugreenpower`, `tonhe`.
+- Single source of truth config in `configs/charger.json` (inline `ocpp` or `ocppConfig` base file).
 
-What’s here
------------
-- `libocpp/` fetched from upstream for the OCPP 1.6/2.0.1 stack
-- CMake project that builds a single binary `dc_ocpp`
-- Configuration files under `configs/` with defaults for a 2‑gun DC charger
-- Adapter code that:
-  - boots libocpp with the provided config and schemas
-  - registers all required callbacks for remote control, reservations, firmware/log uploads, etc.
-  - exposes hooks to push meter values, errors, and session lifecycle from your EVSE controller
-  - includes a lightweight simulated hardware implementation for local testing
-  - optional CAN/PLC backend (per Ref/Basic/docs/CAN_DBC.dbc) for real guns via SocketCAN
+Architecture (high level)
+- Vehicle <-> PLC (IEC 61851 / SLAC / ISO 15118 / DIN stack)
+- PLC <-> controller over CAN (SocketCAN, 29-bit extended IDs, 125 kbps)
+- Controller handles OCPP, authorization, sessions, power planning, and module dispatch
+- Power modules talk over CAN (module drivers live in `src/power_module_controller.cpp`)
 
-Prerequisites
--------------
-- CMake ≥ 3.16 and a C++17 compiler
-- Dependencies used by libocpp (install via your package manager):
-  - OpenSSL 3, libwebsockets, SQLite3, Boost (program_options, regex, thread)
-  - nlohmann-json, nlohmann-json-schema-validator
-  - everest-log, everest-timer, everest-evse_security, everest-sqlite
-- Network access to your CSMS endpoint
-
-Build
------
-This repository uses a pinned libocpp submodule (`v0.31.1`). After cloning, make sure submodules are initialized:
+Quick start
+1) Init submodules:
 ```bash
 git submodule update --init --recursive
 ```
-
+2) Build:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-If you only need the runtime binary (and want to avoid building all test targets), build just `dc_ocpp`:
-```bash
 cmake --build build --target dc_ocpp -j
 ```
-or use `./scripts/build_dc_ocpp.sh`.
-
-The root CMake script fetches `everest-cmake` automatically. If your dependencies are installed in non‑standard locations, append them to `CMAKE_PREFIX_PATH`.
-
-Optional unit tests for the planner:
+3) Edit `configs/charger.json` (see config section below).
+4) Run:
 ```bash
-cmake --build build -j --target power_manager_tests
-./build/power_manager_tests
+./build/dc_ocpp -c configs/charger.json
 ```
 
-Raspberry Pi OS (Docker) builds
--------------------------------
-- Requires Docker Desktop with buildx/qemu enabled (`docker buildx ls` should show `linux/arm64`); no cross toolchain setup needed on the host.
-- Build arm64 artifacts (default): `./docker/build-rpi.sh` → binaries land in `build-rpi/artifacts/bin/` with configs under `build-rpi/artifacts/share/`.
-- 32-bit Pi OS: `PLATFORM=linux/arm/v7 ./docker/build-rpi.sh`.
-- Enable the config web UI (installs WebKit/GTK inside the image): `BUILD_CONFIG_WEB_UI=ON ./docker/build-rpi.sh`.
-- Cross build directly with CMake presets (uses the Raspberry Pi toolchain + Ninja): `cmake --preset rpi-arm64 && cmake --build --preset rpi-arm64 -j` (swap `rpi-armhf` for 32-bit).
-- If you prefer explicit flags, the equivalent manual cross build is: `cmake -S . -B build-rpi -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/raspberrypi.cmake -DRPI_ARCH=armhf -DCMAKE_BUILD_TYPE=Release && cmake --build build-rpi -j`.
-- Copy the `build-rpi/artifacts` directory to your Pi; make sure runtime deps (`libssl-dev`, `libsqlite3-dev`, `libcurl4-openssl-dev`, `libboost-log-dev`, `libwebsockets-dev`) are installed on the target.
-
-Run
----
-1. Set CSMS + charger identity in `configs/charger.json`:
-   - `chargePoint.centralSystemURI` and `ocpp.Internal.CentralSystemURI`
-   - `chargePoint.id` / `ocpp.Internal.ChargePointId`
-   - Size `connectors[]` and `slots[]` to your hardware; connector IDs must start at 1.
-   - Paths in `configs/charger.json` are resolved relative to the file, and default to the repo’s top-level `libocpp`, `data`, and `logs` directories.
-2. Build if you have not already:
-   ```bash
-   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-   cmake --build build -j
-   ```
-3. Run in the foreground:
-   ```bash
-   ./build/dc_ocpp --config configs/charger.json
-   ```
-   - On non-Linux hosts without SocketCAN, the PLC backend falls back to simulated hardware automatically.
-   - Logs stream to stdout and to `logs/dc_ocpp.log`; libocpp DB lives under `data/db`.
-4. Run in the background (capture PID for stopping later):
-   ```bash
-   nohup ./build/dc_ocpp --config configs/charger.json > logs/dc_ocpp.log 2>&1 & echo $!
-   tail -f logs/dc_ocpp.log
-   ```
-
-Stop
-----
-- If running in the foreground, press Ctrl+C.
-- If running in the background, stop by PID:
-  ```bash
-  kill <pid>
-  ```
-  or stop all matching processes:
-  ```bash
-  pkill -f "dc_ocpp --config configs/charger.json"
-  ```
-
-Config editor web UI
---------------------
-- A lightweight C++/WebKit editor (`config_webui` target) mirrors the config-guardian layout so you can view, validate, and save `configs/charger.json` with automatic backups under `configs/backups/`.
-- Build the helper:
-  ```bash
-  cmake --build build -j --target config_webui
-  ```
-- Launch (opens a WebKit window; use `--headless` to keep only the local server):
-  ```bash
-  ./build/config_webui --config configs/charger.json --assets webui --port 8844 --host 0.0.0.0
-  ```
-- The UI validates before save, keeps automatic backups under `configs/backups/`, and can restore any backup from the JSON/Backups tab.
-- Dependencies: macOS uses system WebKit; Linux requires `pkg-config` plus `webkit2gtk` + `gtk3` development packages for the webview backend.
-- mDNS: if `dns_sd.h`/`libdns_sd` (Bonjour/Avahi compat) are available, the server advertises `_http._tcp` using your `chargePoint.id` (e.g., `jyotisman.local`). Disable with `--no-mdns` or override labels with `--mdns-name` / `--mdns-host`.
-- To reach via `<chargePoint.id>.local`, ensure mDNS is enabled on your LAN (Bonjour/Avahi); the server binds to `--host` (default `0.0.0.0`) so other devices can reach it on the advertised port.
-- Flags: `--host`/`--bind` override the bind address, `--port` sets the HTTP port, `--headless` skips opening a window, `--assets` points to a static dir, `--config` sets the target JSON path.
-
-PLC/CAN notes
--------------
-- For real PLC/CAN hardware, set `"usePLC": true`, configure `"canInterface"`, and map each connector’s `plcId`. Current firmware/DBC includes `plcId` in TX IDs so multiple PLCs can share one CAN interface as long as each has a unique `plcId`.
-- On macOS or other hosts without SocketCAN, the process stays in simulated mode for end-to-end OCPP without field IO.
-- For Waveshare USB-CAN-B adapters (ControlCAN-based), use the provided bridge to expose a SocketCAN interface; see `docs/waveshare_usb_can_b.md`.
-
-Project layout
---------------
-- `configs/charger.json` – single source of charger + OCPP settings (connectors, URIs, paths, `ocpp` block). You can still point `ocppConfig` to a custom external file if you maintain one privately.
-- `src/` and `include/` – adapter, config loader, simulated hardware, and the main entrypoint
-- `data/` – placeholder certificate/key directories and user config file location
-- `logs/` – message log output
+Notes
+- `dc_ocpp` exits if `chargePoint.usePLC` is false.
+- The CAN interface must exist (e.g., `can0`) or the PLC backend will fail to start.
 
 Build prerequisites
-- Boost (program_options, regex, thread) must be installed and discoverable by CMake.
-- SocketCAN support is required for PLC mode (Linux).
+- CMake >= 3.16 and a C++17 compiler
+- Boost: log, log_setup, filesystem, thread, regex, date_time
+- OpenSSL, libcurl, SQLite3
+- libwebsockets
+- `pkg-config` + `webkit2gtk` + `gtk3` (only when building `config_webui`)
 
-Next steps to hook up real hardware
------------------------------------
-- Replace `SimulatedHardware` with calls into your EVSE controller (contactor control, meter reads, lock control).
-- Call the `OcppAdapter` methods when real events occur:
-  - `push_meter_values(connector, measurement)` on each meter sample
-  - `begin_transaction(...)` / `finish_transaction(...)` when charging starts/stops
-  - `report_fault(...)` / `clear_faults(...)` for error handling
-- Populate the certificate bundles in `data/certs` with production CA chains and keys.
-- Adjust sampling intervals and charging limits per connector in `configs/charger.json`.
+CMake fetches several deps automatically (everest-cmake, everest-log, everest-timer, everest-evse_security, everest-sqlite, nlohmann-json, json-schema-validator, date) when not available locally.
 
-PLC / CAN contract (summary)
-----------------------------
-Full specification lives in `Ref/Basic/docs/CAN_DBC.dbc` with narrative in `Ref/Basic/docs/can_dbc_overview.md`. Key points:
-
-- **Bus**: 29-bit extended IDs, 125 kbps. Low nibble encodes `plcId` (0–15) on both TX and RX IDs. CRC8 (poly 0x07, init 0x00) is required on RelayControl/RelayStatus/SafetyStatus/GCMC_Command/GCMC_Status/ConfigCmd/ConfigAck and EVSE_DC_MAX_LIMITS/EVSE_DC_PRESENT (byte7).
-- **RX IDs (host → PLC)**  
-  - `RelayControl`: `0x0300 | ((0x4<<4)|plcId)` — safety-critical. Signals: `RLY1_CMD`, `SYS_ENABLE`, `FORCE_ALL_OFF`, `CLEAR_FAULTS`, `CMD_SEQ`, enable mask, mode, pulse_ms, CRC. Timeout ≈3000 ms forces relays off and faults.
-  - `ConfigCmd`: `0x0300 | ((0x8<<4)|plcId)` — runtime config get/set. Signals: `CFG_PARAM_ID`, `CFG_OP`, `CFG_VALUE`, reserved, CRC.
-  - `GCMC_Command`: `0x0300 | ((0x9<<4)|plcId)` — GC/MC/MN command mask + force-off/clear (maps onto existing relays for current hardware).
-- **TX IDs (PLC → host)**  
-  - `RelayStatus`: `0x0100 | ((0x6<<4)|plcId)` — relay states, switches, `SAFETY_OK`, `EARTH_FAULT`, `ESTOP_INPUT`, `FAULT_REASON`, `LAST_CMD_SEQ_APPLIED`, `COMM_FAULT`, CRC.  
-  - `SafetySwitchStatus`: `0x0100 | ((0x9<<4)|plcId)` — debounced switch states, estop, safety_ok, earth_fault, mask, CRC.  
-  - `EnergyMeterData`: `0x0100 | ((0x7<<4)|plcId)` — multiplexed:  
-    - MUX0: flags `METER_OK/COMM_ERROR/DATA_STALE/OVERRANGE/FALLBACK_ACTIVE`, `VOLTAGE_0p1V`, signed `CURRENT_0p01A`, signed `ACTIVE_POWER_0p01kW`  
-    - MUX1: same flags, `IMPORT_ENERGY_0p1kWh`, `FREQ_0p01Hz`  
-  - `ConfigAck`: `0x0100 | ((0xA<<4)|plcId)` — echoes param/status/value/plcId, CRC.  
-  - `GCMC_Status`: `0x0100 | ((0x5<<4)|plcId)` — GC/MC/MN command/feedback bits, fault reason, comm/safety flags, seqs.
-  - Additional TX for CP/V2G telemetry (CP_Voltage_Levels, ChargingSession, RTEVLog/RTTLog, EVDC_* limits/targets) are defined in the DBC; firmware may publish them as available.
-  - Identity frames now include EVCCID/EMAID0/EMAID1 **and EVMAC** (AutoCharge MAC) using segmented 5-byte payloads.
-  - ChargeInfo flags include `auth_granted`, `auth_pending`, and `lock_engaged` in addition to HLC stage flags.
-- **Fault semantics**: Relay timeout/bus-off/CRC fail drive `FAULT_REASON` and `COMM_FAULT`, force relays off. Estop/earth faults clear safety_ok. Remote force-off flagged separately. Missing RX beyond timeout sets comm_fault.
-- **Driver behavior (current code)**:
-  - SocketCAN filters per PLC ID, error-frame handling (bus-off/restart), CRC8 verification enforced on required frames.
-  - Safety debounced; relay commands expect `CMD_SEQ` ack with retry/backoff (3 attempts) then fault.
-  - Meter staleness timeout 2 s; comm faults propagate to OCPP faults; ConfigAck logged.
-  - Single CAN interface per config (one socket), multiple PLCs allowed via distinct `plcId`.
-
-OCPP adapter behavior (current)
--------------------------------
-- Per-connector state tracking drives `StatusNotification`:
-  - Plug-in with/without session → Preparing; post-stop while still plugged or HLC charge complete → Finishing; Charging/SuspendedEV/Evse as appropriate.
-  - Faulted on safety/estop/earth/comm/meter-stale/weld; clears to Available when healthy.
-  - Seamless retry tolerance: brief CP/B1-B2 drops or quick unplug/replug within 8s keep the session and avoid Finishing.
-- Auth pipeline:
-  - Pending auth pushed to PLC (AuthorizationState::Pending) so PLC can reply ISO15118 AuthorizationRes=Ongoing.
-  - Tokens flow from RFID/RemoteStart/Autocharge (EVCCID/EMAID/EVMAC), with 10s dedup and 24h local auth cache for offline acceptance.
-  - Reservations enforced: sessions won’t start without matching idTag/parentId.
-- Transaction start aligned with ISO15118 HLC `PowerDelivery` readiness, CP state, and lock feedback to prevent premature energy delivery or OCPP transaction start.
-- Safety gating: all faults auto-stop transactions and disable connector; weld/isolation/lock faults mapped to precise OCPP error codes.
-- Metering/control loop: 200 ms supervisor for state/fault/auth handling; meter push interval per connector; monotonic energy enforcement; meter-stale triggers fault; PLC/shunt source selectable.
-- Firmware/diagnostics/log uploads: emit progress notifications (Downloading/Installing/Installed, Uploading/Uploaded); log bundling and HTTPS/file upload supported.
-
-Configuration notes
--------------------
-- `configs/charger.json` fields:
-  - `chargePoint` block: `id`, `vendor`, `model`, `firmwareVersion`, `centralSystemURI`, `usePLC`, `canInterface`.
-- `plc` block: `useCRC8` (retained for compatibility; host enforces CRC8 on required frames),
-  `requireHttpsUploads` (enforce HTTPS when pushing diagnostics/log bundles), `moduleRelaysEnabled`
-  (drive PLC auxiliary relays as KM_A/KM_B bus cuts), `relayMode` (must be `ties` for split charging),
-  and `relayFeedbackAvailable` (set false when no aux feedback is wired; controller assumes actuation succeeded).
-- `connectors[]`: `id`, `plcId`, `label`, `maxCurrentA`, `maxPowerW`, `maxVoltageV`, optional `canInterface`,
-  `meterSampleIntervalSeconds`, `requireLock`, `lockInputSwitch` (1-4 switch input for lock feedback),
-  `meterSource` (`plc`, `shunt`, or `module`), `meterScale`, `meterOffsetWh`, `minVoltageV`.
-- `slots[]` (optional explicit ring topology): `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`, and `modules[]` each with
-    `id` and `mn` contactor id. Modules can also carry a `type` (e.g. `"maxwell-mxr"`), `address` (0–63),
-    `group`, optional per-module `canInterface`, and optional `ratedPowerKW`/`ratedCurrentA` to drive vendor-specific
-    CAN drivers. Additional optional fields: `pollMs`, `cmdIntervalMs` (min 100 ms), `broadcast` (send via group/global
-    broadcast DST). If omitted, slots/modules are auto-generated per connector. CW/CCW neighbors must reference existing
-    slot IDs (or be 0 for line ends / single-slot systems).
-  - **Split charging topology**: modules are expanded into module‑level ring segments in CW order; `modules[0]` is the
-    gun’s home segment and `modules[1]` is the adjacent segment. KM_A maps to the `modules[0]` boundary (relay bit0),
-    KM_B maps to the `modules[1]` boundary (relay bit1). Opening either KM isolates that segment from the ring.
-  - **Missing modules**: if a PLC has only one module configured, the missing module slot is treated as a pass‑through
-    segment (no module capacity, no telemetry) while KM_A/KM_B topology control remains intact.
-  - **Telemetry fallback**: tie/GC switching gates use module telemetry when available, and fall back to the gun’s
-    PLC‑reported voltage/current when a module segment has no telemetry. Slots with no modules and no gun are kept
-    closed (no switching) to avoid unmeasured island boundaries.
-  - **mc field note**: in split‑charging mode the controller derives KM identifiers from module IDs; `slots[].mc` is
-    retained for schema compatibility but is not used to drive relay masks.
-- `modulePowerKW` (per DC module rating), `gridLimitKW` (site-wide limit), and `defaultVoltageV` drive the power
-  allocator for the 12-slot ring (2 modules/slot, 12 guns by default in config).
-  - Sample config maps 24 Maxwell MXR modules on `can0`, group `0`, addresses `0`–`23` (two per slot).
-  - Module config validation: when `type` is set, `address` must be 0–63 and unique per `canInterface`+`group`; `group`
-    is clamped to 0–60; `ratedPowerKW` defaults to `modulePowerKW` when omitted. Broadcast mode allows addresses 0xFE/0xFF.
-- `security`: CA bundle paths and key/cert directories (ensure populated for TLS/OCPP security profiles).
-- PLC constraints: unique `plcId` per connector; a single CAN interface is enforced by the host driver.
-- `timeouts.plcPresentWarnMs` / `timeouts.plcLimitsWarnMs` also tune controller TX cadence for
-  `EVSE_DC_PRESENT` / `EVSE_DC_MAX_LIMITS` frames (controller sends at or faster than these warning windows).
-
-Example split‑charging config (4 guns / 8 modules)
---------------------------------------------------
-```json
-{
-  "plc": {
-    "relayMode": "ties",
-    "moduleRelaysEnabled": true,
-    "gunRelayOwnedByPlc": false,
-    "relayFeedbackAvailable": false
-  },
-  "planner": {
-    "allowCrossSlotIslands": true,
-    "tieCloseMaxDeltaV": 20,
-    "switchMaxCurrentA": 2,
-    "switchStableTimeMs": 200
-  },
-  "connectors": [
-    { "id": 1, "plcId": 0 }, { "id": 2, "plcId": 1 },
-    { "id": 3, "plcId": 2 }, { "id": 4, "plcId": 3 }
-  ],
-  "slots": [
-    { "id": 1, "gunId": 1, "cw": 2, "ccw": 4, "gc": "GC_1", "mc": "MC_1",
-      "modules": [ { "id": "M1_0", "mn": "MN_1_0", "address": 0, "group": 0, "type": "maxwell-mxr" },
-                   { "id": "M1_1", "mn": "MN_1_1", "address": 1, "group": 0, "type": "maxwell-mxr" } ] },
-    { "id": 2, "gunId": 2, "cw": 3, "ccw": 1, "gc": "GC_2", "mc": "MC_2",
-      "modules": [ { "id": "M2_0", "mn": "MN_2_0", "address": 2, "group": 0, "type": "maxwell-mxr" },
-                   { "id": "M2_1", "mn": "MN_2_1", "address": 3, "group": 0, "type": "maxwell-mxr" } ] },
-    { "id": 3, "gunId": 3, "cw": 4, "ccw": 2, "gc": "GC_3", "mc": "MC_3",
-      "modules": [ { "id": "M3_0", "mn": "MN_3_0", "address": 4, "group": 0, "type": "maxwell-mxr" },
-                   { "id": "M3_1", "mn": "MN_3_1", "address": 5, "group": 0, "type": "maxwell-mxr" } ] },
-    { "id": 4, "gunId": 4, "cw": 1, "ccw": 3, "gc": "GC_4", "mc": "MC_4",
-      "modules": [ { "id": "M4_0", "mn": "MN_4_0", "address": 6, "group": 0, "type": "maxwell-mxr" },
-                   { "id": "M4_1", "mn": "MN_4_1", "address": 7, "group": 0, "type": "maxwell-mxr" } ] }
-  ]
-}
+Helper script
+```bash
+./scripts/build_dc_ocpp.sh
 ```
 
-Planner/allocator overview
---------------------------
-- Fast planner thread (100 ms) computes power budgets, discrete module picks, and island MC/MN/GC commands.
-- Supports cross-slot borrowing to build multi-slot islands when a gun’s home slot lacks healthy modules (non-overlapping,
-  contiguous expansion).
-- Thermal-aware derating on connector temperature and module over-temp trip, with weld/isolation/safety gating before
-  energizing.
-- Logging emits per-cycle dispatch summaries for observability; unit tests for the planner live in `tests/`.
+Run helpers
+- `./scripts/dc_ocpp_run.sh` (uses `DC_OCPP_BIN` and `DC_OCPP_CONFIG` if set)
+- `./scripts/install_systemd_service.sh` (Linux systemd unit using `dc_ocpp_run.sh`)
 
-Operational playbooks
----------------------
+Config reference (charger.json)
+Paths are resolved relative to the config file location. The loader creates missing directories and initializes `userConfig` if needed. Values persisted via OCPP ChangeConfiguration are stored in `userConfig` and merged into the base config on startup.
+
+Top-level sections
+- `chargePoint`
+  - `id`, `vendor`, `model`, `firmwareVersion`
+  - `centralSystemURI` or `ocppEndpointToBackend` (the latter overrides ID + URI from the URL path)
+  - `usePLC`/`usePlc` (must be true for `dc_ocpp`), `canInterface` (default CAN interface)
+  - Optional identity fields: `chargePointSerialNumber`, `meterSerialNumber`, `meterType`, `iccid`, `imsi`, `imei`, `apn`
+- `controller`
+  - `freeMode` (auto-authorize on plug-in)
+  - `defaultTag` (token used when `freeMode` is true)
+- `connectors[]`
+  - `id` (1..N, unique), `plcId` (0..15, unique; default `id-1`)
+  - `label`, `canInterface` (optional override), `maxCurrentA`, `maxPowerW`, `maxVoltageV`, `minVoltageV`
+  - `meterSampleIntervalSeconds`, `meterSource` (`plc` | `module` | `shunt`)
+  - `meterScale`, `meterOffsetWh`, `requireLock`, `lockInputSwitch` (1..4)
+- `plc`
+  - `enabled` (defaults true), `useCRC8`
+  - `gunRelayOwnedByPlc` (must be false for split charging), `moduleRelaysEnabled` (must be true)
+  - `relayMode` (only `ties` is supported), `relayFeedbackAvailable`
+  - `autochargeIdSource` (`evmac`, `evccid`, `emaid`)
+  - `requireHttpsUploads` (enforces HTTPS for OCPP uploads; PLC backend rejects uploads by default)
+- `slots[]` (optional explicit topology; auto-generated if omitted)
+  - `id`, `gunId`, `gc`, `mc`, `cw`, `ccw`
+  - `modules[]` with per-module metadata
+- `planner` / `siteLimits` / top-level planner fields
+  - `modulePowerKW`, `gridLimitKW`, `defaultVoltageV`
+  - `allowCrossSlotIslands`, `maxModulesPerGun`, `minModulesPerActiveGun`, `maxIslandRadius`
+  - `minModuleHoldMs`, `minMcHoldMs`, `minGcHoldMs`
+  - `mcOpenCurrentA`, `gcOpenCurrentA`, `tieCloseMaxDeltaV`, `switchMaxCurrentA`, `switchStableTimeMs`
+  - `prechargeTimeoutMs`, `prechargeVoltageToleranceV`
+- `timeouts`
+  - `authorizationSeconds`, `hlcAuthorizationSeconds` (clamped to 150s), `pncBlockSeconds`
+  - `powerRequestSeconds`, `evseLimitAckMs`, `telemetryTimeoutMs`
+  - `plcPresentWarnMs`, `plcLimitsWarnMs`
+- `uploads`
+  - `maxBytes`, `connectTimeoutSeconds`, `transferTimeoutSeconds`, `allowFileTargets`
+- `security`
+  - `csmsCaBundle`, `moCaBundle`, `v2gCaBundle`
+  - `clientCertDir`, `clientKeyDir`, `seccCertDir`, `seccKeyDir`
+- `ocpp` (inline base config) or `ocppConfig` (path to base config JSON)
+- `sharePath`, `sqlMigrationsPath`, `databaseDir`, `userConfig`, `messageLogPath`, `loggingConfig`
+- `meterSampleIntervalSeconds`, `meterKeepAliveSeconds`, `minimumStatusDurationSeconds`, `moduleHealthGraceMs`
+
+Module config (`slots[].modules[]`)
+- `id`, `mn` (module contactor id), `type`
+- `canInterface`, `address`, `group`
+- Optional vendor fields: `monitorAddress`, `productionDay`, `serialLow`, `sourceAddress`,
+  `inputMode`, `hiLoMode`, `silentMode`
+- `ratedPowerKW`, `ratedCurrentA`, `pollMs`, `cmdIntervalMs`, `telemetryStaleMs`
+- `broadcast`, `probeOnStartup`, `readbackLimits`, `sendOutputCurrent`, `sendOutputPower`
+
+Constraints and defaults
+- If `slots` is omitted, a ring is auto-generated from `connectors` order with two modules per slot.
+- Each slot supports at most 2 modules in the current implementation.
+- `plc.relayMode` must be `ties`, `plc.moduleRelaysEnabled` must be true, and `plc.gunRelayOwnedByPlc` must be false.
+- `allowCrossSlotIslands` requires hardware support (`PlcCanHardware` supports this).
+- `databaseDir` also stores pending auth tokens at `pending_tokens.json`.
+- Autocharge can be toggled at runtime via OCPP ChangeConfiguration key `Custom.AutochargeEnabled`.
+
+PLC/CAN contract
+- Authoritative details: `docs/CAN_CONTRACT.md` and `Ref/Basic/docs/CAN_DBC.dbc`.
+- Bus: 29-bit extended IDs, 125 kbps, CRC8 on required frames.
+- Handshake: controller expects `PROTO_VERSION` (param 91) and treats mismatches as comm faults.
+- For Waveshare USB-CAN-B, use `docs/waveshare_usb_can_b.md` and `scripts/waveshare_usbcan_setup.sh`.
+
+Config editor web UI (`config_webui`)
+Build (desktop):
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_CONFIG_WEB_UI=ON
+cmake --build build --target config_webui -j
+```
+Run:
+```bash
+./build/config_webui --config configs/charger.json --assets webui --port 8844 --host 0.0.0.0
+```
+Flags: `--headless`, `--host/--bind`, `--port`, `--assets`, `--config`, `--no-mdns`, `--mdns-name`, `--mdns-host`.
+Backups are stored under `configs/backups/` (relative to the config path).
+
+Raspberry Pi / Docker builds
+```bash
+./docker/build-rpi.sh
+# 32-bit Raspberry Pi OS
+PLATFORM=linux/arm/v7 ./docker/build-rpi.sh
+# Include config web UI
+BUILD_CONFIG_WEB_UI=ON ./docker/build-rpi.sh
+```
+Artifacts land in `build-rpi/artifacts/bin` and `build-rpi/artifacts/share/`.
+
+Testing
+- Planner tests: `cmake --build build --target power_manager_tests -j` then `./build/power_manager_tests`.
+- CAN loopback sanity: `./scripts/can_loop_test.sh can0`.
+
+Operational docs
 - TLS/PKI provisioning: `docs/security_pki.md`
-- Soak testing and resilience: `docs/soak_test_plan.md`
-- HIL/system scenarios: `tests/HIL_PLAN.md`
+- Soak testing: `docs/soak_test_plan.md`
+- HIL scenarios: `tests/HIL_PLAN.md`
 
-Known gaps / TODO for production
---------------------------------
-- PLC firmware must be validated to map AuthorizationState::Pending to ISO15118 AuthorizationRes=Ongoing on-device.
-- Islanding/cross-slot module routing is supported in `plc.relayMode=ties`, but without relay aux feedback the controller
-  assumes contactor actuation; add aux feedback for weld detection and definitive topology verification.
-- V2G/PnC flows are not supported in this release; Autocharge via EVCCID/EMAID/EVMAC is available.
-- Run the soak test plan (`docs/soak_test_plan.md`) and HIL plan (`tests/HIL_PLAN.md`) before production rollout to validate long-haul stability.
-
-Security and TLS
-----------------
-- Certificate bundles and key directories are created automatically on boot if missing.
-- Startup fails if CA bundles are empty unless `DC_OCPP_STUB_SECURITY=1` is set (test only).
-- See `docs/security_pki.md` for provisioning TLS/PKI material for both OCPP and ISO 15118 (CSMS CA, MO/V2G CA, client certs/keys).
+Limitations and notes
+- OCPP adapter is 1.6 only (libocpp supports 2.0.1/2.1, but this binary uses v16).
+- `dc_ocpp` ships with the PLC CAN backend only. To use custom hardware, implement `HardwareInterface` and update `src/main.cpp`.
+- PLC backend rejects diagnostics/log uploads and firmware updates by default; implement these in a custom backend if required.
+- This binary only supports OCPP SecurityProfile 0; set `DC_OCPP_STUB_SECURITY=1` only for permissive dev mode (not production safe).
