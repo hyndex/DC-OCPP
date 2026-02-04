@@ -3481,28 +3481,6 @@ void OcppAdapter::apply_power_plan() {
         }
     }
 
-    std::map<int, uint8_t> relay_mask_by_connector;
-    for (const auto& c : cfg_.connectors) {
-        uint8_t mask = 0u;
-        auto slot_it = connector_module_slots_.find(c.id);
-        if (slot_it != connector_module_slots_.end()) {
-            const auto& module_slots = slot_it->second;
-            if (module_slots[0] > 0) {
-                const auto mc_it = mc_state_cmd_by_slot.find(module_slots[0]);
-                if (mc_it != mc_state_cmd_by_slot.end() && mc_it->second == ContactorState::Closed) {
-                    mask |= 0x01u;
-                }
-            }
-            if (module_slots[1] > 0) {
-                const auto mc_it = mc_state_cmd_by_slot.find(module_slots[1]);
-                if (mc_it != mc_state_cmd_by_slot.end() && mc_it->second == ContactorState::Closed) {
-                    mask |= 0x02u;
-                }
-            }
-        }
-        relay_mask_by_connector[c.id] = mask;
-    }
-
     // Compute runtime islands from the commanded MC states (tie mode) so that module allocation
     // and safety checks track the actual bus topology during switching.
     std::map<int, int> slot_to_island;
@@ -3903,6 +3881,10 @@ void OcppAdapter::apply_power_plan() {
                                               planner_cfg_.min_gc_hold_ms, true);
         gc_closed_cmd = (enforced_gc == ContactorState::Closed);
 
+        // Keep the per-slot MC command map in sync with the final (post-gating/post-hold) decision used below.
+        // This avoids stale relay-mask decisions when tie safety logic changes MC state later in the loop.
+        mc_state_cmd_by_slot[slot->id] = mc_closed_cmd ? ContactorState::Closed : ContactorState::Open;
+
         const bool module_health_ok = info.modules_healthy;
         const bool island_modules_allowed = in_island && !local_fault && !info.disabled_by_csms &&
                                             isolation_ready && dispatch.modules_assigned > 0 && module_health_ok;
@@ -3921,8 +3903,30 @@ void OcppAdapter::apply_power_plan() {
         const bool allow_energy_home = is_home && allow_energy_for_gun;
 
         uint8_t relay_mask_cmd = 0u;
-        const auto relay_it = relay_mask_by_connector.find(c.id);
-        relay_mask_cmd = relay_it != relay_mask_by_connector.end() ? relay_it->second : 0u;
+        const auto module_slots_it = connector_module_slots_.find(c.id);
+        if (module_slots_it != connector_module_slots_.end()) {
+            const auto& module_slots = module_slots_it->second;
+            auto slot_closed = [&](int slot_id) -> bool {
+                if (slot_id <= 0) {
+                    return false;
+                }
+                if (slot_id == slot->id) {
+                    return mc_closed_cmd;
+                }
+                const auto mc_it = mc_state_cmd_by_slot.find(slot_id);
+                if (mc_it != mc_state_cmd_by_slot.end()) {
+                    return mc_it->second == ContactorState::Closed;
+                }
+                const auto info2_it = slot_info.find(slot_id);
+                return info2_it != slot_info.end() && info2_it->second.desired_mc_state == ContactorState::Closed;
+            };
+            if (slot_closed(module_slots[0])) {
+                relay_mask_cmd |= 0x01u;
+            }
+            if (slot_closed(module_slots[1])) {
+                relay_mask_cmd |= 0x02u;
+            }
+        }
         const bool connector_fault = !info.gun_state.safety_ok;
         if (info.disabled_by_csms || connector_fault) {
             relay_mask_cmd = 0u;
