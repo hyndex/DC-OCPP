@@ -142,6 +142,19 @@ public:
         set_authorization_state(connector, state == AuthorizationState::Granted);
     }
 
+    /// \brief Request that the PLC advertise or suppress digital communication (ISO15118/DIN).
+    /// When disabled, CP should remain at 100% duty (pre-HLC waiting).
+    virtual void set_digital_comm_enabled(std::int32_t connector, bool enabled) {
+        (void)connector;
+        (void)enabled;
+    }
+
+    /// \brief Block Contract/PnC selection for the current EV (force ExternalPayment/EIM only).
+    virtual void set_pnc_blocked(std::int32_t connector, bool blocked) {
+        (void)connector;
+        (void)blocked;
+    }
+
     /// \brief Apply computed power allocation (modules, contactors, setpoints) for the connector.
     /// Default fallbacks map to the older apply_power_allocation + enable/disable calls.
     virtual void apply_power_command(const PowerCommand& cmd) {

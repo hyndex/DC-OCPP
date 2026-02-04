@@ -1,5 +1,6 @@
 #include "ocpp_adapter.hpp"
 #include "hardware_interface.hpp"
+#include "test_config_helpers.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -50,6 +51,7 @@ public:
     ocpp::Measurement sample_meter(std::int32_t) override { return meas; }
     GunStatus get_status(std::int32_t) override { return status; }
     void apply_power_command(const PowerCommand& cmd) override { last_cmd = cmd; }
+    bool supports_cross_slot_islands() const override { return true; }
 };
 
 static ChargerConfig basic_cfg() {
@@ -57,6 +59,7 @@ static ChargerConfig basic_cfg() {
     cfg.charge_point_id = "derate-test";
     cfg.connectors = {ConnectorConfig{.id = 1}};
     cfg.allow_cross_slot_islands = false;
+    populate_minimal_slots(cfg);
     return cfg;
 }
 

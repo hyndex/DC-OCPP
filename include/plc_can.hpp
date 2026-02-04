@@ -49,6 +49,8 @@ public:
     GunStatus get_status(std::int32_t connector) override;
     void set_authorization_state(std::int32_t connector, bool authorized) override;
     void set_authorization_state(std::int32_t connector, AuthorizationState state) override;
+    void set_digital_comm_enabled(std::int32_t connector, bool enabled) override;
+    void set_pnc_blocked(std::int32_t connector, bool blocked) override;
     void apply_power_command(const PowerCommand& cmd) override;
     void apply_power_allocation(std::int32_t connector, int modules) override;
     void set_evse_limits(std::int32_t connector, const EvseLimits& limits) override;
@@ -110,6 +112,10 @@ private:
         std::chrono::steady_clock::time_point last_auth_tx{};
         bool authorized{false};
         bool auth_pending{false};
+        bool hlc_enabled{false};
+        bool pnc_blocked{false};
+        bool hlc_enabled_sent{false};
+        bool pnc_blocked_sent{false};
         bool sys_enable{false};
         bool output_enabled{false};
         bool regulating{false};
@@ -173,9 +179,14 @@ private:
         bool lock_command_set{false};
         uint8_t boot_feature_flags{0};
         bool meter_available{true};
-        bool protocol_ok{true};
+        bool protocol_ok{false};
+        bool protocol_verified{false};
         bool protocol_sent{false};
         std::chrono::steady_clock::time_point last_protocol_tx{};
+        std::chrono::steady_clock::time_point last_protocol_ack{};
+        std::chrono::steady_clock::time_point last_protocol_warn{};
+        std::chrono::steady_clock::time_point last_hlc_enable_tx{};
+        std::chrono::steady_clock::time_point last_pnc_block_tx{};
         // Track CAN-level protocol health.
         uint64_t relay_status_crc_fail_count{0};
         uint64_t safety_status_crc_fail_count{0};

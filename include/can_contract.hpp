@@ -18,6 +18,8 @@ constexpr uint32_t TX_BASE_BOOT = 0x00090000u;
 // Config parameter ids (must match Basic firmware)
 constexpr uint8_t PARAM_AUTH_STATE = 20;
 constexpr uint8_t PARAM_AUTH_PENDING = 21;
+constexpr uint8_t PARAM_HLC_ENABLE = 22;
+constexpr uint8_t PARAM_PNC_BLOCKED = 23;
 constexpr uint8_t PARAM_LOCK_CMD = 30;
 constexpr uint8_t PARAM_EVSE_LIMIT_ACK = 90;
 constexpr uint8_t PARAM_PROTO_VERSION = 91;

@@ -115,7 +115,9 @@
   ],
   "sqlMigrationsPath": "../../libocpp/config/v16/core_migrations",
   "timeouts": {
-    "powerRequestSeconds": 600
+    "powerRequestSeconds": 600,
+    "hlcAuthorizationSeconds": 150,
+    "pncBlockSeconds": 1200
   },
   "userConfig": "../../data/user_config.json"
 }

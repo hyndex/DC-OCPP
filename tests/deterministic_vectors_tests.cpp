@@ -1,5 +1,6 @@
 #include "ocpp_adapter.hpp"
 #include "test_hardware.hpp"
+#include "test_config_helpers.hpp"
 #include "power_manager.hpp"
 
 #include <cassert>
@@ -13,6 +14,7 @@ static ChargerConfig make_cfg() {
     cfg.connectors = {ConnectorConfig{.id = 1}, ConnectorConfig{.id = 2}};
     cfg.meter_sample_interval_s = 1;
     cfg.auth_wait_timeout_s = 10;
+    populate_minimal_slots(cfg);
     return cfg;
 }
 

@@ -597,6 +597,17 @@ if(BUILD_APP_TESTS)
   target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(limit_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(hlc_fallback_tests
+    tests/hlc_fallback_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(hlc_fallback_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(hlc_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(hlc_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(island_manager_tests
     tests/island_manager_tests.cpp
     src/island_manager.cpp

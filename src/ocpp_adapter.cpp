@@ -34,6 +34,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
+constexpr uint8_t HLC_STAGE_AUTHORIZATION = 5; // PLC HLC stage enum: WAIT_AUTHORIZATION
 constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power delivery readiness
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
@@ -351,6 +352,7 @@ OcppAdapter::OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> h
         auth_state_cache_[c.id] = AuthorizationState::Unknown;
         post_stop_plugged_[c.id] = false;
         post_stop_time_[c.id] = std::chrono::steady_clock::time_point{};
+        hlc_control_[c.id] = HlcControlState{};
         reservation_required_tag_.erase(c.id);
         reservation_parent_tag_.erase(c.id);
         connector_meter_intervals_[c.id] = c.meter_sample_interval_s > 0 ? c.meter_sample_interval_s
@@ -394,6 +396,82 @@ void OcppAdapter::seed_default_evse_limits() {
 
 const Slot* OcppAdapter::find_slot_for_gun(int gun_id) const {
     return charger::find_slot_for_gun(slots_, gun_id);
+}
+
+OcppAdapter::HlcControlOutcome
+OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, bool had_session,
+                               const ActiveSession& session, bool post_stop_plugged,
+                               const std::optional<std::string>& autocharge_reject_id, bool force_auth_denied,
+                               const std::chrono::steady_clock::time_point& now) {
+    HlcControlOutcome out{};
+    out.force_auth_denied = force_auth_denied;
+    const bool autocharge_allowed = autocharge_enabled_.load();
+    const bool pseudo_pnc = (cfg_.autocharge_id_source == "evmac");
+
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    auto& flow = hlc_control_[connector];
+    if (!status.plugged_in) {
+        flow.pnc_blocked = false;
+        flow.blocked_identity.reset();
+        flow.block_expires = std::chrono::steady_clock::time_point{};
+        flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+        flow.last_autocharge_id.reset();
+    } else if (flow.pnc_blocked && flow.block_expires.time_since_epoch().count() != 0 &&
+               now >= flow.block_expires) {
+        flow.pnc_blocked = false;
+        flow.blocked_identity.reset();
+        flow.block_expires = std::chrono::steady_clock::time_point{};
+    }
+
+    if (autocharge_reject_id) {
+        flow.pnc_blocked = true;
+        flow.blocked_identity = autocharge_reject_id;
+        flow.block_expires = cfg_.pnc_block_ttl_s > 0
+                                 ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
+                                 : std::chrono::steady_clock::time_point{};
+        flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+        clear_pending_autocharge_tokens_for_connector_locked(connector);
+        out.force_auth_denied = true;
+        EVLOG_warning << "Autocharge rejected; blocking PnC on connector " << connector;
+    }
+
+    const bool session_authorized = had_session && session.authorized;
+    const bool autocharge_start = autocharge_allowed && !flow.pnc_blocked;
+    if (autocharge_start && !session_authorized && status.hlc_stage >= HLC_STAGE_AUTHORIZATION) {
+        if (flow.auth_pending_since.time_since_epoch().count() == 0) {
+            flow.auth_pending_since = now;
+        } else if (cfg_.hlc_auth_timeout_s > 0 &&
+                   (now - flow.auth_pending_since) > std::chrono::seconds(cfg_.hlc_auth_timeout_s)) {
+            flow.pnc_blocked = true;
+            flow.blocked_identity = flow.last_autocharge_id;
+            flow.block_expires = cfg_.pnc_block_ttl_s > 0
+                                     ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
+                                     : std::chrono::steady_clock::time_point{};
+            flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+            clear_pending_autocharge_tokens_for_connector_locked(connector);
+            out.auth_timeout_triggered = true;
+            out.force_auth_denied = true;
+            EVLOG_warning << "Autocharge timed out on connector " << connector << "; forcing EIM fallback";
+        }
+    } else {
+        flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+    }
+
+    out.desired_digital = status.plugged_in && !post_stop_plugged && (autocharge_start || session_authorized);
+    if (flow.pnc_blocked && !session_authorized) {
+        out.desired_digital = false;
+    }
+    out.desired_pnc_blocked = (!autocharge_allowed) || pseudo_pnc || flow.pnc_blocked;
+
+    if (out.desired_digital != flow.digital_enabled) {
+        flow.digital_enabled = out.desired_digital;
+        out.digital_update = true;
+    }
+    if (out.desired_pnc_blocked != flow.pnc_blocked_sent) {
+        flow.pnc_blocked_sent = out.desired_pnc_blocked;
+        out.pnc_block_update = true;
+    }
+    return out;
 }
 
 void OcppAdapter::initialize_slots() {
@@ -1407,8 +1485,16 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (auto_auth_granted) {
                 set_auth_state(connector, AuthorizationState::Granted);
             }
+            AuthorizationState pending_auth_state = AuthorizationState::Unknown;
+            bool force_auth_denied = false;
+            std::optional<std::string> autocharge_reject_id;
             if (pending_auth) {
-                authorize_token_for_session(connector, pending_auth_session_id, *pending_auth);
+                pending_auth_state = authorize_token_for_session(connector, pending_auth_session_id, *pending_auth);
+                if (pending_auth->token.source == AuthTokenSource::Autocharge &&
+                    pending_auth_state == AuthorizationState::Denied) {
+                    autocharge_reject_id = pending_auth->token.id_token;
+                    force_auth_denied = true;
+                }
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 auto it = sessions_.find(connector);
                 if (it != sessions_.end()) {
@@ -1439,6 +1525,18 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         ++rit;
                     }
                 }
+            }
+
+            const auto hlc_out = apply_hlc_control(connector, status, had_session, session, post_stop_plugged,
+                                                   autocharge_reject_id, force_auth_denied, now);
+            if (hlc_out.digital_update) {
+                hardware_->set_digital_comm_enabled(connector, hlc_out.desired_digital);
+            }
+            if (hlc_out.pnc_block_update) {
+                hardware_->set_pnc_blocked(connector, hlc_out.desired_pnc_blocked);
+            }
+            if (hlc_out.force_auth_denied && !session.authorized) {
+                set_auth_state(connector, AuthorizationState::Denied);
             }
             const auto cfg_it = std::find_if(cfg_.connectors.begin(), cfg_.connectors.end(),
                                              [&](const ConnectorConfig& c) { return c.id == connector; });
@@ -2026,11 +2124,26 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
     const auto ttl = auth_timeout_enabled ? std::chrono::seconds(cfg_.auth_wait_timeout_s) : std::chrono::seconds(0);
     const bool allow_autocharge = autocharge_enabled_.load();
     std::size_t autocharge_dropped = 0;
+    std::size_t autocharge_blocked = 0;
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (auto token : tokens) {
         if (token.source == AuthTokenSource::Autocharge && !allow_autocharge) {
             ++autocharge_dropped;
             continue;
+        }
+        if (token.source == AuthTokenSource::Autocharge && token.connector_hint > 0) {
+            auto& flow = hlc_control_[token.connector_hint];
+            if (flow.pnc_blocked && flow.block_expires.time_since_epoch().count() != 0 &&
+                now >= flow.block_expires) {
+                flow.pnc_blocked = false;
+                flow.blocked_identity.reset();
+                flow.block_expires = std::chrono::steady_clock::time_point{};
+            }
+            flow.last_autocharge_id = token.id_token;
+            if (flow.pnc_blocked) {
+                ++autocharge_blocked;
+                continue;
+            }
         }
         const auto dedup_it = recent_token_cache_.find(token.id_token);
         if (dedup_it != recent_token_cache_.end() && (now - dedup_it->second) < RECENT_TOKEN_DEDUP_WINDOW) {
@@ -2053,6 +2166,14 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
             (log_now - last_autocharge_drop_log_) > std::chrono::seconds(10)) {
             EVLOG_info << "Autocharge disabled; ignored " << autocharge_dropped << " autocharge token(s)";
             last_autocharge_drop_log_ = log_now;
+        }
+    }
+    if (autocharge_blocked > 0) {
+        const auto log_now = now;
+        if (last_autocharge_block_log_.time_since_epoch().count() == 0 ||
+            (log_now - last_autocharge_block_log_) > std::chrono::seconds(10)) {
+            EVLOG_info << "Autocharge blocked; ignored " << autocharge_blocked << " autocharge token(s)";
+            last_autocharge_block_log_ = log_now;
         }
     }
     persist_pending_tokens_locked();
@@ -2085,6 +2206,23 @@ void OcppAdapter::clear_pending_autocharge_tokens_locked() {
         }
     }
     if (removed) {
+        persist_pending_tokens_locked();
+    }
+}
+
+void OcppAdapter::clear_pending_autocharge_tokens_for_connector_locked(std::int32_t connector) {
+    auto it = pending_tokens_.find(connector);
+    if (it == pending_tokens_.end()) {
+        return;
+    }
+    auto& queue = it->second;
+    const auto before = queue.size();
+    queue.erase(std::remove_if(queue.begin(), queue.end(),
+                               [](const PendingToken& p) {
+                                   return p.token.source == AuthTokenSource::Autocharge;
+                               }),
+                queue.end());
+    if (queue.size() != before) {
         persist_pending_tokens_locked();
     }
 }
@@ -2131,7 +2269,7 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
             return 3;
         }
     };
-    const bool csms_offline = charge_point_ && !csms_connected_.load();
+    const bool csms_offline = !charge_point_ || !csms_connected_.load();
     const bool allow_autocharge = autocharge_enabled_.load();
     bool removed = false;
     for (auto qit = queue.begin(); qit != queue.end();) {
@@ -2208,9 +2346,14 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
     } else {
         AuthorizationState state = AuthorizationState::Denied;
         if (pending.token.source == AuthTokenSource::Autocharge) {
-            state = AuthorizationState::Pending;
-            EVLOG_info << "Autocharge rejected on connector " << connector
-                       << "; keeping auth pending to allow RemoteStart";
+            if (!csms_connected_.load()) {
+                state = AuthorizationState::Pending;
+                EVLOG_info << "Autocharge rejected on connector " << connector
+                           << "; keeping auth pending to allow RemoteStart";
+            } else {
+                EVLOG_info << "Autocharge rejected on connector " << connector
+                           << "; forcing EIM fallback";
+            }
         }
         set_auth_state(connector, state);
         persist_pending_tokens_locked();
@@ -2234,17 +2377,22 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
     }
 
     AuthorizationState new_state = accepted ? AuthorizationState::Granted : AuthorizationState::Denied;
-    const bool csms_offline = charge_point_ && !csms_connected_.load();
+    const bool csms_offline = !charge_point_ || !csms_connected_.load();
     if (!accepted && pending.token.source == AuthTokenSource::Autocharge) {
-        new_state = AuthorizationState::Pending;
-        EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
-                   << "; keeping auth pending to allow RemoteStart";
-        if (autocharge_enabled_.load() && csms_offline && pending.expires_at > now && !pending.defer_until_online) {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            PendingToken retry = pending;
-            retry.defer_until_online = true;
-            pending_tokens_[connector].push_back(std::move(retry));
-            persist_pending_tokens_locked();
+        if (csms_offline) {
+            new_state = AuthorizationState::Pending;
+            EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
+                       << "; keeping auth pending to allow RemoteStart";
+            if (autocharge_enabled_.load() && pending.expires_at > now && !pending.defer_until_online) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                PendingToken retry = pending;
+                retry.defer_until_online = true;
+                pending_tokens_[connector].push_back(std::move(retry));
+                persist_pending_tokens_locked();
+            }
+        } else {
+            EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
+                       << "; forcing EIM fallback";
         }
     }
 

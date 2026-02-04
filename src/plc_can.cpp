@@ -360,12 +360,49 @@ void PlcCanHardware::tx_loop() {
                         st.last_auth_tx = now;
                     }
                 }
-                if (!st.protocol_sent ||
+                {
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_hlc_enable_tx).count();
+                    const bool changed = (st.hlc_enabled_sent != st.hlc_enabled);
+                    if (st.last_hlc_enable_tx.time_since_epoch().count() == 0 || elapsed >= 1000 || changed) {
+                        const uint32_t val = st.hlc_enabled ? 1u : 0u;
+                        auto payload =
+                            can_contract::build_config_cmd(can_contract::PARAM_HLC_ENABLE, 0, val, use_crc_);
+                        if (!send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+                            EVLOG_error << "Failed to send HLC_ENABLE to plc " << st.plc_id;
+                        } else {
+                            if (changed) {
+                                EVLOG_info << "HLC_ENABLE -> plc " << st.plc_id << " enabled=" << st.hlc_enabled;
+                            }
+                        }
+                        st.last_hlc_enable_tx = now;
+                        st.hlc_enabled_sent = st.hlc_enabled;
+                    }
+                }
+                {
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_pnc_block_tx).count();
+                    const bool changed = (st.pnc_blocked_sent != st.pnc_blocked);
+                    if (st.last_pnc_block_tx.time_since_epoch().count() == 0 || elapsed >= 1000 || changed) {
+                        const uint32_t val = st.pnc_blocked ? 1u : 0u;
+                        auto payload =
+                            can_contract::build_config_cmd(can_contract::PARAM_PNC_BLOCKED, 0, val, use_crc_);
+                        if (!send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+                            EVLOG_error << "Failed to send PNC_BLOCKED to plc " << st.plc_id;
+                        } else {
+                            if (changed) {
+                                EVLOG_info << "PNC_BLOCKED -> plc " << st.plc_id << " blocked=" << st.pnc_blocked;
+                            }
+                        }
+                        st.last_pnc_block_tx = now;
+                        st.pnc_blocked_sent = st.pnc_blocked;
+                    }
+                }
+                if (!st.protocol_verified ||
                     (!st.protocol_ok &&
                      std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_protocol_tx).count() > 1000)) {
                     const auto payload =
-                        can_contract::build_config_cmd(can_contract::PARAM_PROTO_VERSION, 0,
-                                                       can_contract::PROTOCOL_VERSION, use_crc_);
+                        can_contract::build_config_cmd(can_contract::PARAM_PROTO_VERSION, 1, 0, use_crc_);
                     (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload);
                     st.protocol_sent = true;
                     st.last_protocol_tx = now;
@@ -483,10 +520,14 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         } else if (ack.param_id == can_contract::PARAM_PROTO_VERSION) {
             const bool ok = (ack.status == 0) && (ack.value == can_contract::PROTOCOL_VERSION);
             st->protocol_ok = ok;
+            st->protocol_verified = true;
+            st->last_protocol_ack = now;
             if (!ok) {
                 EVLOG_error << "PLC protocol version mismatch plc=" << static_cast<int>(plc_id)
                             << " status=" << static_cast<int>(ack.status) << " value=" << ack.value
                             << " expected=" << static_cast<int>(can_contract::PROTOCOL_VERSION);
+            } else {
+                EVLOG_info << "PLC protocol version OK plc=" << static_cast<int>(plc_id);
             }
         }
     } else if (can_id == can_contract::cp_voltage_levels_id(plc_id)) {
@@ -1040,8 +1081,20 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     // Treat "never received any status yet" as unknown during startup grace rather than a comm fault.
     // After the grace window, missing/stale frames become actionable.
     const bool comm_missing = !status_seen && !within_startup_grace;
+    const auto protocol_grace = std::chrono::milliseconds(5000);
+    const bool protocol_grace_active =
+        started_at_.time_since_epoch().count() != 0 && (now - started_at_) < protocol_grace;
+    const bool protocol_fault = st.protocol_verified ? !st.protocol_ok : !protocol_grace_active;
+    if (protocol_fault) {
+        if (st.last_protocol_warn.time_since_epoch().count() == 0 ||
+            (now - st.last_protocol_warn) > std::chrono::seconds(10)) {
+            EVLOG_warning << "PLC protocol not verified or mismatched on plc=" << st.plc_id
+                          << " verified=" << st.protocol_verified << " ok=" << st.protocol_ok;
+            st.last_protocol_warn = now;
+        }
+    }
     const bool raw_comm_fault = status_stale || comm_missing || relay_stale || safety_stale ||
-                                (relay_feedback ? st.last_relay.comm_fault : false) || !st.protocol_ok;
+                                (relay_feedback ? st.last_relay.comm_fault : false) || protocol_fault;
 
     // Safety inputs are only authoritative when their respective telemetry is fresh.
     const bool relay_status_fresh = relay_feedback && relay_seen && !relay_stale;
@@ -1343,6 +1396,44 @@ void PlcCanHardware::set_authorization_state(std::int32_t connector, Authorizati
     st.last_auth_tx = std::chrono::steady_clock::now();
 }
 
+void PlcCanHardware::set_digital_comm_enabled(std::int32_t connector, bool enabled) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto it = connectors_.find(connector);
+    if (it == connectors_.end()) {
+        return;
+    }
+    auto& st = it->second;
+    st.hlc_enabled = enabled;
+    st.hlc_enabled_sent = enabled;
+    const uint32_t val = enabled ? 1u : 0u;
+    auto payload = can_contract::build_config_cmd(can_contract::PARAM_HLC_ENABLE, 0, val, use_crc_);
+    if (!send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+        EVLOG_error << "Failed to send HLC_ENABLE (immediate) to plc " << st.plc_id;
+    } else {
+        EVLOG_info << "HLC_ENABLE immediate -> plc " << st.plc_id << " enabled=" << enabled;
+    }
+    st.last_hlc_enable_tx = std::chrono::steady_clock::now();
+}
+
+void PlcCanHardware::set_pnc_blocked(std::int32_t connector, bool blocked) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto it = connectors_.find(connector);
+    if (it == connectors_.end()) {
+        return;
+    }
+    auto& st = it->second;
+    st.pnc_blocked = blocked;
+    st.pnc_blocked_sent = blocked;
+    const uint32_t val = blocked ? 1u : 0u;
+    auto payload = can_contract::build_config_cmd(can_contract::PARAM_PNC_BLOCKED, 0, val, use_crc_);
+    if (!send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+        EVLOG_error << "Failed to send PNC_BLOCKED (immediate) to plc " << st.plc_id;
+    } else {
+        EVLOG_info << "PNC_BLOCKED immediate -> plc " << st.plc_id << " blocked=" << blocked;
+    }
+    st.last_pnc_block_tx = std::chrono::steady_clock::now();
+}
+
 void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(cmd.connector);
@@ -1502,6 +1593,8 @@ ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t) { return {}; }
 GunStatus PlcCanHardware::get_status(std::int32_t) { return {}; }
 void PlcCanHardware::set_authorization_state(std::int32_t, bool) {}
 void PlcCanHardware::set_authorization_state(std::int32_t, AuthorizationState) {}
+void PlcCanHardware::set_digital_comm_enabled(std::int32_t, bool) {}
+void PlcCanHardware::set_pnc_blocked(std::int32_t, bool) {}
 void PlcCanHardware::apply_power_command(const PowerCommand&) {}
 void PlcCanHardware::apply_power_allocation(std::int32_t, int) {}
 void PlcCanHardware::set_evse_limits(std::int32_t, const EvseLimits&) {}

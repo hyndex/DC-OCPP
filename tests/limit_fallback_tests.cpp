@@ -1,5 +1,6 @@
 #include "ocpp_adapter.hpp"
 #include "test_hardware.hpp"
+#include "test_config_helpers.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -18,6 +19,7 @@ static ChargerConfig make_cfg() {
     cfg.meter_sample_interval_s = 1;
     cfg.default_voltage_v = 800.0;
     cfg.max_modules_per_gun = 1;
+    populate_minimal_slots(cfg);
     return cfg;
 }
 

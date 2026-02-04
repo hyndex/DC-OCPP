@@ -97,17 +97,42 @@ public:
         status_[connector].authorization_granted = (state == AuthorizationState::Granted);
     }
 
+    void set_digital_comm_enabled(std::int32_t connector, bool enabled) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        digital_enabled_[connector] = enabled;
+    }
+
+    void set_pnc_blocked(std::int32_t connector, bool blocked) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pnc_blocked_[connector] = blocked;
+    }
+
+    bool digital_comm_enabled(std::int32_t connector) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = digital_enabled_.find(connector);
+        return it != digital_enabled_.end() ? it->second : false;
+    }
+
+    bool pnc_blocked(std::int32_t connector) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pnc_blocked_.find(connector);
+        return it != pnc_blocked_.end() ? it->second : false;
+    }
+
     void apply_power_command(const PowerCommand&) override {}
     void apply_power_allocation(std::int32_t, int) override {}
     void set_evse_limits(std::int32_t, const EvseLimits&) override {}
     void publish_evse_present(std::int32_t, double, double, double, bool, bool) override {}
     void publish_fault_state(std::int32_t, uint8_t) override {}
     void clear_faults(std::int32_t) override {}
+    bool supports_cross_slot_islands() const override { return true; }
 
 private:
     std::mutex mutex_;
     std::map<std::int32_t, GunStatus> status_;
     std::map<std::int32_t, double> energy_wh_;
+    std::map<std::int32_t, bool> digital_enabled_;
+    std::map<std::int32_t, bool> pnc_blocked_;
 };
 
 } // namespace charger

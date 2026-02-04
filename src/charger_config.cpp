@@ -225,6 +225,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     };
     const auto timeouts = json.value("timeouts", nlohmann::json::object());
     cfg.auth_wait_timeout_s = timeouts.value("authorizationSeconds", cfg.auth_wait_timeout_s);
+    cfg.hlc_auth_timeout_s = timeouts.value("hlcAuthorizationSeconds", cfg.hlc_auth_timeout_s);
+    cfg.pnc_block_ttl_s = timeouts.value("pncBlockSeconds", cfg.pnc_block_ttl_s);
     cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
     cfg.evse_limit_ack_timeout_ms = timeouts.value("evseLimitAckMs", cfg.evse_limit_ack_timeout_ms);
     cfg.telemetry_timeout_ms = timeouts.value("telemetryTimeoutMs", cfg.telemetry_timeout_ms);
@@ -257,6 +259,18 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     // Keep the legacy default (1800s) only when the value is negative/invalid.
     if (cfg.auth_wait_timeout_s < 0) {
         cfg.auth_wait_timeout_s = 1800;
+    }
+    // hlcAuthorizationSeconds == 0 disables HLC auth watchdog (not recommended).
+    if (cfg.hlc_auth_timeout_s < 0) {
+        cfg.hlc_auth_timeout_s = 150;
+    }
+    // PLC firmware enforces a hard 150s auth-pending budget; clamp host to match.
+    if (cfg.hlc_auth_timeout_s > 150) {
+        cfg.hlc_auth_timeout_s = 150;
+    }
+    // pncBlockSeconds == 0 => block until unplug only.
+    if (cfg.pnc_block_ttl_s < 0) {
+        cfg.pnc_block_ttl_s = 1200;
     }
     // powerRequestSeconds == 0 disables the timeout (wait indefinitely for EV power delivery).
     // Keep the legacy default (60s) only when the value is negative/invalid.

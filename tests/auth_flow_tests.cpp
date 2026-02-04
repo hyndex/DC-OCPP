@@ -1,5 +1,6 @@
 #include "ocpp_adapter.hpp"
 #include "test_hardware.hpp"
+#include "test_config_helpers.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -11,6 +12,7 @@ static ChargerConfig make_basic_config() {
     cfg.charge_point_id = "auth-flow-test";
     cfg.connectors = {ConnectorConfig{.id = 1}, ConnectorConfig{.id = 2}};
     cfg.meter_sample_interval_s = 1;
+    populate_minimal_slots(cfg);
     return cfg;
 }
 

@@ -64,6 +64,25 @@ private:
         bool defer_until_online{false};
     };
 
+    struct HlcControlState {
+        bool digital_enabled{false};
+        bool pnc_blocked{false};       // autocharge/PnC blocked due to rejection/timeout
+        bool pnc_blocked_sent{false};  // last effective block sent to PLC
+        std::optional<std::string> blocked_identity{};
+        std::chrono::steady_clock::time_point block_expires{};
+        std::chrono::steady_clock::time_point auth_pending_since{};
+        std::optional<std::string> last_autocharge_id{};
+    };
+
+    struct HlcControlOutcome {
+        bool digital_update{false};
+        bool pnc_block_update{false};
+        bool desired_digital{false};
+        bool desired_pnc_blocked{false};
+        bool force_auth_denied{false};
+        bool auth_timeout_triggered{false};
+    };
+
 #ifdef CHARGER_UNIT_TESTS
 public:
     struct TestHook {
@@ -100,6 +119,23 @@ public:
 
         static void apply_power_plan(OcppAdapter& adapter) { adapter.apply_power_plan(); }
 
+        static HlcControlOutcome
+        apply_hlc_control(OcppAdapter& adapter, std::int32_t connector, const GunStatus& status, bool had_session,
+                          const ActiveSession& session, bool post_stop_plugged,
+                          const std::optional<std::string>& autocharge_reject_id, bool force_auth_denied,
+                          const std::chrono::steady_clock::time_point& now) {
+            return adapter.apply_hlc_control(connector, status, had_session, session, post_stop_plugged,
+                                             autocharge_reject_id, force_auth_denied, now);
+        }
+
+        static void set_autocharge_enabled(OcppAdapter& adapter, bool enabled) {
+            adapter.autocharge_enabled_.store(enabled);
+        }
+
+        static void set_csms_connected(OcppAdapter& adapter, bool connected) {
+            adapter.csms_connected_.store(connected);
+        }
+
         static std::mutex& session_mutex(OcppAdapter& adapter) { return adapter.session_mutex_; }
         static std::map<std::int32_t, ActiveSession>& sessions(OcppAdapter& adapter) { return adapter.sessions_; }
         static std::map<std::int32_t, bool>& plugged_in_state(OcppAdapter& adapter) { return adapter.plugged_in_state_; }
@@ -123,6 +159,7 @@ private:
     std::filesystem::path pending_token_store_;
     std::map<std::int32_t, ActiveSession> sessions_;
     std::map<std::int32_t, std::deque<PendingToken>> pending_tokens_;
+    std::map<std::int32_t, HlcControlState> hlc_control_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> plug_event_time_;
     std::map<std::int32_t, bool> plugged_in_state_;
     std::map<std::int32_t, bool> connector_faulted_;
@@ -191,6 +228,7 @@ private:
     std::map<int, AuthorizationState> auth_state_cache_;
     std::atomic<bool> autocharge_enabled_{true};
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
+    std::chrono::steady_clock::time_point last_autocharge_block_log_{};
     std::map<int, int> telemetry_mismatch_count_;
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
     std::map<int, int> connector_meter_intervals_;
@@ -218,6 +256,12 @@ private:
                             const std::chrono::steady_clock::time_point& now);
     void set_autocharge_enabled(bool enabled, const std::string& source);
     void clear_pending_autocharge_tokens_locked();
+    void clear_pending_autocharge_tokens_for_connector_locked(std::int32_t connector);
+    HlcControlOutcome apply_hlc_control(std::int32_t connector, const GunStatus& status, bool had_session,
+                                        const ActiveSession& session, bool post_stop_plugged,
+                                        const std::optional<std::string>& autocharge_reject_id,
+                                        bool force_auth_denied,
+                                        const std::chrono::steady_clock::time_point& now);
     int select_connector_for_token(const AuthToken& token) const;
     std::optional<PendingToken> pop_next_pending_token(std::int32_t connector,
                                                        const std::chrono::steady_clock::time_point& now,

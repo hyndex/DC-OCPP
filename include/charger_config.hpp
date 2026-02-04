@@ -123,6 +123,8 @@ struct ChargerConfig {
     int precharge_timeout_ms{2000};
     int module_health_grace_ms{2000};
     int auth_wait_timeout_s{1800};
+    int hlc_auth_timeout_s{150};
+    int pnc_block_ttl_s{1200};
     int power_request_timeout_s{60};
     int evse_limit_ack_timeout_ms{1500};
     int telemetry_timeout_ms{2000};
