@@ -29,6 +29,7 @@ constexpr int kPollMs = 200;
 constexpr int kDefaultTxPresentMs = 100;
 constexpr int kMinTxLimitsMs = 200;
 constexpr int kMinTxPresentMs = 50;
+// Keep relay commands at 1 Hz to avoid extra CAN load while staying below the 3 s PLC watchdog.
 constexpr int kTxRelayMs = 1000;
 constexpr int kSegmentTimeoutMs = 2000;
 constexpr int kPlugInDebounceMs = 200;
@@ -468,7 +469,11 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
         st->last_relay = decoded;
         st->last_relay_rx = now;
         st->last_status_rx = now;
-        st->output_enabled = st->last_relay.relay[0];
+        // In no-feedback mode, keep `output_enabled` as our commanded state.
+        // Otherwise transient PLC relay feedback glitches can feed back into planner gating.
+        if (cfg_.plc_relay_feedback || cfg_.plc_owns_gun_relay) {
+            st->output_enabled = st->last_relay.relay[0];
+        }
     } else if (can_id == can_contract::safety_status_id(plc_id)) {
         const auto decoded = can_contract::decode_safety_status(data, use_crc_);
         if (use_crc_ && !decoded.crc_ok) {
@@ -720,13 +725,14 @@ void PlcCanHardware::update_limits_tx(PlcState& st, std::chrono::steady_clock::t
     const bool allow_change_tx = elapsed >= kMinTxLimitsMs;
     const bool allow_keepalive_tx = elapsed >= tx_limits_ms_;
     if (payload_changed ? allow_change_tx : allow_keepalive_tx) {
-        if (!send_frame(st, can_contract::evse_dc_max_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+        const bool sent = send_frame(st, can_contract::evse_dc_max_limits_id(static_cast<uint8_t>(st.plc_id)), payload);
+        if (!sent) {
             EVLOG_warning << "Failed to TX EVSE limits on CAN for plc_id=" << st.plc_id;
         } else {
             st.last_limits_payload = payload;
             st.last_limits_payload_valid = true;
+            st.last_limits_tx = now;
         }
-        st.last_limits_tx = now;
     }
 }
 
@@ -757,13 +763,15 @@ void PlcCanHardware::update_present_tx(PlcState& st, std::chrono::steady_clock::
     const bool allow_change_tx = elapsed >= tx_present_ms_;
     const bool allow_keepalive_tx = elapsed >= kPresentKeepaliveMs;
     if (payload_changed ? allow_change_tx : allow_keepalive_tx) {
-        if (!send_frame(st, can_contract::evse_dc_reg_limits_id(static_cast<uint8_t>(st.plc_id)), payload)) {
+        const bool sent =
+            send_frame(st, can_contract::evse_dc_reg_limits_id(static_cast<uint8_t>(st.plc_id)), payload);
+        if (!sent) {
             EVLOG_warning << "Failed to TX EVSE present on CAN for plc_id=" << st.plc_id;
         } else {
             st.last_present_payload = payload;
             st.last_present_payload_valid = true;
+            st.last_present_tx = now;
         }
-        st.last_present_tx = now;
     }
 }
 
@@ -781,9 +789,11 @@ void PlcCanHardware::update_relay_tx(PlcState& st, std::chrono::steady_clock::ti
                                                            st.relay_clear_faults,
                                                            0,
                                                            use_crc_);
-    (void)send_frame(st, can_contract::relay_control_id(static_cast<uint8_t>(st.plc_id)), payload);
-    st.last_relay_tx = now;
-    st.relay_clear_faults = false;
+    const bool sent = send_frame(st, can_contract::relay_control_id(static_cast<uint8_t>(st.plc_id)), payload);
+    if (sent) {
+        st.last_relay_tx = now;
+        st.relay_clear_faults = false;
+    }
 }
 
 void PlcCanHardware::emit_autocharge_token(PlcState& st, const std::string& id_token,
