@@ -75,6 +75,9 @@ struct GunStatus {
     uint64_t limit_stale_events{0};
     uint64_t auth_push_count{0};
     uint64_t relay_conflict_count{0};
+    bool degraded_mode{false};
+    uint8_t backpressure_level{0};
+    uint64_t tx_error_count{0};
 };
 
 /// \brief Planner dispatch toward hardware (per connector).

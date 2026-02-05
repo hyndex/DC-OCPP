@@ -27,3 +27,15 @@
 - [x] Update config examples with HLC auth timeout + PnC block TTL.
 - [x] Add/adjust unit tests for HLC gate + PnC fallback behavior.
 - [x] Run targeted tests (auth_flow, pending_token_persistence, deterministic_vectors, limit_fallback, derate_fault, hlc_fallback).
+
+## CAN Stability Hardening — Single-Bus (Controller + 8 PLC + 16 Modules)
+- [x] Baseline gap readout: aligned stability plan vs. current controller/PLC code and highlighted load/race/fault risks (see notes in `src/plc_can.cpp`, Basic firmware scheduler).
+- [x] Controller backpressure: throttle non-critical CAN TX cadence when SocketCAN signals EAGAIN/ENOBUFS; cap keepalives to remain <1s while stretching limits/relay keepalive to reduce congestion (`src/plc_can.cpp`).
+- [x] Controller bus metrics: surface backpressure level/tx error count + degraded-mode flag via `GunStatus`.
+- [ ] Controller priority queues: enforce per-class TX ordering (safety/control/heartbeat/telemetry/debug) with latest-value wins + drop-oldest for low priority.
+- [x] PLC firmware scheduling: add load-shed tier for debug/meter under bus-off/fail, propagate TX fail/drop counters in shared state (Basic firmware `can_scheduler`, `shared_state`).
+- [ ] PLC filters/isolation: tighten MCP2515 acceptance filters per-node, add SPI mutex coverage audit, and document shield/termination expectations alongside `docs/system_overview.md`.
+- [ ] Contactor FSM/ACK: add seq/ack + idempotent close/open commands and welded/open detection feedback loop between controller and PLC.
+- [ ] HLC quiet/degraded window: gate bulk telemetry during SLAC/SDP/Auth/StartPowerDelivery windows; resume gradually post-start; coordinate with OCPP state machine.
+- [ ] Fault tolerance/watchdogs: confirm bus-off auto-recover on PLC + controller, add watchdog coverage notes, and define degraded-mode exit criteria.
+- [ ] Test matrix: codify stress, bus-off, node-drop, reboot, and HLC-under-load tests into `docs/soak_test_plan.md` with target pass/fail thresholds.

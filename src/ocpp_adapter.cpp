@@ -1677,6 +1677,14 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             }
             uint8_t module_healthy_mask = status.module_healthy_mask;
             uint8_t module_fault_mask = status.module_fault_mask;
+            int modules_requested = 0;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                const auto it = last_module_alloc_.find(connector);
+                if (it != last_module_alloc_.end()) {
+                    modules_requested = it->second;
+                }
+            }
             if (module_controller_) {
                 bool any_valid = false;
                 uint8_t healthy = 0;
@@ -1714,10 +1722,16 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const bool have_ev_targets = status.target_voltage_v && status.target_voltage_v.value() > 0.0;
             const bool precharge_hint = status.plugged_in && !post_stop_plugged && !status.hlc_charge_complete &&
                                         (status.hlc_precharge_active || have_ev_targets) &&
-                                        !disabled && !paused;
+                                        !disabled && !paused && status.authorization_granted;
             const bool power_ready_hint = had_session && session.authorized &&
                 (status.relay_closed || power_delivery_requested(status, lock_required)) && !disabled;
-            const bool need_modules = power_ready_hint || precharge_hint;
+            const bool module_commanded = modules_requested > 0;
+            const bool module_capability_needed =
+                status.relay_closed || status.hlc_precharge_active || status.hlc_stage >= HLC_MIN_POWER_STAGE ||
+                status.hlc_power_ready;
+            const bool module_relevant = status.plugged_in || had_session;
+            const bool need_modules = module_relevant && (power_ready_hint || precharge_hint) && module_commanded &&
+                                      module_capability_needed;
             bool module_unavailable_fault = false;
             if (!fault) {
                 if (need_modules && usable_modules == 0) {
@@ -1739,6 +1753,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                     module_missing_since_.erase(connector);
                 }
+            } else {
+                std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                module_missing_since_.erase(connector);
             }
             if (!fault && module_unavailable_fault) {
                 bool already_faulted = false;
@@ -1844,7 +1861,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             // Sync OCPP error states (raise on edges, clear on recovery).
             const bool ocpp_cp_fault = status.cp_fault && !cp_fault_grace;
             const bool ocpp_estop = status.estop;
-            const bool ocpp_comm = !ocpp_estop && (status.comm_fault || telemetry_stale);
+            const bool comm_relevant =
+                status.plugged_in || status.relay_closed || status.hlc_stage > 0 || had_session || status.authorization_granted;
+            const bool ocpp_comm = !ocpp_estop && comm_relevant && (status.comm_fault || telemetry_stale);
             const bool ocpp_earth = !ocpp_estop && !ocpp_comm && status.earth_fault;
             const bool ocpp_safety = !ocpp_estop && !ocpp_comm && !ocpp_earth && !status.safety_ok;
             const bool ocpp_isolation = status.isolation_fault;
@@ -2146,8 +2165,14 @@ void OcppAdapter::sync_ocpp_error(std::int32_t connector, const std::string& uui
 
     if (raise) {
         ocpp::v16::ErrorInfo err(uuid, error_code, is_fault, info, vendor_id, vendor_error_code);
+        EVLOG_warning << "Raising OCPP error connector=" << connector << " uuid=" << uuid
+                      << " code=" << static_cast<int>(error_code)
+                      << " fault=" << (is_fault ? "true" : "false")
+                      << (info ? " info=" + *info : "")
+                      << (vendor_error_code ? " vendor=" + *vendor_error_code : "");
         charge_point_->on_error(connector, err);
     } else if (clear) {
+        EVLOG_info << "Clearing OCPP error connector=" << connector << " uuid=" << uuid;
         charge_point_->on_error_cleared(connector, uuid);
     }
 }
@@ -3769,7 +3794,7 @@ void OcppAdapter::apply_power_plan() {
                 power_constrained_[c.id] = true;
             }
         }
-        if (local_fault) {
+        if (local_fault || dispatch.modules_assigned == 0 || info.disabled_by_csms) {
             isolation_ready = false;
             mc_closed_cmd = false;
         }
@@ -3977,6 +4002,9 @@ void OcppAdapter::apply_power_plan() {
         if (info.disabled_by_csms || connector_fault) {
             relay_mask_cmd = 0u;
         }
+        if (gc_module_count <= 0) {
+            relay_mask_cmd = 0u;
+        }
 
         PowerCommand cmd;
         cmd.connector = c.id;
@@ -3987,6 +4015,11 @@ void OcppAdapter::apply_power_plan() {
         cmd.voltage_set_v = dispatch.voltage_set_v;
         cmd.current_limit_a = allow_energy_home ? dispatch.current_limit_a : 0.0;
         cmd.power_kw = allow_energy_home ? dispatch.p_set_kw : 0.0;
+
+        if (cmd.module_count <= 0) {
+            cmd.module_mask = 0;
+            cmd.mc_closed = false;
+        }
 
         if (info.paused && g.ev_session_active && is_home) {
             cmd.current_limit_a = 0.0;

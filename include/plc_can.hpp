@@ -62,6 +62,14 @@ public:
     bool supports_cross_slot_islands() const override;
 
 private:
+    enum class TxPriority {
+        Critical = 0,
+        Control = 1,
+        Heartbeat = 2,
+        Telemetry = 3,
+        Debug = 4
+    };
+
     enum class AutochargeIdSource {
         Evmac,
         Evccid,
@@ -221,6 +229,8 @@ private:
         std::chrono::steady_clock::time_point emaid0_rx{};
         std::chrono::steady_clock::time_point emaid1_rx{};
         RfidAssembly rfid;
+        uint64_t tx_failures{0};
+        uint64_t tx_errors_recent{0};
     };
 
     ChargerConfig cfg_;
@@ -235,8 +245,11 @@ private:
     std::atomic<bool> running_{false};
     bool init_ok_{false};
     int connection_timeout_s_{0};
-    int tx_limits_ms_{500};
-    int tx_present_ms_{100};
+    int tx_limits_base_ms_{500};
+    int tx_present_base_ms_{100};
+    std::atomic<int> backpressure_level_{0};
+    std::atomic<uint64_t> backpressure_until_ms_{0};
+    std::atomic<uint64_t> last_backpressure_log_ms_{0};
     std::chrono::steady_clock::time_point started_at_{};
     mutable std::mutex state_mutex_;
     std::mutex token_mutex_;
@@ -244,15 +257,16 @@ private:
 
 
     bool open_socket_for_iface(const std::string& iface);
-    bool send_frame(const PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data);
+    bool send_frame(PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data,
+                    TxPriority pri = TxPriority::Telemetry);
     void rx_loop();
     void tx_loop();
     void handle_frame(uint32_t can_id, const uint8_t data[8]);
     PlcState* find_state_by_plc(uint8_t plc_id);
     std::int32_t connector_from_plc(uint8_t plc_id) const;
-    void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now);
-    void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now);
-    void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now);
+    void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
+    void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
+    void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor = 1);
     bool set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
     void emit_autocharge_token(PlcState& st, const std::string& id_token,
@@ -269,6 +283,9 @@ private:
     static uint16_t clamp_to_0p1(double v);
     static uint16_t clamp_to_0p1k(double kw);
     static uint16_t clamp_to_0p1_current(double a);
+    int compute_interval_ms(int base_ms, int min_ms, int max_ms, int backoff_factor) const;
+    int backpressure_factor(uint64_t now_ms);
+    void note_tx_backpressure(bool severe);
 };
 
 } // namespace charger
