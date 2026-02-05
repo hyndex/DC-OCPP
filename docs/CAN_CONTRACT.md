@@ -4,49 +4,48 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 
 ## ID map (extended IDs, low nibble = plc_id)
 
-- PLC→Controller
-  - `0x0100|(0x0<<4)|plc_id` CHARGEINFO: HLC stage/flags (auth pending/granted, lock, contactor state)
-  - `0x0200|(0x1<<4)|plc_id` EVDC_TARGETS: EV target V/I + EVSE present V/I (0.1V/0.1A)
-  - `0x0200|(0x0<<4)|plc_id` EVDC_MAX_LIMITS: EV max limits (EV-requested)
-  - `0x0200|(0x3<<4)|plc_id` EVDC_ENERGY_LIMITS: EV energy limits (if used)
-  - `0x0200|(0x5<<4)|plc_id` EVAC_CTRL: SLAC/SDP control
-  - `0x0200|(0x6<<4)|plc_id` EMAID0 segments
-  - `0x0200|(0x7<<4)|plc_id` EMAID1 segments
-  - `0x0200|(0x8<<4)|plc_id` EVCCID segments
-  - `0x0200|(0x4<<4)|plc_id` EVMAC segments (optional)
-  - `0x0400|(0x1<<4)|plc_id` CHARGING_SESSION: HLC session flags
-  - `0x0400|(0x3<<4)|plc_id` CP_LEVELS: CP state/duty/voltages
-  - `0x0100|(0x6<<4)|plc_id` RELAY_STATUS: relay feedback + safety bits
-  - `0x0100|(0x9<<4)|plc_id` SAFETY_STATUS: e-stop/earth/comm faults
-  - `0x0100|(0x7<<4)|plc_id` ENERGY_METER: V/I/P/Energy
-  - `0x0100|(0xA<<4)|plc_id` CONFIG_ACK: ACK for EVSE limit/config params (param=90 EVSE_LIMIT_ACK)
-  - `0x0100|(0xB<<4)|plc_id` DEBUG_INFO: diag counters
-
-- Controller→PLC
-  - `0x0300|(0x0<<4)|plc_id` EVSE_DC_MAX_LIMITS_CMD: EVSE capability (0.1V/0.1A/0.1kW). **Cadence: ≥1 Hz**
-  - `0x0300|(0x1<<4)|plc_id` EVSE_DC_PRESENT_CMD (EVSE_DC_REG_LIMITS): EVSE present V/I/P + flags. **Cadence: ≥10 Hz**
-    - byte6 bits: b0=output_enabled, b1=regulating, b2..b7=fault_bits[0..5] (see below)
-  - `0x0300|(0x8<<4)|plc_id` CONFIG_CMD: runtime config (auth pending/granted etc.)
-    - param 91: PROTO_VERSION (value must equal `1`); PLC returns NOT_ALLOWED on mismatch.
-    - param 20: AUTH_STATE (0/1 = denied/granted)
-    - param 21: AUTH_PENDING (0/1)
-    - param 30: LOCK_CMD (0=unlock, 1=lock)
-  - `0x0300|(0x4<<4)|plc_id` RELAY_CMD: module/gun relay drive (used only when controller owns GC)
-  - `0x0300|(0x9<<4)|plc_id` GCMC_CMD: mirrored relay command (legacy)
+- Protocol v2 (compact)
+  - Controller→PLC
+    - `0x0300|(0x2<<4)|plc_id` EVSE_FAST_V2: present V/I/P (0.5 V/0.2 A/0.5 kW) + output/regulating +
+      fault bits + relay cmd bits + sys_enable/force_off + seq + enable_mask + clear_faults.
+    - `0x0300|(0x3<<4)|plc_id` EVSE_SLOW_V2: max V/I/P (0.5 V/0.2 A/0.5 kW) + auth/pending + hlc_enable +
+      pnc_blocked + lock_cmd + proto_version.
+  - PLC→Controller
+    - `0x0400|(0x4<<4)|plc_id` PLC_STATE_V2: cp_state + duty_pct + hlc_stage + auth/lock/precharge flags.
+    - `0x0400|(0x5<<4)|plc_id` PLC_STATUS_V2: relay state/fault bits + safety bits + fault_reason + tec/rec + uptime +
+      safety policy.
+    - `0x0200|(0x0<<4)|plc_id` EVDC_MAX_LIMITS: EVSE max V/I/P from HLC (0.1V/0.1A/0.1kW).
+    - `0x0200|(0x1<<4)|plc_id` EVDC_TARGETS: EV target V/I + EVSE present V/I (0.1V/0.1A).
+    - `0x0200|(0x2<<4)|plc_id` EV_STATUS_DISPLAY: present V/I + CP/HLC summary.
+    - `0x0200|(0x3<<4)|plc_id` EVDC_ENERGY_LIMITS: EVSE max V/I/P (0.1V/0.1A/0.1kW).
+    - `0x0200|(0x5<<4)|plc_id` EVAC_CHG_CTRL: CP duty/state + setpoint/present I.
+    - `0x0100|(0x7<<4)|plc_id` ENERGY_METER: V/I/P/Energy.
+    - `0x0100|(0xA<<4)|plc_id` CONFIG_ACK: ACK for EVSE limit/config params (param=90 EVSE_LIMIT_ACK).
+    - `0x0100|(0x8<<4)|plc_id` RFID_EVENT: segmented UID events.
+    - `0x0200|(0x6<<4)|plc_id` EMAID0 segments.
+    - `0x0200|(0x7<<4)|plc_id` EMAID1 segments.
+    - `0x0200|(0x8<<4)|plc_id` EVCCID segments.
+    - `0x0200|(0x4<<4)|plc_id` EVMAC segments (optional).
+    - `0x090000|plc_id` BOOTCONFIG: firmware + feature flags.
+    - `0x0100|(0x3<<4)|plc_id` HW_STATUS, `0x0100|(0xB<<4)|plc_id` DEBUGINFO,
+      `0x0400|(0x0<<4)|plc_id` RTTLOG, `0x0400|(0x2<<4)|plc_id` RTEVLOG,
+      `0x0100|(0x1<<4)|plc_id` SOFTWAREINFO, `0x0100|(0xC<<4)|plc_id` GUN_TEMP (if enabled),
+      `0x0100|(0x2<<4)|plc_id` ERRORCODES, `0x0100|(0x4<<4)|plc_id` SLACINFO (debug/placeholder).
+  - Controller→PLC
+    - `0x0300|(0x8<<4)|plc_id` CONFIG_CMD: PROTO_VERSION query (op=1); PLC returns CONFIG_ACK value `2`.
 
 ## Ownership rules
 
 - **Gun contactor (GC) ownership is PLC-only when `plc.gunRelayOwnedByPlc=true` (default).**
-  - Controller will not set GC bits in `RELAY_CMD` when this flag is true.
+  - Controller will not set GC bits in EVSE_FAST_V2 when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
 - Auxiliary relays (RLY2/RLY3) are used as KM_A/KM_B bus sectionalizers when `plc.moduleRelaysEnabled=true`
   (module‑level ring cuts; bit0=KM_A, bit1=KM_B).
-- When both RELAY_CMD and mirrored GCMC_CMD are present, PLC gives priority to RELAY_CMD updates received within 50 ms; GCMC_CMD is used only as a legacy fallback when no fresh RELAY_CMD is seen.
-- `CLEAR_FAULTS` in RELAY_CMD/GCMC_CMD is asserted only on explicit operator/service request (no auto-clear on any fault).
+- `CLEAR_FAULTS` in EVSE_FAST_V2 is asserted only on explicit operator/service request (no auto-clear on any fault).
 
 ## Fault propagation (controller → PLC)
 
-- Controller computes a 6-bit fault mask each planner tick and packs into EVSE_PRESENT byte6 bits 2..7:
+- Controller computes a 6-bit fault mask each planner tick and packs into EVSE_FAST_V2 bits 31..36:
   - bit0 (LSB in mask) = general fault present (safety not OK or meter/CP issues)
   - bit1 = communication fault (PLC/controller path)
   - bit2 = isolation/earth/E-Stop fault
@@ -59,12 +58,15 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 
 ## Cadence and freshness requirements
 
-- EVSE_DC_PRESENT_CMD (`0x310+id`): send every 100 ms nominal; **warn at > presentWarnMs (default 1000 ms)**, controller will flag comm fault and constrain power on staleness.
-- EVSE_DC_MAX_LIMITS_CMD (`0x300+id`): send every 1 s nominal and whenever derates change; **warn at > limitsWarnMs (default 1500 ms)**, controller will constrain power on staleness.
+- EVSE_FAST_V2: send every 100 ms nominal; **warn at > presentWarnMs (default 1000 ms)**, controller will flag comm
+  fault and constrain power on staleness.
+- EVSE_SLOW_V2: send every 1 s nominal and whenever derates/config change; **warn at > limitsWarnMs (default 1500 ms)**.
 - PLC must ACK EVSE limits via CONFIG_ACK param 90. Controller will constrain power if ACK is stale (`evseLimitAckTimeoutMs`).
-- PROTO_VERSION (param 91) handshake is mandatory; the controller expects value `1` and treats mismatches as a comm fault.
-- CRC8 (poly 0x07, init 0x00) is required on RelayControl/RelayStatus/SafetyStatus/GCMC_Command/GCMC_Status/ConfigCmd/ConfigAck **and** EVSE_DC_MAX_LIMITS/EVSE_DC_PRESENT; frames that carry CRC8 must use DLC=8.
-- Authorization state must be refreshed by controller every ~1 s; PLC must treat AUTH_PENDING as valid until controller clears it.
+- PROTO_VERSION (param 91) handshake is mandatory; controller queries (op=1) and expects CONFIG_ACK value `2`
+  (mismatch treated as a comm fault).
+- CRC8 (poly 0x07, init 0x00) is required on ConfigCmd/ConfigAck and EVSE_FAST_V2/EVSE_SLOW_V2/PLC_STATE_V2/
+  PLC_STATUS_V2; frames that carry CRC8 must use DLC=8.
+- Authorization state should be refreshed by controller every ~1 s via EVSE_SLOW_V2.
 
 ## Identity / Autocharge
 
@@ -77,7 +79,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 - If fault bits indicate weld/iso/comm/thermal/overcurrent, PLC should:
   - Refuse/abort PowerDelivery/CurrentDemand with appropriate ResponseCode (e.g., `FAILED_IsolationMonitoringActive`, `FAILED_PowerDeliveryNotApplied`, `FAILED_WeldingDetectionFailed`).
   - Set DC_EVSEStatusCode to Faulted/IsolationMonitoringActive/WeldDetected accordingly.
-- Suggested ISO/DIN ResponseCode mapping (consume fault bits in EVSE_PRESENT):
+- Suggested ISO/DIN ResponseCode mapping (consume fault bits in EVSE_FAST_V2):
   - Isolation/earth/E-Stop (bit2): `FAILED_IsolationMonitoringActive` + `EVSE_IsolationMonitoringActive`
   - Weld (bit5): `FAILED_WeldingDetectionFailed` + `EVSE_EmergencyShutdown`
   - Overcurrent (bit4): `FAILED_PowerDeliveryNotApplied` + `EVSE_EmergencyShutdown`

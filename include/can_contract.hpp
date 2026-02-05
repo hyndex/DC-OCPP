@@ -23,7 +23,7 @@ constexpr uint8_t PARAM_PNC_BLOCKED = 23;
 constexpr uint8_t PARAM_LOCK_CMD = 30;
 constexpr uint8_t PARAM_EVSE_LIMIT_ACK = 90;
 constexpr uint8_t PARAM_PROTO_VERSION = 91;
-constexpr uint8_t PROTOCOL_VERSION = 1;
+constexpr uint8_t PROTOCOL_VERSION = 2;
 
 // BootConfig feature flags.
 constexpr uint8_t FEATURE_RELAYS = 1u << 0;
@@ -41,17 +41,12 @@ inline uint32_t tx_id(uint32_t base_aligned, uint8_t type_nibble, uint8_t plc_id
            static_cast<uint32_t>(plc_id & 0x0Fu);
 }
 
-inline uint32_t relay_control_id(uint8_t plc_id) { return rx_id(0x4u, plc_id); }
-inline uint32_t gcmc_command_id(uint8_t plc_id) { return rx_id(0x9u, plc_id); }
 inline uint32_t config_cmd_id(uint8_t plc_id) { return rx_id(0x8u, plc_id); }
-inline uint32_t evse_dc_max_limits_id(uint8_t plc_id) { return rx_id(0x0u, plc_id); }
-inline uint32_t evse_dc_reg_limits_id(uint8_t plc_id) { return rx_id(0x1u, plc_id); }
+inline uint32_t evse_fast_v2_id(uint8_t plc_id) { return rx_id(0x2u, plc_id); }
+inline uint32_t evse_slow_v2_id(uint8_t plc_id) { return rx_id(0x3u, plc_id); }
 
-inline uint32_t charge_info_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x0u, plc_id); }
-inline uint32_t relay_status_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x6u, plc_id); }
 inline uint32_t energy_meter_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x7u, plc_id); }
 inline uint32_t rfid_event_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x8u, plc_id); }
-inline uint32_t safety_status_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0x9u, plc_id); }
 inline uint32_t config_ack_id(uint8_t plc_id) { return tx_id(TX_BASE_SYS, 0xAu, plc_id); }
 inline uint32_t evdc_max_limits_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x0u, plc_id); }
 inline uint32_t evdc_targets_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x1u, plc_id); }
@@ -62,8 +57,8 @@ inline uint32_t evccid_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x8u, plc
 inline uint32_t evemaid0_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x6u, plc_id); }
 inline uint32_t evemaid1_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x7u, plc_id); }
 inline uint32_t evmac_id(uint8_t plc_id) { return tx_id(TX_BASE_EVDC, 0x4u, plc_id); }
-inline uint32_t cp_voltage_levels_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x3u, plc_id); }
-inline uint32_t charging_session_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x1u, plc_id); }
+inline uint32_t plc_state_v2_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x4u, plc_id); }
+inline uint32_t plc_status_v2_id(uint8_t plc_id) { return tx_id(TX_BASE_CP, 0x5u, plc_id); }
 inline uint32_t boot_config_id(uint8_t plc_id) { return TX_BASE_BOOT | static_cast<uint32_t>(plc_id & 0x0Fu); }
 
 constexpr std::array<const char*, 13> FAULT_REASONS = {{
@@ -146,36 +141,6 @@ struct ConfigAck {
     bool crc_ok{true};
 };
 
-struct ChargeInfo {
-    uint8_t hlc_stage{0};
-    bool charge_complete{false};
-    bool precharge_active{false};
-    bool cable_checked{false};
-    bool auth_granted{false};
-    bool auth_pending{false};
-    bool lock_engaged{false};
-    uint8_t target_mv_lsb{0};
-    uint8_t target_ma_lsb{0};
-    uint8_t present_mv_lsb{0};
-    uint8_t present_ma_lsb{0};
-};
-
-struct CpVoltageLevels {
-    uint16_t mv_robust{0};
-    uint16_t mv_peak{0};
-    uint16_t mv_min{0};
-    char cp_state{'U'};
-    uint8_t duty_pct{0};
-};
-
-struct ChargingSession {
-    uint32_t session_epoch{0};
-    char cp_state{'U'};
-    uint8_t duty_pct{0};
-    uint8_t hlc_stage{0};
-    bool auth_pending{false};
-};
-
 struct BootConfig {
     uint8_t fw_major{0};
     uint8_t fw_minor{0};
@@ -221,41 +186,25 @@ struct IdentitySegment {
     std::array<uint8_t, 5> payload{};
 };
 
-inline std::array<uint8_t, 8> build_relay_control_masks(uint8_t cmd_mask,
-                                                        uint8_t enable_mask,
-                                                        uint8_t seq,
-                                                        bool sys_enable,
-                                                        bool force_all_off,
-                                                        bool clear_faults,
-                                                        uint16_t pulse_ms,
-                                                        bool use_crc8) {
-    std::array<uint8_t, 8> data{};
-    data[0] = static_cast<uint8_t>(cmd_mask & 0x07u);
-    if (sys_enable) data[0] |= 0x08u;
-    if (force_all_off) data[0] |= 0x10u;
-    if (clear_faults) data[0] |= 0x20u;
-    data[1] = seq;
-    data[2] = static_cast<uint8_t>(enable_mask & 0x07u);
-    data[3] = pulse_ms > 0 ? 1u : 0u;
-    data[4] = static_cast<uint8_t>(pulse_ms & 0xFFu);
-    data[5] = static_cast<uint8_t>((pulse_ms >> 8) & 0xFFu);
-    data[6] = 0;
-    data[7] = use_crc8 ? crc8_07(data.data(), 7) : 0;
-    return data;
-}
+struct PlcStateV2 {
+    char cp_state{'U'};
+    uint8_t duty_pct{0};
+    uint8_t hlc_stage{0};
+    bool auth_granted{false};
+    bool auth_pending{false};
+    bool lock_engaged{false};
+    bool charge_complete{false};
+    bool precharge_active{false};
+    bool cable_checked{false};
+    bool crc_ok{true};
+};
 
-inline std::array<uint8_t, 8> build_relay_control(uint8_t relay_mask,
-                                                  bool state_on,
-                                                  uint8_t seq,
-                                                  bool sys_enable,
-                                                  bool force_all_off,
-                                                  bool clear_faults,
-                                                  uint16_t pulse_ms,
-                                                  bool use_crc8) {
-    const uint8_t cmd_mask = state_on ? relay_mask : 0u;
-    return build_relay_control_masks(cmd_mask, relay_mask, seq, sys_enable, force_all_off, clear_faults,
-                                     pulse_ms, use_crc8);
-}
+struct PlcStatusV2 {
+    RelayStatus relay{};
+    SafetyStatus safety{};
+    uint8_t policy{0};
+    bool crc_ok{true};
+};
 
 inline std::array<uint8_t, 8> build_config_cmd(uint8_t param_id, uint8_t op, uint32_t value, bool use_crc8) {
     std::array<uint8_t, 8> data{};
@@ -270,92 +219,66 @@ inline std::array<uint8_t, 8> build_config_cmd(uint8_t param_id, uint8_t op, uin
     return data;
 }
 
-inline std::array<uint8_t, 8> build_evse_limits(uint16_t max_v_0p1,
-                                                uint16_t max_i_0p1,
-                                                uint16_t max_p_0p1,
-                                                bool use_crc8) {
+inline std::array<uint8_t, 8> build_evse_fast_v2(uint16_t present_v_0p5,
+                                                  uint16_t present_i_0p2,
+                                                  uint16_t present_p_0p5,
+                                                  bool output_enabled,
+                                                  bool regulating,
+                                                  uint8_t fault_bits,
+                                                  uint8_t relay_cmd_mask,
+                                                  uint8_t relay_enable_mask,
+                                                  bool sys_enable,
+                                                  bool force_off,
+                                                  bool clear_faults,
+                                                  uint8_t seq,
+                                                  bool use_crc8) {
     std::array<uint8_t, 8> data{};
-    data[0] = static_cast<uint8_t>(max_v_0p1 & 0xFFu);
-    data[1] = static_cast<uint8_t>((max_v_0p1 >> 8) & 0xFFu);
-    data[2] = static_cast<uint8_t>(max_i_0p1 & 0xFFu);
-    data[3] = static_cast<uint8_t>((max_i_0p1 >> 8) & 0xFFu);
-    data[4] = static_cast<uint8_t>(max_p_0p1 & 0xFFu);
-    data[5] = static_cast<uint8_t>((max_p_0p1 >> 8) & 0xFFu);
-    data[6] = 0;
+    uint64_t packed = 0;
+    packed |= static_cast<uint64_t>(present_v_0p5 & 0x07FFu) << 0;
+    packed |= static_cast<uint64_t>(present_i_0p2 & 0x07FFu) << 11;
+    packed |= static_cast<uint64_t>(present_p_0p5 & 0x01FFu) << 22;
+    packed |= static_cast<uint64_t>(fault_bits & 0x3Fu) << 31;
+    packed |= static_cast<uint64_t>(output_enabled ? 1u : 0u) << 37;
+    packed |= static_cast<uint64_t>(regulating ? 1u : 0u) << 38;
+    packed |= static_cast<uint64_t>(relay_cmd_mask & 0x07u) << 39;
+    packed |= static_cast<uint64_t>(sys_enable ? 1u : 0u) << 42;
+    packed |= static_cast<uint64_t>(force_off ? 1u : 0u) << 43;
+    packed |= static_cast<uint64_t>(seq) << 44;
+    packed |= static_cast<uint64_t>(relay_enable_mask & 0x07u) << 52;
+    packed |= static_cast<uint64_t>(clear_faults ? 1u : 0u) << 55;
+    for (int i = 0; i < 7; ++i) {
+        data[i] = static_cast<uint8_t>((packed >> (i * 8)) & 0xFFu);
+    }
     data[7] = use_crc8 ? crc8_07(data.data(), 7) : 0;
     return data;
 }
 
-inline std::array<uint8_t, 8> build_evse_present(uint16_t present_v_0p1,
-                                                 uint16_t present_i_0p1,
-                                                 uint16_t present_p_0p1k,
-                                                 bool output_enabled,
-                                                 bool regulating,
-                                                 uint8_t fault_bits,
-                                                 bool use_crc8) {
+inline std::array<uint8_t, 8> build_evse_slow_v2(uint16_t max_v_0p5,
+                                                  uint16_t max_i_0p2,
+                                                  uint16_t max_p_0p5,
+                                                  bool auth_granted,
+                                                  bool auth_pending,
+                                                  bool hlc_enable,
+                                                  bool pnc_blocked,
+                                                  bool lock_cmd,
+                                                  uint8_t proto_version,
+                                                  bool use_crc8) {
     std::array<uint8_t, 8> data{};
-    data[0] = static_cast<uint8_t>(present_v_0p1 & 0xFFu);
-    data[1] = static_cast<uint8_t>((present_v_0p1 >> 8) & 0xFFu);
-    data[2] = static_cast<uint8_t>(present_i_0p1 & 0xFFu);
-    data[3] = static_cast<uint8_t>((present_i_0p1 >> 8) & 0xFFu);
-    data[4] = static_cast<uint8_t>(present_p_0p1k & 0xFFu);
-    data[5] = static_cast<uint8_t>((present_p_0p1k >> 8) & 0xFFu);
-    uint8_t flags = 0;
-    if (output_enabled) flags |= 0x01u;
-    if (regulating) flags |= 0x02u;
-    flags |= static_cast<uint8_t>((fault_bits & 0x3Fu) << 2);
-    data[6] = flags;
+    uint64_t packed = 0;
+    packed |= static_cast<uint64_t>(max_v_0p5 & 0x07FFu) << 0;
+    packed |= static_cast<uint64_t>(max_i_0p2 & 0x07FFu) << 11;
+    packed |= static_cast<uint64_t>(max_p_0p5 & 0x01FFu) << 22;
+    packed |= static_cast<uint64_t>(auth_granted ? 1u : 0u) << 31;
+    packed |= static_cast<uint64_t>(auth_pending ? 1u : 0u) << 32;
+    packed |= static_cast<uint64_t>(hlc_enable ? 1u : 0u) << 33;
+    packed |= static_cast<uint64_t>(pnc_blocked ? 1u : 0u) << 34;
+    packed |= static_cast<uint64_t>(lock_cmd ? 1u : 0u) << 35;
+    packed |= static_cast<uint64_t>(proto_version & 0x0Fu) << 36;
+    for (int i = 0; i < 7; ++i) {
+        data[i] = static_cast<uint8_t>((packed >> (i * 8)) & 0xFFu);
+    }
     data[7] = use_crc8 ? crc8_07(data.data(), 7) : 0;
     return data;
-}
-
-inline RelayStatus decode_relay_status(const uint8_t in[8], bool use_crc8) {
-    RelayStatus st{};
-    st.relay[0] = (in[0] & 0x01u) != 0;
-    st.relay[1] = (in[0] & 0x02u) != 0;
-    st.relay[2] = (in[0] & 0x04u) != 0;
-    st.relay_fault[0] = (in[0] & 0x08u) != 0;
-    st.relay_fault[1] = (in[0] & 0x10u) != 0;
-    st.relay_fault[2] = (in[0] & 0x20u) != 0;
-    st.safety_active = (in[0] & 0x40u) != 0;
-    st.comm_fault = (in[0] & 0x80u) != 0;
-
-    st.sw_active[0] = (in[2] & 0x01u) != 0;
-    st.sw_active[1] = (in[2] & 0x02u) != 0;
-    st.sw_active[2] = (in[2] & 0x04u) != 0;
-    st.estop_latched = (in[2] & 0x08u) != 0;
-    st.safety_ok = (in[2] & 0x10u) != 0;
-    st.earth_fault = (in[2] & 0x20u) != 0;
-    st.sw_active[3] = (in[2] & 0x40u) != 0;
-    st.estop_input = (in[2] & 0x80u) != 0;
-
-    st.fault_reason = in[3];
-    st.uptime_s = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
-    st.tec = static_cast<uint8_t>((in[6] >> 4) & 0x0Fu);
-    st.rec = static_cast<uint8_t>(in[6] & 0x0Fu);
-    if (use_crc8) {
-        const auto crc = crc8_07(in, 7);
-        st.crc_ok = (crc == in[7]);
-    }
-    return st;
-}
-
-inline SafetyStatus decode_safety_status(const uint8_t in[8], bool use_crc8) {
-    SafetyStatus st{};
-    st.sw_active[0] = (in[0] & 0x01u) != 0;
-    st.sw_active[1] = (in[0] & 0x02u) != 0;
-    st.sw_active[2] = (in[0] & 0x04u) != 0;
-    st.estop_latched = (in[0] & 0x08u) != 0;
-    st.safety_ok = (in[0] & 0x10u) != 0;
-    st.earth_fault = (in[0] & 0x20u) != 0;
-    st.sw_active[3] = (in[0] & 0x40u) != 0;
-    st.estop_input = (in[0] & 0x80u) != 0;
-    st.policy = in[2];
-    if (use_crc8) {
-        const auto crc = crc8_07(in, 7);
-        st.crc_ok = (crc == in[7]);
-    }
-    return st;
 }
 
 inline MeterReading decode_energy_meter(const uint8_t in[8], std::uint64_t seq) {
@@ -404,42 +327,57 @@ inline ConfigAck decode_config_ack(const uint8_t in[8], bool use_crc8) {
     return ack;
 }
 
-inline ChargeInfo decode_charge_info(const uint8_t in[8]) {
-    ChargeInfo info{};
-    info.hlc_stage = in[0];
-    const uint8_t flags = in[1];
-    info.charge_complete = (flags & 0x01u) != 0;
-    info.precharge_active = (flags & 0x02u) != 0;
-    info.cable_checked = (flags & 0x04u) != 0;
-    info.auth_granted = (flags & 0x08u) != 0;
-    info.auth_pending = (flags & 0x10u) != 0;
-    info.lock_engaged = (flags & 0x20u) != 0;
-    info.target_mv_lsb = in[2];
-    info.target_ma_lsb = in[3];
-    info.present_mv_lsb = in[4];
-    info.present_ma_lsb = in[5];
-    return info;
+inline PlcStateV2 decode_plc_state_v2(const uint8_t in[8], bool use_crc8) {
+    PlcStateV2 st{};
+    if (use_crc8) {
+        st.crc_ok = (crc8_07(in, 7) == in[7]);
+    }
+    st.cp_state = static_cast<char>(in[0]);
+    st.duty_pct = in[1];
+    st.hlc_stage = in[2];
+    const uint8_t flags = in[3];
+    st.auth_granted = (flags & 0x01u) != 0;
+    st.auth_pending = (flags & 0x02u) != 0;
+    st.lock_engaged = (flags & 0x04u) != 0;
+    st.charge_complete = (flags & 0x08u) != 0;
+    st.precharge_active = (flags & 0x10u) != 0;
+    st.cable_checked = (flags & 0x20u) != 0;
+    return st;
 }
 
-inline CpVoltageLevels decode_cp_voltage_levels(const uint8_t in[8]) {
-    CpVoltageLevels cp{};
-    cp.mv_robust = static_cast<uint16_t>(in[0]) | (static_cast<uint16_t>(in[1]) << 8);
-    cp.cp_state = static_cast<char>(in[2]);
-    cp.duty_pct = in[3];
-    cp.mv_peak = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
-    cp.mv_min = static_cast<uint16_t>(in[6]) | (static_cast<uint16_t>(in[7]) << 8);
-    return cp;
-}
+inline PlcStatusV2 decode_plc_status_v2(const uint8_t in[8], bool use_crc8) {
+    PlcStatusV2 st{};
+    if (use_crc8) {
+        st.crc_ok = (crc8_07(in, 7) == in[7]);
+    }
+    const uint8_t b0 = in[0];
+    st.relay.relay[0] = (b0 & 0x01u) != 0;
+    st.relay.relay[1] = (b0 & 0x02u) != 0;
+    st.relay.relay[2] = (b0 & 0x04u) != 0;
+    st.relay.relay_fault[0] = (b0 & 0x08u) != 0;
+    st.relay.relay_fault[1] = (b0 & 0x10u) != 0;
+    st.relay.relay_fault[2] = (b0 & 0x20u) != 0;
+    st.relay.safety_active = (b0 & 0x40u) != 0;
+    st.relay.comm_fault = (b0 & 0x80u) != 0;
 
-inline ChargingSession decode_charging_session(const uint8_t in[8]) {
-    ChargingSession session{};
-    session.session_epoch = static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) |
-                            (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) << 24);
-    session.cp_state = static_cast<char>(in[4]);
-    session.duty_pct = in[5];
-    session.hlc_stage = in[6];
-    session.auth_pending = (in[7] != 0);
-    return session;
+    const uint8_t b1 = in[1];
+    st.safety.sw_active[0] = (b1 & 0x01u) != 0;
+    st.safety.sw_active[1] = (b1 & 0x02u) != 0;
+    st.safety.sw_active[2] = (b1 & 0x04u) != 0;
+    st.safety.estop_latched = (b1 & 0x08u) != 0;
+    st.safety.safety_ok = (b1 & 0x10u) != 0;
+    st.safety.earth_fault = (b1 & 0x20u) != 0;
+    st.safety.sw_active[3] = (b1 & 0x40u) != 0;
+    st.safety.estop_input = (b1 & 0x80u) != 0;
+
+    st.relay.fault_reason = in[2];
+    st.relay.tec = static_cast<uint8_t>((in[3] >> 4) & 0x0Fu);
+    st.relay.rec = static_cast<uint8_t>(in[3] & 0x0Fu);
+    st.relay.uptime_s = static_cast<uint16_t>(in[4]) | (static_cast<uint16_t>(in[5]) << 8);
+    st.safety.policy = in[6];
+    st.relay.crc_ok = st.crc_ok;
+    st.safety.crc_ok = st.crc_ok;
+    return st;
 }
 
 inline BootConfig decode_boot_config(const uint8_t in[8]) {

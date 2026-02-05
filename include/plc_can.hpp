@@ -117,13 +117,10 @@ private:
         std::string iface;
         std::atomic<uint8_t> seq{0};
         AuthorizationState desired_auth_state{AuthorizationState::Unknown};
-        std::chrono::steady_clock::time_point last_auth_tx{};
         bool authorized{false};
         bool auth_pending{false};
         bool hlc_enabled{false};
         bool pnc_blocked{false};
-        bool hlc_enabled_sent{false};
-        bool pnc_blocked_sent{false};
         bool sys_enable{false};
         bool output_enabled{false};
         bool regulating{false};
@@ -165,7 +162,7 @@ private:
         uint8_t relay_enable_mask{0};
         bool relay_force_off{false};
         // Desired relay state (planner / EVSE control). Applied state is held in the fields above and is
-        // rate-limited/debounced in update_relay_tx() to avoid relay chatter and excess CAN traffic.
+        // rate-limited/debounced in update_fast_v2_tx() to avoid relay chatter and excess CAN traffic.
         bool desired_sys_enable{true};
         uint8_t desired_relay_cmd_mask{0};
         uint8_t desired_relay_enable_mask{0};
@@ -206,8 +203,6 @@ private:
         std::chrono::steady_clock::time_point last_protocol_tx{};
         std::chrono::steady_clock::time_point last_protocol_ack{};
         std::chrono::steady_clock::time_point last_protocol_warn{};
-        std::chrono::steady_clock::time_point last_hlc_enable_tx{};
-        std::chrono::steady_clock::time_point last_pnc_block_tx{};
         // Track CAN-level protocol health.
         uint64_t relay_status_crc_fail_count{0};
         uint64_t safety_status_crc_fail_count{0};
@@ -264,9 +259,8 @@ private:
     void handle_frame(uint32_t can_id, const uint8_t data[8]);
     PlcState* find_state_by_plc(uint8_t plc_id);
     std::int32_t connector_from_plc(uint8_t plc_id) const;
-    void update_limits_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
-    void update_present_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
-    void update_relay_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor = 1);
+    void update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
+    void update_slow_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
     bool set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
     void emit_autocharge_token(PlcState& st, const std::string& id_token,
@@ -280,9 +274,9 @@ private:
                                       const can_contract::RfidEventSegment& seg,
                                       std::chrono::steady_clock::time_point now,
                                       std::vector<uint8_t>& out);
-    static uint16_t clamp_to_0p1(double v);
-    static uint16_t clamp_to_0p1k(double kw);
-    static uint16_t clamp_to_0p1_current(double a);
+    static uint16_t clamp_to_0p5(double v);
+    static uint16_t clamp_to_0p5k(double kw);
+    static uint16_t clamp_to_0p2_current(double a);
     int compute_interval_ms(int base_ms, int min_ms, int max_ms, int backoff_factor) const;
     int backpressure_factor(uint64_t now_ms);
     void note_tx_backpressure(bool severe);
