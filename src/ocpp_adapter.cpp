@@ -1166,6 +1166,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
     auto meter_period = std::chrono::seconds(std::max(1, current_interval_s));
     const auto control_tick = std::chrono::milliseconds(50);
     auto next_meter_push = std::chrono::steady_clock::now();
+    bool telemetry_stale_active = false;
+    std::chrono::steady_clock::time_point telemetry_stale_log_ts{};
+    std::chrono::steady_clock::time_point telemetry_stale_disable_ts{};
+    std::chrono::steady_clock::time_point telemetry_overdue_since{};
+    std::chrono::steady_clock::time_point charge_complete_since{};
 
     while (running_) {
         try {
@@ -1820,10 +1825,26 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
             }
 
+            const bool telemetry_seen = status.last_telemetry.time_since_epoch().count() != 0;
+            const auto telemetry_age =
+                telemetry_seen ? (now - status.last_telemetry) : std::chrono::steady_clock::duration::zero();
+            const bool telemetry_overdue = cfg_.telemetry_timeout_ms > 0 && telemetry_seen &&
+                                           telemetry_age > telemetry_timeout(cfg_);
+            if (telemetry_overdue) {
+                if (telemetry_overdue_since.time_since_epoch().count() == 0) {
+                    telemetry_overdue_since = now;
+                }
+            } else {
+                telemetry_overdue_since = std::chrono::steady_clock::time_point{};
+            }
+            constexpr auto kTelemetryStaleDebounce = std::chrono::milliseconds(500);
+            const bool telemetry_stale = telemetry_overdue && telemetry_overdue_since.time_since_epoch().count() != 0 &&
+                                         (now - telemetry_overdue_since) >= kTelemetryStaleDebounce;
+
             // Sync OCPP error states (raise on edges, clear on recovery).
             const bool ocpp_cp_fault = status.cp_fault && !cp_fault_grace;
             const bool ocpp_estop = status.estop;
-            const bool ocpp_comm = !ocpp_estop && status.comm_fault;
+            const bool ocpp_comm = !ocpp_estop && (status.comm_fault || telemetry_stale);
             const bool ocpp_earth = !ocpp_estop && !ocpp_comm && status.earth_fault;
             const bool ocpp_safety = !ocpp_estop && !ocpp_comm && !ocpp_earth && !status.safety_ok;
             const bool ocpp_isolation = status.isolation_fault;
@@ -1839,7 +1860,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             // OCPP 1.6 has no dedicated "EmergencyStop" error code; avoid mislabeling it as PowerSwitchFailure.
             sync_ocpp_error(connector, "estop", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_estop,
                             "EmergencyStop", cfg_.vendor, "ESTOP");
-            sync_ocpp_error(connector, "comm", ocpp::v16::ChargePointErrorCode::InternalError, true, ocpp_comm);
+            sync_ocpp_error(connector, "comm", ocpp::v16::ChargePointErrorCode::InternalError, true, ocpp_comm,
+                            telemetry_stale ? "TelemetryStale" : "PlcCommFault", cfg_.vendor,
+                            telemetry_stale ? "TELEM_STALE" : "PLC_COMM");
             sync_ocpp_error(connector, "earth", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_earth);
             sync_ocpp_error(connector, "safety", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_safety,
                             "SafetyTrip", cfg_.vendor, "SAFETY");
@@ -1872,7 +1895,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 const auto age = now - status.last_evse_limit_ack;
                 const auto ack_timeout = evse_limit_ack_timeout(cfg_);
                 if (age > ack_timeout) {
-                    EVLOG_error << "EVSE limit ACK stale on connector " << connector << " age=" << age.count()
+                    EVLOG_error << "EVSE limit ACK stale on connector " << connector
+                                << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(age).count()
                                 << "ms ack_count=" << status.evse_limit_ack_count
                                 << " -- stopping session for safety";
                     {
@@ -1886,11 +1910,15 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
             }
 
-            if (!fault && cfg_.telemetry_timeout_ms > 0 &&
-                status.last_telemetry.time_since_epoch().count() != 0) {
-                const auto age = now - status.last_telemetry;
-                if (age > telemetry_timeout(cfg_)) {
-                    EVLOG_error << "Telemetry stale on connector " << connector << " age=" << age.count()
+            if (telemetry_stale) {
+                fault = true;
+                if (!telemetry_stale_active) {
+                    telemetry_stale_active = true;
+                    telemetry_stale_log_ts = now;
+                    telemetry_stale_disable_ts = now;
+                    EVLOG_error << "Telemetry stale on connector " << connector
+                                << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
+                                << "ms timeout=" << telemetry_timeout(cfg_).count()
                                 << "ms -- forcing stop for safety";
                     {
                         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1901,8 +1929,26 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         had_session = false;
                     }
                     hardware_->disable(connector);
-                    fault = true;
+                } else {
+                    if (telemetry_stale_log_ts.time_since_epoch().count() == 0 ||
+                        (now - telemetry_stale_log_ts) > std::chrono::seconds(10)) {
+                        telemetry_stale_log_ts = now;
+                        EVLOG_error << "Telemetry still stale on connector " << connector
+                                    << " age="
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
+                                    << "ms timeout=" << telemetry_timeout(cfg_).count() << "ms";
+                    }
+                    if (telemetry_stale_disable_ts.time_since_epoch().count() == 0 ||
+                        (now - telemetry_stale_disable_ts) > std::chrono::seconds(1)) {
+                        telemetry_stale_disable_ts = now;
+                        hardware_->disable(connector);
+                    }
                 }
+            } else if (telemetry_stale_active) {
+                telemetry_stale_active = false;
+                telemetry_stale_log_ts = std::chrono::steady_clock::time_point{};
+                telemetry_stale_disable_ts = std::chrono::steady_clock::time_point{};
+                EVLOG_info << "Telemetry recovered on connector " << connector;
             }
 
             if (!fault && had_session && session.transaction_started && status.hlc_charge_complete) {

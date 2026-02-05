@@ -156,6 +156,15 @@ private:
         uint8_t relay_cmd_mask{0};
         uint8_t relay_enable_mask{0};
         bool relay_force_off{false};
+        // Desired relay state (planner / EVSE control). Applied state is held in the fields above and is
+        // rate-limited/debounced in update_relay_tx() to avoid relay chatter and excess CAN traffic.
+        bool desired_sys_enable{true};
+        uint8_t desired_relay_cmd_mask{0};
+        uint8_t desired_relay_enable_mask{0};
+        bool desired_relay_force_off{false};
+        bool relay_state_dirty{true};
+        bool relay_tx_urgent{false};
+        std::array<std::chrono::steady_clock::time_point, 3> relay_last_change{};
         bool relay_clear_faults{false};
         std::array<std::chrono::steady_clock::time_point, 3> relay_mismatch_since{};
         uint64_t relay_conflict_count{0};
