@@ -126,7 +126,8 @@ struct ChargerConfig {
     int hlc_auth_timeout_s{150};
     int pnc_block_ttl_s{1200};
     int power_request_timeout_s{60};
-    int evse_limit_ack_timeout_ms{1500};
+    // Allow more time for PLCs that acknowledge EVSE limits slowly during precharge/auth phases.
+    int evse_limit_ack_timeout_ms{5000};
     int telemetry_timeout_ms{2000};
     int plc_present_warn_ms{1000};
     int plc_limits_warn_ms{1500};

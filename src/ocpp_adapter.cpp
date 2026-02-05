@@ -1854,7 +1854,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             } else {
                 telemetry_overdue_since = std::chrono::steady_clock::time_point{};
             }
-            constexpr auto kTelemetryStaleDebounce = std::chrono::milliseconds(500);
+            // Debounce telemetry staleness longer to avoid false positives when PLC is busy or slow to start.
+            constexpr auto kTelemetryStaleDebounce = std::chrono::milliseconds(3000);
             const bool telemetry_stale = telemetry_overdue && telemetry_overdue_since.time_since_epoch().count() != 0 &&
                                          (now - telemetry_overdue_since) >= kTelemetryStaleDebounce;
 
@@ -1913,7 +1914,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 status.last_evse_limit_ack.time_since_epoch().count() != 0) {
                 const auto age = now - status.last_evse_limit_ack;
                 const auto ack_timeout = evse_limit_ack_timeout(cfg_);
-                if (age > ack_timeout) {
+                const bool ack_relevant = status.relay_closed || status.hlc_power_ready || status.hlc_precharge_active ||
+                    status.hlc_stage >= HLC_MIN_POWER_STAGE;
+                if (ack_relevant && age > ack_timeout) {
                     EVLOG_error << "EVSE limit ACK stale on connector " << connector
                                 << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(age).count()
                                 << "ms ack_count=" << status.evse_limit_ack_count
@@ -3112,12 +3115,26 @@ void OcppAdapter::apply_power_plan() {
                                             regulating);
         }
 
+        const double target_voltage_for_calc = st.target_voltage_v
+                                                   ? st.target_voltage_v.value()
+                                                   : (measured_v > 0.0 ? measured_v : planner_cfg_.default_voltage_v);
+        double ev_target_kw = 0.0;
+        if ((power_ready || precharge_hint) && st.target_current_a) {
+            ev_target_kw = (target_voltage_for_calc * st.target_current_a.value()) / 1000.0;
+            if (ev_target_kw > 0.0) {
+                last_ev_target_power_kw_[c.id] = ev_target_kw;
+            }
+        } else if (last_ev_target_power_kw_.count(c.id)) {
+            ev_target_kw = last_ev_target_power_kw_[c.id];
+        }
+
         double req_kw = 0.0;
-        if ((power_ready || precharge_hint) && g.safety_ok && modules_ok && !st.gc_welded && !st.mc_welded) {
+        if ((power_ready || precharge_hint) && g.safety_ok && !st.gc_welded && !st.mc_welded) {
             if (st.target_voltage_v && st.target_current_a) {
-                req_kw = (st.target_voltage_v.value() * st.target_current_a.value()) / 1000.0;
+                req_kw = ev_target_kw;
             } else if (st.target_current_a) {
-                req_kw = (measured_v > 0.0 ? measured_v : 800.0) * st.target_current_a.value() / 1000.0;
+                req_kw = (measured_v > 0.0 ? measured_v : planner_cfg_.default_voltage_v) *
+                         st.target_current_a.value() / 1000.0;
             } else if (power_ready && st.evse_max_power_kw) {
                 req_kw = st.evse_max_power_kw.value();
             } else if (power_ready && last_requested_power_kw_[c.id] > 0.0) {
@@ -3132,6 +3149,27 @@ void OcppAdapter::apply_power_plan() {
             if (req_kw <= 0.0 && power_ready) {
                 req_kw = g.gun_power_limit_kw;
             }
+
+            // Relaxed fallback: keep using the last EV target and EV limits to avoid starving HLC with near-zero power.
+            double ev_limit_kw = 0.0;
+            if (st.evse_max_power_kw) {
+                ev_limit_kw = st.evse_max_power_kw.value();
+            }
+            if (st.evse_max_current_a) {
+                const double v_for_limit =
+                    st.target_voltage_v.value_or(target_voltage_for_calc);
+                if (v_for_limit > 0.0) {
+                    ev_limit_kw = std::max(ev_limit_kw,
+                                           (v_for_limit * st.evse_max_current_a.value()) / 1000.0);
+                }
+            }
+            double fallback_kw = std::max({req_kw, ev_target_kw, ev_limit_kw, last_requested_power_kw_[c.id]});
+            const double cap_kw =
+                g.gun_power_limit_kw > 0.0 ? g.gun_power_limit_kw : planner_cfg_.grid_limit_kw;
+            if (cap_kw > 0.0 && fallback_kw > cap_kw) {
+                fallback_kw = cap_kw;
+            }
+            req_kw = fallback_kw;
         }
         g.ev_req_power_kw = std::max(0.0, req_kw);
         g.ev_req_voltage_v = st.target_voltage_v ? st.target_voltage_v.value()
@@ -3152,7 +3190,7 @@ void OcppAdapter::apply_power_plan() {
         g.ev_req_voltage_v = std::min(g.ev_req_voltage_v, max_voltage_v);
         g.i_meas_a = measured_i;
 
-        const bool blocked = !g.safety_ok || total_healthy_modules <= 0 || st.gc_welded || st.mc_welded;
+        const bool blocked = !g.safety_ok || module_unavailable_fault || st.gc_welded || st.mc_welded;
         g.ev_session_active = session_ready;
         const bool ready_for_power = (power_ready || precharge_hint) && !blocked;
 
@@ -3694,6 +3732,38 @@ void OcppAdapter::apply_power_plan() {
     actual_modules_per_gun.clear();
     island_fault.clear();
     island_fault_reason.clear();
+    // Fallback: if the planner dropped modules but the EV is requesting power, keep at least the
+    // configured slot modules online so HLC does not stall with zero current.
+    for (auto& kv : slot_info) {
+        const int slot_id = kv.first;
+        auto& info = kv.second;
+        const int gid = info.selection.gun_id;
+        if (gid <= 0) {
+            continue;
+        }
+        const Slot* slot = find_slot(slots_, slot_id);
+        if (!slot || slot->modules.empty()) {
+            continue;
+        }
+        const auto g_it = gun_lookup.find(gid);
+        const GunState gstate = (g_it != gun_lookup.end()) ? g_it->second : GunState{};
+        const bool ev_requesting =
+            (gstate.ev_req_power_kw > 0.1) || info.status.hlc_power_ready || info.status.hlc_precharge_active ||
+            info.status.hlc_stage >= HLC_MIN_POWER_STAGE;
+        if (info.modules_final == 0 && ev_requesting && !info.disabled_by_csms && !info.local_fault) {
+            uint8_t mask = 0u;
+            for (std::size_t idx = 0; idx < slot->modules.size() && idx < 8; ++idx) {
+                mask |= static_cast<uint8_t>(1u << idx);
+            }
+            info.modules_final = static_cast<int>(slot->modules.size());
+            info.mask_final = mask;
+            info.modules_healthy = true;
+            info.module_health_valid = true;
+            info.module_unavailable_fault = false;
+            info.local_fault = false;
+        }
+    }
+
     for (const auto& kv : slot_info) {
         const auto& info = kv.second;
         const int gid = info.selection.gun_id;

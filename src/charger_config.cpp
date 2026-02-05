@@ -278,7 +278,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
         cfg.power_request_timeout_s = 60;
     }
     if (cfg.evse_limit_ack_timeout_ms <= 0) {
-        cfg.evse_limit_ack_timeout_ms = 1500;
+        cfg.evse_limit_ack_timeout_ms = 5000;
     }
     if (cfg.telemetry_timeout_ms <= 0) {
         cfg.telemetry_timeout_ms = 2000;

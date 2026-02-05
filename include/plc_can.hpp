@@ -226,6 +226,11 @@ private:
         RfidAssembly rfid;
         uint64_t tx_failures{0};
         uint64_t tx_errors_recent{0};
+        std::chrono::steady_clock::time_point last_tx_warn{};
+        std::chrono::steady_clock::time_point last_tx_ok{};
+        std::chrono::steady_clock::time_point tx_quiet_until{};
+        std::chrono::steady_clock::time_point last_tx_quiet_log{};
+        uint32_t tx_failure_streak{0};
     };
 
     ChargerConfig cfg_;

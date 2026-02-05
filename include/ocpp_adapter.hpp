@@ -191,6 +191,7 @@ private:
     std::map<int, double> last_power_w_;
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
+    std::map<int, double> last_ev_target_power_kw_;
     std::map<std::string, ContactorState> last_gc_state_;
     std::map<std::string, ContactorState> last_mc_state_;
     std::map<int, bool> mc_open_pending_;
