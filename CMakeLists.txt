@@ -597,6 +597,28 @@ if(BUILD_APP_TESTS)
   target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(limit_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(gc_close_gating_tests
+    tests/gc_close_gating_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(gc_close_gating_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(gc_close_gating_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(gc_close_gating_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(power_delivery_stall_tests
+    tests/power_delivery_stall_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(power_delivery_stall_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(power_delivery_stall_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(power_delivery_stall_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(hlc_fallback_tests
     tests/hlc_fallback_tests.cpp
     src/ocpp_adapter.cpp

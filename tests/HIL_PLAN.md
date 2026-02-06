@@ -49,6 +49,14 @@
 10. **Seamless retry tolerance**
     - Drop ISO15118 briefly (B1/B2 toggles) without unplug; controller keeps session, resumes Charging
 
+11. **PowerDelivery contactor closure**
+    - Run ISO15118 precharge to completion; send PowerDeliveryReq(Start)
+    - Expect: GC closes within tolerance window, CurrentDemand shows rising current, OCPP transitions to Charging
+
+12. **Power delivery stall / GC close timeout**
+    - Simulate GC close blocked or contactor closed with 0A (no current)
+    - Expect: controller aborts session, emits PowerSwitchFailure, requires fault clear before retry
+
 ## CI hook suggestion
 - Add job to run `ctest --output-on-failure` for controller unit tests
 - Add optional HIL flag to trigger scripted versions of scenarios 1–5 using simulator APIs

@@ -6,6 +6,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 
 namespace charger {
 
@@ -119,7 +120,10 @@ public:
         return it != pnc_blocked_.end() ? it->second : false;
     }
 
-    void apply_power_command(const PowerCommand&) override {}
+    void apply_power_command(const PowerCommand& cmd) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_power_cmd_[cmd.connector] = cmd;
+    }
     void apply_power_allocation(std::int32_t, int) override {}
     void set_evse_limits(std::int32_t, const EvseLimits&) override {}
     void publish_evse_present(std::int32_t, double, double, double, bool, bool) override {}
@@ -127,12 +131,22 @@ public:
     void clear_faults(std::int32_t) override {}
     bool supports_cross_slot_islands() const override { return true; }
 
+    std::optional<PowerCommand> last_power_command(std::int32_t connector) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = last_power_cmd_.find(connector);
+        if (it == last_power_cmd_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
 private:
     std::mutex mutex_;
     std::map<std::int32_t, GunStatus> status_;
     std::map<std::int32_t, double> energy_wh_;
     std::map<std::int32_t, bool> digital_enabled_;
     std::map<std::int32_t, bool> pnc_blocked_;
+    std::map<std::int32_t, PowerCommand> last_power_cmd_;
 };
 
 } // namespace charger

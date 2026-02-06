@@ -200,6 +200,8 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> gc_switch_ready_since_;
     std::map<int, bool> gc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
+    std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
+    std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_command_change_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> gc_command_change_time_;
     std::map<int, bool> paused_evse_;

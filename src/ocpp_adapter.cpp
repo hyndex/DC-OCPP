@@ -276,7 +276,9 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
     }
     const bool cp_ready = status.cp_state == 'C' || status.cp_state == 'D';
     if (!cp_ready) return false;
-    if (!status.hlc_power_ready) {
+    const bool hlc_power_phase =
+        status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+    if (!hlc_power_phase) {
         return false;
     }
     // By this point the PLC has asserted HLC readiness (stage >= POWER_DELIVERY, cable check ok, precharge complete).
@@ -2075,7 +2077,7 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
     }
 
     float energy_wh = 0.0f;
-    if (was_started) {
+    if (was_started && charge_point_) {
         const auto measurement = hardware_->sample_meter(connector);
         energy_wh = static_cast<float>(measurement.power_meter.energy_Wh_import.total);
         charge_point_->on_transaction_stopped(connector, session_id, reason, ocpp::DateTime(),
@@ -2098,7 +2100,9 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         persist_pending_tokens_locked();
     }
     set_auth_state(connector, AuthorizationState::Unknown);
-    charge_point_->on_session_stopped(connector, session_id);
+    if (charge_point_) {
+        charge_point_->on_session_stopped(connector, session_id);
+    }
 }
 
 void OcppAdapter::push_meter_values(std::int32_t connector, const ocpp::Measurement& measurement) {
@@ -3881,8 +3885,32 @@ void OcppAdapter::apply_power_plan() {
         const double gc_open_thresh = planner_cfg_.gc_open_current_a > 0.0 ? planner_cfg_.gc_open_current_a : 0.5;
         bool gc_closed_cmd = is_home && (info.desired_gc_state == ContactorState::Closed) &&
                              dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
+        const bool gc_close_requested = gc_closed_cmd;
+        const bool hlc_power_phase =
+            status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+        const bool hlc_known = status.hlc_stage > 0 || status.hlc_precharge_active || status.hlc_power_ready;
+        const bool ev_requesting = status.cp_state == 'C' || status.cp_state == 'D';
+        const bool ev_current_req = status.target_current_a && status.target_current_a.value() > 0.5;
+        bool gc_close_blocked = false;
         if (gc_closed_cmd && is_home && !status.relay_closed) {
-            if (!isolation_ready) {
+            if (hlc_known && !hlc_power_phase) {
+                static std::map<std::string, std::chrono::steady_clock::time_point> last_hlc_log;
+                auto& last_log = last_hlc_log[slot->gc_id];
+                const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
+                                       ((now - last_log) >= std::chrono::milliseconds(500));
+                if (allow_log) {
+                    EVLOG_info << "GC close blocked by HLC stage"
+                               << " connector=" << c.id
+                               << " gc=" << slot->gc_id
+                               << " hlc_stage=" << static_cast<int>(status.hlc_stage)
+                               << " precharge=" << (status.hlc_precharge_active ? "1" : "0");
+                    last_log = now;
+                }
+                gc_closed_cmd = false;
+                gc_close_blocked = true;
+                power_constrained_[c.id] = true;
+            }
+            if (gc_closed_cmd && !isolation_ready) {
                 static std::map<std::string, std::chrono::steady_clock::time_point> last_isolation_log;
                 auto& last_log = last_isolation_log[slot->gc_id];
                 const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
@@ -3898,85 +3926,163 @@ void OcppAdapter::apply_power_plan() {
                     last_log = now;
                 }
                 gc_closed_cmd = false;
+                gc_close_blocked = true;
                 power_constrained_[c.id] = true;
             }
-            bool safe_close = false;
-            bool telem_complete = false;
-            double island_v = 0.0;
-            double island_i = 0.0;
-            double v_target = 0.0;
-            double dv = 0.0;
-            if (tie_mode && current_island > 0) {
-                const auto telem_it = telemetry_by_island.find(current_island);
-                if (telem_it != telemetry_by_island.end() && telem_it->second.telemetry_complete) {
-                    telem_complete = true;
-                    island_v = telem_it->second.voltage_v;
-                    island_i = telem_it->second.current_a;
-                    v_target = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : info.meas_voltage;
-                    if (v_target > 0.0) {
-                        dv = std::fabs(island_v - v_target);
-                        if (dv <= gc_close_max_dv && std::fabs(island_i) < switch_i_thresh) {
-                            safe_close = true;
+            if (gc_closed_cmd) {
+                bool safe_close = false;
+                bool telem_complete = false;
+                double island_v = 0.0;
+                double island_i = 0.0;
+                double v_target = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : info.meas_voltage;
+                double dv = 0.0;
+                if (tie_mode && current_island > 0) {
+                    const auto telem_it = telemetry_by_island.find(current_island);
+                    if (telem_it != telemetry_by_island.end() && telem_it->second.telemetry_complete) {
+                        telem_complete = true;
+                        island_v = telem_it->second.voltage_v;
+                        island_i = telem_it->second.current_a;
+                        if (v_target > 0.0) {
+                            dv = std::fabs(island_v - v_target);
+                            if (dv <= gc_close_max_dv && std::fabs(island_i) < switch_i_thresh) {
+                                safe_close = true;
+                            }
                         }
                     }
                 }
-            }
-            if (safe_close) {
-                if (stable_ms.count() == 0) {
-                    gc_switch_ready_since_.erase(slot->gc_id);
-                } else {
-                    auto& since = gc_switch_ready_since_[slot->gc_id];
-                    if (since.time_since_epoch().count() == 0) {
-                        since = now;
-                    }
-                    if ((now - since) >= stable_ms) {
+                const double close_v = info.meas_voltage;
+                const double close_i = meas_i;
+                const bool have_target = v_target > 0.0;
+                const bool have_close_v = close_v > 0.0;
+                const double dv_fallback = (have_target && have_close_v) ? std::fabs(close_v - v_target) : 0.0;
+                const bool fallback_ready =
+                    !safe_close && hlc_power_phase && have_target && have_close_v &&
+                    dv_fallback <= gc_close_max_dv && std::fabs(close_i) < switch_i_thresh;
+
+                bool close_ready = safe_close || fallback_ready;
+                if (close_ready) {
+                    if (stable_ms.count() == 0) {
                         gc_switch_ready_since_.erase(slot->gc_id);
                     } else {
-                        safe_close = false;
+                        auto& since = gc_switch_ready_since_[slot->gc_id];
+                        if (since.time_since_epoch().count() == 0) {
+                            since = now;
+                        }
+                        if ((now - since) >= stable_ms) {
+                            gc_switch_ready_since_.erase(slot->gc_id);
+                        } else {
+                            close_ready = false;
+                        }
                     }
+                } else {
+                    gc_switch_ready_since_.erase(slot->gc_id);
                 }
-            } else {
-                gc_switch_ready_since_.erase(slot->gc_id);
-            }
-            if (!safe_close) {
-                gc_closed_cmd = false;
-                if (is_home) {
-                    power_constrained_[c.id] = true;
-                }
-                const auto ready_it = gc_switch_ready_since_.find(slot->gc_id);
-                const double ready_ms =
-                    (ready_it != gc_switch_ready_since_.end() && ready_it->second.time_since_epoch().count() != 0)
-                        ? static_cast<double>(
-                              std::chrono::duration_cast<std::chrono::milliseconds>(now - ready_it->second).count())
-                        : 0.0;
-                // When the EV is requesting power but GC cannot be closed, log the gating inputs so we can
-                // diagnose deadlocks between ISO15118 precharge/current-demand and contactor control.
-                static std::map<std::string, std::chrono::steady_clock::time_point> last_gc_block_log;
-                auto& last_log = last_gc_block_log[slot->gc_id];
-                const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
-                                       ((now - last_log) >= std::chrono::milliseconds(500));
-                if (allow_log) {
-                    EVLOG_info << "GC close gated"
-                               << " connector=" << c.id
-                               << " gc=" << slot->gc_id
-                               << " desired=" << (info.desired_gc_state == ContactorState::Closed ? "C" : "O")
-                               << " isolation_ready=" << (isolation_ready ? "1" : "0")
-                               << " tie_mode=" << (tie_mode ? "1" : "0")
-                               << " island=" << current_island
-                               << " telem_complete=" << (telem_complete ? "1" : "0")
-                               << " V_island=" << island_v
-                               << " I_island=" << island_i
-                               << " V_target=" << v_target
-                               << " dv=" << dv
-                               << " dv_max=" << gc_close_max_dv
-                               << " i_max=" << switch_i_thresh
-                               << " stable_ms=" << stable_ms.count()
-                               << " ready_ms=" << ready_ms;
-                    last_log = now;
+                if (!close_ready) {
+                    gc_closed_cmd = false;
+                    gc_close_blocked = true;
+                    if (is_home) {
+                        power_constrained_[c.id] = true;
+                    }
+                    const auto ready_it = gc_switch_ready_since_.find(slot->gc_id);
+                    const double ready_ms =
+                        (ready_it != gc_switch_ready_since_.end() && ready_it->second.time_since_epoch().count() != 0)
+                            ? static_cast<double>(
+                                  std::chrono::duration_cast<std::chrono::milliseconds>(now - ready_it->second).count())
+                            : 0.0;
+                    // When the EV is requesting power but GC cannot be closed, log the gating inputs so we can
+                    // diagnose deadlocks between ISO15118 precharge/current-demand and contactor control.
+                    static std::map<std::string, std::chrono::steady_clock::time_point> last_gc_block_log;
+                    auto& last_log = last_gc_block_log[slot->gc_id];
+                    const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
+                                           ((now - last_log) >= std::chrono::milliseconds(500));
+                    if (allow_log) {
+                        EVLOG_info << "GC close gated"
+                                   << " connector=" << c.id
+                                   << " gc=" << slot->gc_id
+                                   << " desired=" << (info.desired_gc_state == ContactorState::Closed ? "C" : "O")
+                                   << " isolation_ready=" << (isolation_ready ? "1" : "0")
+                                   << " tie_mode=" << (tie_mode ? "1" : "0")
+                                   << " island=" << current_island
+                                   << " telem_complete=" << (telem_complete ? "1" : "0")
+                                   << " V_island=" << island_v
+                                   << " I_island=" << island_i
+                                   << " V_meas=" << close_v
+                                   << " V_target=" << v_target
+                                   << " dv=" << dv
+                                   << " dv_meas=" << dv_fallback
+                                   << " dv_max=" << gc_close_max_dv
+                                   << " i_max=" << switch_i_thresh
+                                   << " stable_ms=" << stable_ms.count()
+                                   << " ready_ms=" << ready_ms;
+                        last_log = now;
+                    }
                 }
             }
         } else {
             gc_switch_ready_since_.erase(slot->gc_id);
+        }
+        if (gc_close_requested && is_home && !status.relay_closed && !local_fault && !info.disabled_by_csms &&
+            hlc_power_phase && ev_requesting && ev_current_req) {
+            if (!gc_closed_cmd || gc_close_blocked) {
+                auto& ts = gc_close_request_time_[c.id];
+                if (ts.time_since_epoch().count() == 0) {
+                    ts = now;
+                } else {
+                    const auto timeout_ms =
+                        std::chrono::milliseconds(std::max(2000, cfg_.precharge_timeout_ms));
+                    if ((now - ts) > timeout_ms) {
+                        local_fault = true;
+                        if (info.fault_reason.empty()) {
+                            info.fault_reason = "GCCloseTimeout";
+                        }
+                        EVLOG_warning << "GC close timeout for connector " << c.id
+                                      << " (hlc_stage=" << static_cast<int>(status.hlc_stage)
+                                      << " V_meas=" << info.meas_voltage
+                                      << " V_target=" << g.ev_req_voltage_v << ")";
+                    }
+                }
+            } else {
+                gc_close_request_time_.erase(c.id);
+            }
+        } else {
+            gc_close_request_time_.erase(c.id);
+        }
+
+        const bool power_request_active = hlc_power_phase && ev_requesting && ev_current_req;
+        bool current_valid = false;
+        if (snap_it != snapshots.end()) {
+            current_valid = tie_mode && status.relay_closed ? snap_it->second.island_telem_complete
+                                                            : snap_it->second.module_telem_valid;
+        }
+        const bool present_fresh = status.last_telemetry.time_since_epoch().count() != 0 &&
+                                   (now - status.last_telemetry) <= telemetry_timeout(cfg_);
+        if (!current_valid && present_fresh) {
+            current_valid = status.present_current_a.has_value();
+        }
+        if (!local_fault && gc_close_requested && power_request_active && current_valid &&
+            (gc_closed_cmd || status.relay_closed)) {
+            if (std::fabs(meas_i) < gc_open_thresh) {
+                auto& ts = power_delivery_stall_since_[c.id];
+                if (ts.time_since_epoch().count() == 0) {
+                    ts = now;
+                } else {
+                    const auto timeout_ms =
+                        std::chrono::milliseconds(std::max(2000, cfg_.precharge_timeout_ms));
+                    if ((now - ts) > timeout_ms) {
+                        local_fault = true;
+                        if (info.fault_reason.empty()) {
+                            info.fault_reason = "PowerDeliveryStalled";
+                        }
+                        EVLOG_warning << "Power delivery stalled for connector " << c.id
+                                      << " (I_meas=" << meas_i
+                                      << "A target_I=" << status.target_current_a.value_or(0.0) << "A)";
+                    }
+                }
+            } else {
+                power_delivery_stall_since_.erase(c.id);
+            }
+        } else {
+            power_delivery_stall_since_.erase(c.id);
         }
         if (!gc_closed_cmd && !local_fault && is_home) {
             bool current_valid = true;
@@ -4171,7 +4277,8 @@ void OcppAdapter::apply_power_plan() {
             if (charge_point_) {
                 ocpp::v16::ChargePointErrorCode error_code = ocpp::v16::ChargePointErrorCode::OtherError;
                 if (reason == "GCWelded" || reason == "MCWelded" ||
-                    reason == "GCOpenTimeout" || reason == "MCOpenTimeout") {
+                    reason == "GCOpenTimeout" || reason == "GCCloseTimeout" ||
+                    reason == "MCOpenTimeout" || reason == "PowerDeliveryStalled") {
                     error_code = ocpp::v16::ChargePointErrorCode::PowerSwitchFailure;
                 } else if (reason == "Isolation") {
                     error_code = ocpp::v16::ChargePointErrorCode::GroundFailure;
