@@ -173,7 +173,8 @@ private:
                                                  int healthy_modules) const;
     Plan build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                     const std::map<int, int>& modules_per_gun,
-                    const std::set<int>& reserved_slots);
+                    const std::set<int>& reserved_slots,
+                    const std::set<int>& full_island_guns);
     void apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_point now);
     bool validate_plan(const Plan& plan) const;
 };

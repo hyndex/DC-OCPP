@@ -120,19 +120,19 @@ int main() {
     plan = pm.compute_plan();
     assert(!plan.guns.empty());
     const int initial_modules = plan.guns.front().modules_assigned;
-    assert(initial_modules >= 1);
+    assert(initial_modules == 2);
 
     // Drop request to one module but within hold window => still keep 2
     guns.clear();
     guns.push_back(make_gun(1, 20.0, 60.0, true));
     pm.update_guns(guns);
     plan = pm.compute_plan();
-    assert(plan.guns.front().modules_assigned >= 1);
+    assert(plan.guns.front().modules_assigned == initial_modules);
 
     // After hold window expires, allow drop to one module
     std::this_thread::sleep_for(std::chrono::milliseconds(cfg.min_module_hold_ms + 50));
     plan = pm.compute_plan();
-    assert(plan.guns.front().modules_assigned >= 0);
+    assert(plan.guns.front().modules_assigned == 1);
 
     // Fairness: single gun requests large power and should borrow multiple slots when allowed
     PlannerConfig cfg2 = cfg;
@@ -196,7 +196,7 @@ int main() {
     assert(plan_single.islands.front().slot_ids.size() == module_slots.size());
     assert(plan_single.guns.front().modules_assigned == static_cast<int>(module_slots.size()));
 
-    // Single gun with low request still gets full island + all healthy modules.
+    // Single gun with low request should only claim the minimum modules needed.
     PowerManager pm3_low(cfg3);
     pm3_low.set_slots(module_slots);
     pm3_low.update_modules(module_only);
@@ -207,8 +207,76 @@ int main() {
     pm3_low.update_guns(guns3);
     auto plan_single_low = pm3_low.compute_plan();
     assert(plan_single_low.islands.size() == 1);
-    assert(plan_single_low.islands.front().slot_ids.size() == module_slots.size());
-    assert(plan_single_low.guns.front().modules_assigned == static_cast<int>(module_slots.size()));
+    assert(plan_single_low.islands.front().slot_ids.size() == 1);
+    assert(plan_single_low.guns.front().modules_assigned == 1);
+
+    // Ceil module allocation: request slightly above 2 modules should allocate 3.
+    PowerManager pm3_ceil(cfg3);
+    pm3_ceil.set_slots(module_slots);
+    pm3_ceil.update_modules(module_only);
+    guns3.clear();
+    g1 = make_gun(1, 61.0, 240.0, true);
+    g1.slot_id = 1;
+    guns3.push_back(g1);
+    pm3_ceil.update_guns(guns3);
+    auto plan_ceil = pm3_ceil.compute_plan();
+    assert(plan_ceil.guns.front().modules_assigned == 3);
+
+    // Reserved/plugged slots must not be pulled into a single-gun island.
+    PowerManager pm3_reserved(cfg3);
+    pm3_reserved.set_slots(module_slots);
+    pm3_reserved.update_modules(module_only);
+    guns3.clear();
+    g1 = make_gun(1, 120.0, 240.0, true);
+    g1.slot_id = 1;
+    auto g2_reserved = make_gun(2, 0.0, 240.0, false);
+    g2_reserved.slot_id = 3;
+    g2_reserved.plugged_in = true;
+    g2_reserved.fsm_state = GunFsmState::EvDetected;
+    guns3.push_back(g1);
+    guns3.push_back(g2_reserved);
+    pm3_reserved.update_guns(guns3);
+    auto plan_reserved = pm3_reserved.compute_plan();
+    assert(plan_reserved.islands.size() == 1);
+    const auto& reserved_island = plan_reserved.islands.front();
+    assert(std::find(reserved_island.slot_ids.begin(), reserved_island.slot_ids.end(), 3) ==
+           reserved_island.slot_ids.end());
+    assert(plan_reserved.guns.front().modules_assigned == 3);
+
+    // Priority: lower numeric priority keeps extra modules first when constrained.
+    PlannerConfig cfg_priority = cfg3;
+    cfg_priority.max_modules_per_gun = 2;
+    cfg_priority.grid_limit_kw = 90.0;
+    PowerManager pm_priority(cfg_priority);
+    std::vector<Slot> prio_slots;
+    prio_slots.push_back(make_module_slot(1, 2, 3, 1));
+    prio_slots.push_back(make_module_slot(2, 3, 1, 2));
+    prio_slots.push_back(make_module_slot(3, 1, 2, 0));
+    pm_priority.set_slots(prio_slots);
+    std::vector<ModuleState> prio_mods;
+    for (const auto& s : prio_slots) {
+        prio_mods.push_back(make_module(s.modules[0], s.id, true));
+    }
+    pm_priority.update_modules(prio_mods);
+    std::vector<GunState> prio_guns;
+    auto pg1 = make_gun(1, 60.0, 120.0, true);
+    pg1.slot_id = 1;
+    pg1.priority = 0;
+    auto pg2 = make_gun(2, 60.0, 120.0, true);
+    pg2.slot_id = 2;
+    pg2.priority = 1;
+    prio_guns.push_back(pg1);
+    prio_guns.push_back(pg2);
+    pm_priority.update_guns(prio_guns);
+    auto plan_prio = pm_priority.compute_plan();
+    int modules_g1 = 0;
+    int modules_g2 = 0;
+    for (const auto& d : plan_prio.guns) {
+        if (d.gun_id == 1) modules_g1 = d.modules_assigned;
+        if (d.gun_id == 2) modules_g2 = d.modules_assigned;
+    }
+    assert(modules_g1 == 2);
+    assert(modules_g2 == 1);
 
     guns3.clear();
     g1 = make_gun(1, 60.0, 120.0, true);

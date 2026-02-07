@@ -36,7 +36,8 @@ public:
     bool begin_transaction(std::int32_t connector, const std::string& id_token, bool prevalidated = false,
                            ocpp::SessionStartedReason reason = ocpp::SessionStartedReason::Authorized);
     void finish_transaction(std::int32_t connector, ocpp::v16::Reason reason,
-                            std::optional<ocpp::CiString<20>> id_tag_end = std::nullopt);
+                            std::optional<ocpp::CiString<20>> id_tag_end = std::nullopt,
+                            bool defer_session_stop = false);
 
     void push_meter_values(std::int32_t connector, const ocpp::Measurement& measurement);
     void report_fault(std::int32_t connector, const ocpp::v16::ErrorInfo& info);
@@ -102,8 +103,9 @@ public:
         static std::optional<PendingToken>
         pop_next_pending_token(OcppAdapter& adapter, std::int32_t connector, const std::chrono::steady_clock::time_point& now,
                                const std::optional<std::string>& required_token = std::nullopt,
-                               const std::optional<std::string>& parent_token = std::nullopt) {
-            return adapter.pop_next_pending_token(connector, now, required_token, parent_token);
+                               const std::optional<std::string>& parent_token = std::nullopt,
+                               bool* pending_changed = nullptr) {
+            return adapter.pop_next_pending_token(connector, now, required_token, parent_token, pending_changed);
         }
 
         static AuthorizationState try_authorize_with_token(OcppAdapter& adapter, std::int32_t connector,
@@ -167,6 +169,7 @@ private:
     std::map<std::int32_t, ConnectorState> connector_state_;
     std::map<std::int32_t, bool> post_stop_plugged_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> post_stop_time_;
+    std::map<std::int32_t, std::string> pending_session_stop_;
     std::vector<std::thread> meter_threads_;
     std::thread planner_thread_;
     std::atomic<bool> planner_thread_running_{false};
@@ -216,7 +219,7 @@ private:
     std::map<int, uint64_t> last_limit_stale_counts_;
     std::map<int, uint64_t> limit_ack_stale_events_;
     std::map<int, uint64_t> telemetry_timeout_events_;
-    std::map<std::string, std::chrono::steady_clock::time_point> recent_token_cache_;
+    std::map<int, std::map<std::string, std::chrono::steady_clock::time_point>> recent_token_cache_;
     struct RfidTapLatch {
         std::string token;
         std::chrono::steady_clock::time_point last_seen{};
@@ -228,11 +231,15 @@ private:
     std::chrono::steady_clock::time_point global_fault_clear_since_{};
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
     std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
+    std::map<int, std::string> last_local_fault_reason_;
     std::map<int, AuthorizationState> auth_state_cache_;
+    std::map<int, std::chrono::steady_clock::time_point> auth_denied_since_;
+    std::map<int, std::string> last_denied_token_;
     std::atomic<bool> autocharge_enabled_{true};
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};
     std::map<int, int> telemetry_mismatch_count_;
+    std::mutex telemetry_mutex_;
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
     std::map<int, int> connector_meter_intervals_;
 
@@ -245,7 +252,7 @@ private:
     const Slot* find_slot_for_gun(int gun_id) const;
     void update_connector_state(std::int32_t connector, GunStatus status, bool has_session, bool tx_started,
                                 bool authorized, bool fault_active, bool disabled, bool post_stop_plugged,
-                                bool seamless_retry_active);
+                                bool seamless_retry_active, bool suppress_available_event);
     bool has_active_session(std::int32_t connector);
     void initialize_slots();
     void apply_power_plan();
@@ -258,8 +265,8 @@ private:
     void ingest_auth_tokens(const std::vector<AuthToken>& tokens,
                             const std::chrono::steady_clock::time_point& now);
     void set_autocharge_enabled(bool enabled, const std::string& source);
-    void clear_pending_autocharge_tokens_locked();
-    void clear_pending_autocharge_tokens_for_connector_locked(std::int32_t connector);
+    bool clear_pending_autocharge_tokens_locked();
+    bool clear_pending_autocharge_tokens_for_connector_locked(std::int32_t connector);
     HlcControlOutcome apply_hlc_control(std::int32_t connector, const GunStatus& status, bool had_session,
                                         const ActiveSession& session, bool post_stop_plugged,
                                         const std::optional<std::string>& autocharge_reject_id,
@@ -269,7 +276,8 @@ private:
     std::optional<PendingToken> pop_next_pending_token(std::int32_t connector,
                                                        const std::chrono::steady_clock::time_point& now,
                                                        const std::optional<std::string>& required_token = std::nullopt,
-                                                       const std::optional<std::string>& parent_token = std::nullopt);
+                                                       const std::optional<std::string>& parent_token = std::nullopt,
+                                                       bool* pending_changed = nullptr);
     AuthorizationState try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
     AuthorizationState authorize_token_for_session(std::int32_t connector, const std::string& session_id,
                                                    const PendingToken& pending);
@@ -277,7 +285,7 @@ private:
     void clear_pending_tokens();
     std::string clamp_id_token(const std::string& raw) const;
     void persist_pending_tokens();
-    void persist_pending_tokens_locked();
+    void persist_pending_tokens_snapshot(const std::map<std::int32_t, std::deque<PendingToken>>& snapshot);
     void load_pending_tokens_from_disk();
     std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
@@ -289,6 +297,10 @@ private:
     static std::string auth_state_to_string(AuthorizationState state);
     static AuthTokenSource token_source_from_string(const std::string& s);
     void set_auth_state(std::int32_t connector, AuthorizationState state);
+    AuthorizationState get_auth_state(std::int32_t connector);
+    std::optional<std::chrono::steady_clock::time_point> get_auth_denied_since(std::int32_t connector);
+    void note_auth_denied(std::int32_t connector, const std::string& id_token);
+    bool should_bypass_token_dedup(std::int32_t connector, const AuthToken& token);
     ocpp::v16::DataTransferResponse
     handle_data_transfer_request(const ocpp::v16::DataTransferRequest& request);
     void handle_configuration_key_change(const ocpp::v16::KeyValue& key_value);

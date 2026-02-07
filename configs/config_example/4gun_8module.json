@@ -84,6 +84,7 @@
     "clientKeyDir": "../../data/certs/client/csms",
     "csmsCaBundle": "../../data/certs/ca/csms/CSMS_ROOT_CA.pem",
     "moCaBundle": "../../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "mfCaBundle": "../../data/certs/ca/mf/MF_ROOT_CA.pem",
     "seccCertDir": "../../data/certs/client/cso",
     "seccKeyDir": "../../data/certs/client/cso",
     "v2gCaBundle": "../../data/certs/ca/v2g/V2G_ROOT_CA.pem"
@@ -101,8 +102,8 @@
         {
           "address": 1,
           "group": 0,
-          "id": "M1_0",
-          "mn": "MN_1_0",
+          "id": "1",
+          "mn": "1",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -112,8 +113,8 @@
         {
           "address": 2,
           "group": 0,
-          "id": "M1_1",
-          "mn": "MN_1_1",
+          "id": "2",
+          "mn": "2",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -133,8 +134,8 @@
         {
           "address": 3,
           "group": 0,
-          "id": "M2_0",
-          "mn": "MN_2_0",
+          "id": "3",
+          "mn": "3",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -144,8 +145,8 @@
         {
           "address": 4,
           "group": 0,
-          "id": "M2_1",
-          "mn": "MN_2_1",
+          "id": "4",
+          "mn": "4",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -165,8 +166,8 @@
         {
           "address": 5,
           "group": 0,
-          "id": "M3_0",
-          "mn": "MN_3_0",
+          "id": "5",
+          "mn": "5",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -176,8 +177,8 @@
         {
           "address": 6,
           "group": 0,
-          "id": "M3_1",
-          "mn": "MN_3_1",
+          "id": "6",
+          "mn": "6",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -197,8 +198,8 @@
         {
           "address": 7,
           "group": 0,
-          "id": "M4_0",
-          "mn": "MN_4_0",
+          "id": "7",
+          "mn": "7",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -208,8 +209,8 @@
         {
           "address": 8,
           "group": 0,
-          "id": "M4_1",
-          "mn": "MN_4_1",
+          "id": "8",
+          "mn": "8",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -222,6 +223,7 @@
   "sqlMigrationsPath": "../../libocpp/config/v16/core_migrations",
   "timeouts": {
     "powerRequestSeconds": 600,
+    "authorizationDeniedHoldSeconds": 5,
     "hlcAuthorizationSeconds": 150,
     "pncBlockSeconds": 1200
   },

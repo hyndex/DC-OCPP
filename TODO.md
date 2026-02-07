@@ -24,3 +24,47 @@
 ## Stage 5 - Validation
 - [x] Run unit tests including GC close + power delivery stall coverage
 - [ ] Spot-check with log-derived scenario (precharge -> PowerDelivery -> CurrentDemand) to confirm contactor closes
+
+## Stage 6 - Dynamic split charging alignment
+- [x] Review planner vs spec: full-island behavior, module sizing, priority semantics, hysteresis direction
+- [x] Update module sizing to ceil(request/module_power) with max-modules caps
+- [x] Gate single-gun full-island to only when all modules are needed and no reserved slots
+- [x] Fix priority weighting/downgrade ordering to favor lower numeric priority
+- [x] Apply hysteresis only on module drops when previous modules remain available
+
+## Stage 7 - Coverage and documentation
+- [x] Refresh power_manager tests for new single-gun behavior and hysteresis
+- [x] Add tests for ceil allocation, reserved-slot blocking, priority-driven allocation
+- [x] Update split-charging design doc to match priority weighting and ceil sizing
+- [ ] Add integration/soak coverage for multi-gun contention rebalancing (if required)
+
+## Stage 8 - Validation
+- [x] Run `tests/power_manager_tests` (and other affected unit tests)
+- [ ] Spot-check planner output for single-gun low-demand and reserved-slot scenarios
+
+## Stage 9 - OCPP adapter hardening (status, tokens, availability)
+- [x] Fix telemetry mismatch counter race (per-connector lock)
+- [x] Fix last_module_alloc_ locking (plan_mutex_ only)
+- [x] Correct charge-complete and safety stop reasons (Other vs EmergencyStop)
+- [x] Handle connectorId=0 for enable/disable/pause/resume/stop/unlock; avoid duplicate status events
+
+## Stage 10 - Power plan correctness
+- [x] Compute module availability per island/connector (no global mask)
+- [x] Fix fallback module mask using module_slot_index mapping
+- [x] Prevent fallback from overriding module health/fault flags
+
+## Stage 11 - Transactions and persistence
+- [x] Capture meterStart at transaction start
+- [x] Use double for meterStop through libocpp interface
+- [x] Remove file I/O under session_mutex_ and write pending token file atomically
+- [x] Skip persisting pending tokens when auth timeout disabled (avoid stale tokens)
+
+## Stage 12 - Security and error lifecycle
+- [x] Add mfCaBundle support in config and EVSE security
+- [x] Fix resolve_bundle_path fallback behavior (empty when missing)
+- [x] Track/clear local faults via sync_ocpp_error
+
+## Stage 13 - Validation
+- [x] Build + run impacted unit tests (auth_flow, pending_token_persistence, power_manager)
+- [ ] Validate OCPP status sequence for charge complete -> Finishing -> Available
+- [ ] Verify connectorId=0 ChangeAvailability flows on multi-connector config

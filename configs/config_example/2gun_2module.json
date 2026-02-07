@@ -43,7 +43,7 @@
   "ocppConfig": "../ocpp/v16/config.json",
   "planner": {
     "allowCrossSlotIslands": true,
-    "maxModulesPerGun": 2,
+    "maxModulesPerGun": 1,
     "minModulesPerActiveGun": 1,
     "prechargeTimeoutMs": 15000,
     "prechargeVoltageToleranceV": 50,
@@ -64,6 +64,7 @@
     "clientKeyDir": "../../data/certs/client/csms",
     "csmsCaBundle": "../../data/certs/ca/csms/CSMS_ROOT_CA.pem",
     "moCaBundle": "../../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "mfCaBundle": "../../data/certs/ca/mf/MF_ROOT_CA.pem",
     "seccCertDir": "../../data/certs/client/cso",
     "seccKeyDir": "../../data/certs/client/cso",
     "v2gCaBundle": "../../data/certs/ca/v2g/V2G_ROOT_CA.pem"
@@ -81,8 +82,8 @@
         {
           "address": 1,
           "group": 0,
-          "id": "M1_0",
-          "mn": "MN_1_0",
+          "id": "1",
+          "mn": "1",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -102,8 +103,8 @@
         {
           "address": 2,
           "group": 0,
-          "id": "M2_0",
-          "mn": "MN_2_0",
+          "id": "2",
+          "mn": "2",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,
@@ -116,6 +117,7 @@
   "sqlMigrationsPath": "../../libocpp/config/v16/core_migrations",
   "timeouts": {
     "powerRequestSeconds": 600,
+    "authorizationDeniedHoldSeconds": 5,
     "hlcAuthorizationSeconds": 150,
     "pncBlockSeconds": 1200
   },

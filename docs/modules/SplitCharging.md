@@ -295,11 +295,11 @@ function compute_power_budgets(active_guns):
     remaining_power = P_system_cap
 
     while remaining_guns and remaining_power > 0:
-        total_weight = sum(1 + priority[h] for h in remaining_guns)
+        total_weight = sum(1 / (1 + max(priority[h], 0)) for h in remaining_guns)
         any_capped = false
 
         for g in list(remaining_guns):
-            share = remaining_power * (1 + priority[g]) / total_weight
+            share = remaining_power * (1 / (1 + max(priority[g], 0))) / total_weight
             candidate = P_budget[g] + share
 
             if candidate >= P_req_limited[g]:
@@ -328,20 +328,12 @@ function ideal_modules_for_gun(g, P_budget_g):
     if P_budget_g <= 0:
         return 0
 
-    # Basic thresholds (tunable)
-    if P_budget_g <= 0.8 * P_MOD_KW:
-        n = 1
-    elif P_budget_g <= 1.6 * P_MOD_KW:
-        n = 2
-    else:
-        n = 2
+    n = ceil(P_budget_g / P_MOD_KW)
+    max_by_cable = ceil(P_GUN_LIMIT[g] / P_MOD_KW)
+    max_by_config = MAX_MODULES_PER_GUN
+    min_allowed = MIN_MODULES_PER_ACTIVE_GUN
 
-    max_by_cable = floor(P_GUN_LIMIT[g] / P_MOD_KW)
-    if max_by_cable < 2:
-        n = min(n, max_by_cable)
-
-    if n < 0: n = 0
-    if n > 2: n = 2
+    n = clamp(n, min_allowed, min(max_by_cable, max_by_config))
     return n
 ```
 
@@ -372,7 +364,7 @@ function discrete_module_allocation(active_guns, P_budget, n_ideal, M_healthy):
         candidates = [g for g in active_guns if n_modules[g] == 2]
         if not candidates:
             break
-        g_star = argmin_over(candidates, key = (priority[g], P_budget[g]))
+        g_star = argmax_over(candidates, key = (priority[g], -P_budget[g]))
         n_modules[g_star] -= 1
         total -= 1
 
@@ -381,7 +373,7 @@ function discrete_module_allocation(active_guns, P_budget, n_ideal, M_healthy):
         candidates = [g for g in active_guns if n_modules[g] == 1]
         if not candidates:
             break
-        g_star = argmin_over(candidates, key = (priority[g], P_budget[g]))
+        g_star = argmax_over(candidates, key = (priority[g], -P_budget[g]))
         n_modules[g_star] -= 1
         total -= 1
 
@@ -790,7 +782,7 @@ Integration with OCPP:
 
   * Some `n_modules[g]` move from 2→1.
   * If needed, some from 1→0.
-* Lower priority and lower power guns are downgraded first.
+* Higher numeric priority (lower preference) and lower power guns are downgraded first.
 
 ## 11.6 Module failure
 

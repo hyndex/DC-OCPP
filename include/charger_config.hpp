@@ -70,6 +70,7 @@ struct SlotMapping {
 struct SecurityConfig {
     fs::path csms_ca_bundle;
     fs::path mo_ca_bundle;
+    fs::path mf_ca_bundle;
     fs::path v2g_ca_bundle;
     fs::path client_cert_dir;
     fs::path client_key_dir;
@@ -123,6 +124,7 @@ struct ChargerConfig {
     int precharge_timeout_ms{2000};
     int module_health_grace_ms{2000};
     int auth_wait_timeout_s{1800};
+    int auth_denied_hold_s{5};
     int hlc_auth_timeout_s{150};
     int pnc_block_ttl_s{1200};
     int power_request_timeout_s{60};

@@ -1632,15 +1632,13 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.comm_fault = gs.comm_fault || crc_relay_bad || crc_safety_bad;
     const bool idle_system = idle_paths && !st.regulating && !st.output_enabled;
     if (idle_system) {
-        // Idle + no active session: suppress transport-induced comm faults and safety trips to avoid spurious OCPP
-        // Faulted while the site is quiescent.
+        // Idle + no active session: suppress transport-induced comm faults and safety/earth trips to avoid
+        // spurious OCPP Faulted while the site is quiescent. Keep estop authoritative even while idle.
         st.comm_trip_since = std::chrono::steady_clock::time_point{};
         st.safety_trip_since = std::chrono::steady_clock::time_point{};
-        st.estop_trip_since = std::chrono::steady_clock::time_point{};
         st.earth_trip_since = std::chrono::steady_clock::time_point{};
         gs.comm_fault = false;
         gs.safety_ok = true;
-        gs.estop = false;
         gs.earth_fault = false;
         gs.cp_fault = false;
     }

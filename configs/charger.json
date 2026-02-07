@@ -64,6 +64,7 @@
     "clientKeyDir": "../data/certs/client/csms",
     "csmsCaBundle": "../data/certs/ca/csms/CSMS_ROOT_CA.pem",
     "moCaBundle": "../data/certs/ca/mo/MO_ROOT_CA.pem",
+    "mfCaBundle": "../data/certs/ca/mf/MF_ROOT_CA.pem",
     "seccCertDir": "../data/certs/client/cso",
     "seccKeyDir": "../data/certs/client/cso",
     "v2gCaBundle": "../data/certs/ca/v2g/V2G_ROOT_CA.pem"
@@ -116,6 +117,7 @@
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
     "powerRequestSeconds": 600,
+    "authorizationDeniedHoldSeconds": 5,
     "hlcAuthorizationSeconds": 150,
     "pncBlockSeconds": 1200
   },

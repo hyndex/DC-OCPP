@@ -82,16 +82,7 @@ int PowerManager::ideal_modules_for_gun(const GunState& g, double p_budget) cons
     if (cfg_.module_power_kw <= 0.0) {
         return cfg_.min_modules_per_active_gun;
     }
-    int n = 1;
-    // Prefer a single module until demand exceeds one-module capacity.
-    if (p_budget <= cfg_.module_power_kw) {
-        n = 1;
-    } else if (p_budget <= cfg_.ideal_high_factor * cfg_.module_power_kw) {
-        n = 2;
-    } else {
-        n = static_cast<int>(std::ceil(p_budget / (cfg_.module_power_kw * cfg_.ideal_high_factor)));
-        n = std::max(n, 2);
-    }
+    int n = static_cast<int>(std::ceil(p_budget / cfg_.module_power_kw));
     int max_by_config = std::max(1, cfg_.max_modules_per_gun);
     int max_by_cable = max_by_config;
     if (g.gun_power_limit_kw > 0.0) {
@@ -280,7 +271,8 @@ std::map<int, double> PowerManager::compute_power_budgets(const std::vector<int>
         double total_weight = 0.0;
         for (auto gid : remaining) {
             const auto& g = guns_.at(gid);
-            const double w = std::max(0.1, 1.0 + static_cast<double>(g.priority));
+            const double priority = static_cast<double>(std::max(0, g.priority));
+            const double w = std::max(0.1, 1.0 / (1.0 + priority));
             total_weight += w;
         }
 
@@ -288,7 +280,8 @@ std::map<int, double> PowerManager::compute_power_budgets(const std::vector<int>
         std::vector<int> remove_list;
 
         for (auto gid : remaining) {
-            const double weight = std::max(0.1, 1.0 + static_cast<double>(guns_.at(gid).priority));
+            const double priority = static_cast<double>(std::max(0, guns_.at(gid).priority));
+            const double weight = std::max(0.1, 1.0 / (1.0 + priority));
             const double share = remaining_power * (weight / total_weight);
             const double candidate = budgets[gid] + share;
             const double cap = req_limited.at(gid);
@@ -330,8 +323,8 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
     auto reduce_once = [&](bool respect_minimum) -> bool {
         int chosen = -1;
         int from_count = -1;
-        int best_priority = std::numeric_limits<int>::max();
-        double best_budget = std::numeric_limits<double>::max();
+        int worst_priority = std::numeric_limits<int>::min();
+        double lowest_budget = std::numeric_limits<double>::max();
         for (auto gid : active) {
             const double budget = budgets.at(gid);
             const auto& g = guns_.at(gid);
@@ -340,12 +333,12 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
                                         : 0;
             if (n_modules[gid] <= min_allowed) continue;
             if (n_modules[gid] > from_count ||
-                (n_modules[gid] == from_count && (g.priority < best_priority ||
-                                                 (g.priority == best_priority && budget < best_budget)))) {
+                (n_modules[gid] == from_count && (g.priority > worst_priority ||
+                                                 (g.priority == worst_priority && budget < lowest_budget)))) {
                 chosen = gid;
                 from_count = n_modules[gid];
-                best_priority = g.priority;
-                best_budget = budget;
+                worst_priority = g.priority;
+                lowest_budget = budget;
             }
         }
         if (chosen == -1) return false;
@@ -364,7 +357,8 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
 
 Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                               const std::map<int, int>& modules_per_gun,
-                              const std::set<int>& reserved_slots) {
+                              const std::set<int>& reserved_slots,
+                              const std::set<int>& full_island_guns) {
     Plan plan = blank_plan();
     next_island_id_ = 1;
 
@@ -375,28 +369,10 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
 
     std::set<int> claimed_slots = active_home_slots;
     std::map<int, std::vector<int>> island_slots;
-    bool single_full_island = false;
-    int single_gid = 0;
-    if (active.size() == 1) {
-        single_gid = active.front();
-        const auto g_it = guns_.find(single_gid);
-        const int home_slot = g_it != guns_.end() ? g_it->second.slot_id : 0;
-        bool reserved_block = false;
-        for (const auto& kv : guns_) {
-            const auto& gstate = kv.second;
-            if (gstate.fsm_state == GunFsmState::Charging && gstate.slot_id != home_slot) {
-                reserved_block = true;
-                break;
-            }
-        }
-        if (!reserved_block && cfg_.allow_cross_slot_islands) {
-            single_full_island = true;
-        }
-    }
     for (auto gid : active) {
         const auto& g = guns_.at(gid);
         const int n_needed = modules_per_gun.at(gid);
-        if (single_full_island && gid == single_gid) {
+        if (full_island_guns.count(gid)) {
             std::vector<int> full;
             const int start_id = g.slot_id > 0 ? g.slot_id : (slots_.empty() ? 0 : slots_.front().id);
             if (start_id > 0 && slot_lookup_.count(start_id)) {
@@ -566,23 +542,23 @@ Plan PowerManager::compute_plan() {
     }
 
     auto modules_per_gun = compute_module_allocation(active, budgets, ideal_modules, healthy_modules);
+    std::set<int> full_island_guns;
     if (active.size() == 1 && cfg_.allow_cross_slot_islands) {
         const int gid = active.front();
         const auto g_it = guns_.find(gid);
         const int home_slot = g_it != guns_.end() ? g_it->second.slot_id : 0;
         bool reserved_block = false;
-        for (const auto& kv : guns_) {
-            const auto& gstate = kv.second;
-            if (gstate.fsm_state == GunFsmState::Charging && gstate.slot_id != home_slot) {
+        for (int slot_id : reserved_slots) {
+            if (slot_id != home_slot) {
                 reserved_block = true;
                 break;
             }
         }
-        if (!reserved_block) {
-            modules_per_gun[gid] = healthy_modules;
+        if (!reserved_block && modules_per_gun[gid] >= healthy_modules) {
+            full_island_guns.insert(gid);
         }
     }
-    auto plan = build_plan(active, budgets, modules_per_gun, reserved_slots);
+    auto plan = build_plan(active, budgets, modules_per_gun, reserved_slots, full_island_guns);
     apply_hysteresis(plan, now);
     if (!validate_plan(plan)) {
         return blank_plan();
@@ -592,6 +568,21 @@ Plan PowerManager::compute_plan() {
 
 void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_point now) {
     const auto hold = std::chrono::milliseconds(cfg_.min_module_hold_ms);
+    std::map<std::string, int> module_owner;
+    for (const auto& island : plan.islands) {
+        if (!island.gun_id) continue;
+        const int gid = island.gun_id.value();
+        for (const auto& mid : island.module_ids) {
+            module_owner[mid] = gid;
+        }
+    }
+    std::set<int> reserved_slots;
+    for (const auto& kv : guns_) {
+        const auto& g = kv.second;
+        if (g.plugged_in || g.reserved || g.fsm_state == GunFsmState::Charging) {
+            reserved_slots.insert(g.slot_id);
+        }
+    }
     for (auto& dispatch : plan.guns) {
         const int gid = dispatch.gun_id;
         const int prev = last_modules_assigned_[gid];
@@ -605,55 +596,71 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
 
         const bool within_hold = have_time && (now - it_time->second) < hold;
         const bool request_differs = dispatch.modules_assigned != prev;
+        const auto git = guns_.find(gid);
+        const GunState* g_state = git != guns_.end() ? &git->second : nullptr;
 
-        auto desired_modules = last_module_ids_[gid];
-        bool previous_still_desired = !desired_modules.empty();
-        for (const auto& mod_id : desired_modules) {
-            const auto mit = modules_.find(mod_id);
-            if (mit == modules_.end()) {
-                previous_still_desired = false;
-                break;
-            }
-            const auto cmd_it = plan.mn_commands.find(mit->second.mn_id);
-            if (cmd_it == plan.mn_commands.end() || cmd_it->second != ContactorState::Closed) {
-                previous_still_desired = false;
-                break;
-            }
-        }
+        const bool can_hold = request_differs && within_hold && dispatch.modules_assigned > 0 && prev > 0 &&
+            dispatch.modules_assigned < prev && dispatch.p_budget_kw > 0.0 && g_state &&
+            g_state->safety_ok && !g_state->gc_welded && !g_state->mc_welded;
 
-        if (request_differs && dispatch.modules_assigned > 0 && prev > 0 &&
-            within_hold && previous_still_desired) {
-            dispatch.modules_assigned = prev;
-            if (island_it != plan.islands.end()) {
-                island_it->module_ids = desired_modules;
-            }
-            const auto git = guns_.find(gid);
-            const GunState* g_state = git != guns_.end() ? &git->second : nullptr;
-            const double v_target = island_it != plan.islands.end() ? island_it->v_set_v : dispatch.voltage_set_v;
-            const double p_cap = prev * cfg_.module_power_kw;
-            const double p_set = std::min({dispatch.p_budget_kw, p_cap,
-                                           g_state && g_state->gun_power_limit_kw > 0.0
-                                               ? g_state->gun_power_limit_kw
-                                               : p_cap});
-            const double v_safe = std::max(cfg_.min_voltage_v_for_div, v_target);
-            double i_target = v_safe > 0.0 ? (p_set * 1000.0) / v_safe : 0.0;
-            if (g_state && g_state->gun_current_limit_a > 0.0) {
-                i_target = std::min(i_target, g_state->gun_current_limit_a);
-            }
-            dispatch.p_set_kw = p_set;
-            dispatch.current_limit_a = std::max(0.0, i_target);
-            dispatch.voltage_set_v = v_target;
-
-            if (island_it != plan.islands.end()) {
-                island_it->p_set_kw = p_set;
-            }
+        if (can_hold && island_it != plan.islands.end() && !last_module_ids_[gid].empty()) {
+            const auto& desired_modules = last_module_ids_[gid];
+            std::set<int> island_slots(island_it->slot_ids.begin(), island_it->slot_ids.end());
+            bool previous_available = true;
             for (const auto& mod_id : desired_modules) {
                 const auto mit = modules_.find(mod_id);
-                if (mit != modules_.end()) {
-                    plan.mn_commands[mit->second.mn_id] = ContactorState::Closed;
+                if (mit == modules_.end() || !mit->second.healthy) {
+                    previous_available = false;
+                    break;
+                }
+                if (!island_slots.count(mit->second.slot_id)) {
+                    previous_available = false;
+                    break;
+                }
+                const auto owner_it = module_owner.find(mod_id);
+                if (owner_it != module_owner.end() && owner_it->second != gid) {
+                    previous_available = false;
+                    break;
+                }
+                if (reserved_slots.count(mit->second.slot_id) && g_state->slot_id != mit->second.slot_id) {
+                    previous_available = false;
+                    break;
                 }
             }
-            if (g_state) {
+
+            if (previous_available) {
+                dispatch.modules_assigned = prev;
+                island_it->module_ids = desired_modules;
+
+                std::set<std::string> desired_set(desired_modules.begin(), desired_modules.end());
+                for (int slot_id : island_it->slot_ids) {
+                    const auto* slot = find_slot(slot_id);
+                    if (!slot) continue;
+                    for (const auto& mod_id : slot->modules) {
+                        const auto mit = modules_.find(mod_id);
+                        if (mit == modules_.end()) continue;
+                        plan.mn_commands[mit->second.mn_id] =
+                            desired_set.count(mod_id) ? ContactorState::Closed : ContactorState::Open;
+                    }
+                }
+
+                const double v_target = island_it->v_set_v;
+                const double p_cap = prev * cfg_.module_power_kw;
+                const double p_set = std::min({dispatch.p_budget_kw, p_cap,
+                                               g_state->gun_power_limit_kw > 0.0
+                                                   ? g_state->gun_power_limit_kw
+                                                   : p_cap});
+                const double v_safe = std::max(cfg_.min_voltage_v_for_div, v_target);
+                double i_target = v_safe > 0.0 ? (p_set * 1000.0) / v_safe : 0.0;
+                if (g_state->gun_current_limit_a > 0.0) {
+                    i_target = std::min(i_target, g_state->gun_current_limit_a);
+                }
+                if (i_target < 0.0) i_target = 0.0;
+                dispatch.p_set_kw = p_set;
+                dispatch.current_limit_a = i_target;
+                dispatch.voltage_set_v = v_target;
+                island_it->p_set_kw = p_set;
+
                 if (const auto* slot = find_slot(g_state->slot_id)) {
                     plan.gc_commands[slot->gc_id] = prev > 0 ? ContactorState::Closed : ContactorState::Open;
                 }

@@ -225,6 +225,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     };
     const auto timeouts = json.value("timeouts", nlohmann::json::object());
     cfg.auth_wait_timeout_s = timeouts.value("authorizationSeconds", cfg.auth_wait_timeout_s);
+    cfg.auth_denied_hold_s = timeouts.value("authorizationDeniedHoldSeconds", cfg.auth_denied_hold_s);
     cfg.hlc_auth_timeout_s = timeouts.value("hlcAuthorizationSeconds", cfg.hlc_auth_timeout_s);
     cfg.pnc_block_ttl_s = timeouts.value("pncBlockSeconds", cfg.pnc_block_ttl_s);
     cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
@@ -259,6 +260,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     // Keep the legacy default (1800s) only when the value is negative/invalid.
     if (cfg.auth_wait_timeout_s < 0) {
         cfg.auth_wait_timeout_s = 1800;
+    }
+    // authorizationDeniedHoldSeconds == 0 clears denied state immediately.
+    if (cfg.auth_denied_hold_s < 0) {
+        cfg.auth_denied_hold_s = 5;
     }
     // hlcAuthorizationSeconds == 0 disables HLC auth watchdog (not recommended).
     if (cfg.hlc_auth_timeout_s < 0) {
@@ -334,6 +339,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     const auto security = json.value("security", nlohmann::json::object());
     cfg.security.csms_ca_bundle = make_absolute(base_dir, security.value("csmsCaBundle", "data/certs/ca/csms/CSMS_ROOT_CA.pem"));
     cfg.security.mo_ca_bundle = make_absolute(base_dir, security.value("moCaBundle", "data/certs/ca/mo/MO_ROOT_CA.pem"));
+    const auto mf_ca_bundle = security.value("mfCaBundle", "");
+    cfg.security.mf_ca_bundle = mf_ca_bundle.empty() ? fs::path{} : make_absolute(base_dir, mf_ca_bundle);
     cfg.security.v2g_ca_bundle = make_absolute(base_dir, security.value("v2gCaBundle", "data/certs/ca/v2g/V2G_ROOT_CA.pem"));
     cfg.security.client_cert_dir = make_absolute(base_dir, security.value("clientCertDir", "data/certs/client/csms"));
     cfg.security.client_key_dir = make_absolute(base_dir, security.value("clientKeyDir", "data/certs/client/csms"));
@@ -621,6 +628,9 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     fs::create_directories(cfg.security.secc_key_dir);
     fs::create_directories(cfg.security.csms_ca_bundle.parent_path());
     fs::create_directories(cfg.security.mo_ca_bundle.parent_path());
+    if (!cfg.security.mf_ca_bundle.empty()) {
+        fs::create_directories(cfg.security.mf_ca_bundle.parent_path());
+    }
     fs::create_directories(cfg.security.v2g_ca_bundle.parent_path());
 
     return cfg;
