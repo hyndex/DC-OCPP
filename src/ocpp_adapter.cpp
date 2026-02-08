@@ -42,8 +42,9 @@ constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::seconds RFID_TAP_LATCH_WINDOW(3);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
-constexpr std::chrono::seconds STATUS_REFRESH_INTERVAL(60);
+[[maybe_unused]] constexpr std::chrono::seconds STATUS_REFRESH_INTERVAL(60);
 constexpr std::chrono::milliseconds STATUS_REFRESH_MIN_GAP(2000);
+constexpr std::chrono::milliseconds POST_STOP_HOLD_MS(5000);
 
 const char* connector_state_name(ConnectorState state) {
     switch (state) {
@@ -494,13 +495,18 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
             flow.auth_pending_since = std::chrono::steady_clock::time_point{};
         }
 
-        // Advertise digital communication (SLAC/ISO15118/DIN) as soon as the EV is plugged in so the PLC can
-        // reach the authorization stage and, for AutoCharge, publish the EV identity (e.g., MAC) early.
+        // Advertise digital communication (SLAC/ISO15118/DIN) when appropriate.
+        // - If AutoCharge/PnC is enabled, keep digital comms on while plugged so the PLC can learn EVMAC early.
+        // - If AutoCharge/PnC is disabled, wait for explicit authorization (EIM/app) to avoid HLC auth timeouts.
         const bool cp_known = status.cp_state != 'U';
         const bool plugged_hint = status.plugged_in || (cp_known && status.cp_state != 'A');
-        out.desired_digital = plugged_hint && !post_stop_plugged;
-        if (flow.pnc_blocked && !session_authorized) {
-            out.desired_digital = false;
+        if (autocharge_allowed) {
+            out.desired_digital = plugged_hint;
+        } else {
+            out.desired_digital = plugged_hint && !post_stop_plugged;
+            if (flow.pnc_blocked && !session_authorized) {
+                out.desired_digital = false;
+            }
         }
         // Keep PnC available unless explicitly blocked; MAC-based AutoCharge should not force-disable HLC.
         out.desired_pnc_blocked = (!autocharge_allowed) || flow.pnc_blocked;
@@ -1438,8 +1444,21 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     pending_session_stop_id = pending_it->second;
                     pending_session_stop_.erase(pending_it);
                 }
-                post_stop_plugged = post_stop_plugged_[connector];
                 pending_session_stop = pending_session_stop_.count(connector) != 0;
+                if (post_stop_plugged_[connector]) {
+                    const auto it_fault = connector_faulted_.find(connector);
+                    const bool fault_latched = (it_fault != connector_faulted_.end()) && it_fault->second;
+                    const auto it_time = post_stop_time_.find(connector);
+                    const bool hold_expired =
+                        it_time != post_stop_time_.end() && it_time->second.time_since_epoch().count() != 0 &&
+                        (now - it_time->second) >= POST_STOP_HOLD_MS;
+                    if (!fault_latched && !pending_session_stop && hold_expired) {
+                        post_stop_plugged_[connector] = false;
+                        post_stop_time_[connector] = std::chrono::steady_clock::time_point{};
+                        EVLOG_info << "Clearing post-stop hold on connector " << connector;
+                    }
+                }
+                post_stop_plugged = post_stop_plugged_[connector];
             }
             if (pending_session_stop_id && charge_point_) {
                 charge_point_->on_session_stopped(connector, *pending_session_stop_id);
@@ -4902,11 +4921,10 @@ void OcppAdapter::maybe_refresh_status_notifications(const std::chrono::steady_c
         std::lock_guard<std::mutex> lock(status_refresh_mutex_);
         const bool pending = pending_status_refresh_.load();
         const bool have_last = last_status_refresh_.time_since_epoch().count() != 0;
-        const bool interval_due = !have_last || (now - last_status_refresh_) >= STATUS_REFRESH_INTERVAL;
         const bool min_gap_ok = !have_last || (now - last_status_refresh_) >= STATUS_REFRESH_MIN_GAP;
-        if ((pending && min_gap_ok) || (!pending && interval_due)) {
+        if (pending && min_gap_ok) {
             do_refresh = true;
-            reason = pending ? pending_status_refresh_reason_ : "periodic";
+            reason = pending_status_refresh_reason_;
             pending_status_refresh_.store(false);
             pending_status_refresh_reason_.clear();
             last_status_refresh_ = now;
