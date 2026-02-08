@@ -1723,12 +1723,16 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 fault = true;
             }
-            if (!status.safety_ok || status.estop || status.earth_fault || status.comm_fault) {
+            const bool comm_fault_relevant =
+                status.plugged_in || status.relay_closed || status.hlc_stage > 0 || had_session || status.authorization_granted;
+            if (!status.safety_ok || status.estop || status.earth_fault || (comm_fault_relevant && status.comm_fault)) {
                 ocpp::v16::Reason stop_reason = ocpp::v16::Reason::Other;
                 if (status.estop) {
                     stop_reason = ocpp::v16::Reason::EmergencyStop;
                 } else if (status.comm_fault) {
-                    stop_reason = ocpp::v16::Reason::PowerLoss;
+                    const bool power_path_active = status.relay_closed || status.hlc_precharge_active ||
+                                                   status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE;
+                    stop_reason = power_path_active ? ocpp::v16::Reason::PowerLoss : ocpp::v16::Reason::Other;
                 } else if (status.earth_fault) {
                     stop_reason = ocpp::v16::Reason::Other;
                 }
@@ -1982,12 +1986,17 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
             }
 
+            // Treat telemetry as required only once a connector is actually in a power-capable phase. Power modules may
+            // not stream telemetry while OFF/idle (0V/0A/0W is expected then), so don't trip PowerLoss when idle.
+            const bool telemetry_required =
+                cfg_.telemetry_timeout_ms > 0 && module_relevant && (module_capability_needed || module_commanded);
             const bool telemetry_seen = status.last_telemetry.time_since_epoch().count() != 0;
             const auto telemetry_age =
                 telemetry_seen ? (now - status.last_telemetry) : std::chrono::steady_clock::duration::zero();
-            const bool telemetry_overdue = cfg_.telemetry_timeout_ms > 0 && telemetry_seen &&
-                                           telemetry_age > telemetry_timeout(cfg_);
-            if (telemetry_overdue) {
+            const bool telemetry_bad =
+                telemetry_required &&
+                (!telemetry_seen || telemetry_age > telemetry_timeout(cfg_));
+            if (telemetry_bad) {
                 if (telemetry_overdue_since.time_since_epoch().count() == 0) {
                     telemetry_overdue_since = now;
                 }
@@ -1996,7 +2005,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             }
             // Debounce telemetry staleness longer to avoid false positives when PLC is busy or slow to start.
             constexpr auto kTelemetryStaleDebounce = std::chrono::milliseconds(3000);
-            const bool telemetry_stale = telemetry_overdue && telemetry_overdue_since.time_since_epoch().count() != 0 &&
+            const bool telemetry_stale = telemetry_bad && telemetry_overdue_since.time_since_epoch().count() != 0 &&
                                          (now - telemetry_overdue_since) >= kTelemetryStaleDebounce;
 
             // Sync OCPP error states (raise on edges, clear on recovery).

@@ -262,13 +262,16 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
     }
 
     // Filter out high-traffic power-module frames (e.g. Maxwell 0x060xxxxx) so PLC telemetry like EVDC_TARGETS
-    // is less likely to be dropped under load. All PLC/contract frames live in the low-ID space where the
-    // protocol field (bits 20..28) is 0.
+    // is less likely to be dropped under load. PLC contract frames use protocol field 0x0, plus boot config (0x9).
     {
-        struct can_filter filter {};
-        filter.can_id = CAN_EFF_FLAG; // Require extended frames.
-        filter.can_mask = CAN_EFF_FLAG | (0x1FFu << 20);
-        if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)) < 0) {
+        struct can_filter filters[2] {};
+        // Contract/EVSE frames: protocol field (bits 20..28) = 0x0.
+        filters[0].can_id = CAN_EFF_FLAG;
+        filters[0].can_mask = CAN_EFF_FLAG | (0x1FFu << 20);
+        // BootConfig frames: protocol field (bits 20..28) = 0x9.
+        filters[1].can_id = CAN_EFF_FLAG | (0x9u << 20);
+        filters[1].can_mask = CAN_EFF_FLAG | (0x1FFu << 20);
+        if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, filters, sizeof(filters)) < 0) {
             EVLOG_warning << "Failed to set CAN filter on " << iface << ": " << std::strerror(errno);
         }
     }
@@ -578,21 +581,35 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
                 st->last_config_ack_crc_warn = now;
             }
             return;
-        } else if (ack.param_id == can_contract::PARAM_EVSE_LIMIT_ACK) {
-            EVLOG_debug << "EVSE limits ack plc=" << static_cast<int>(plc_id) << " count=" << ack.value;
-            st->evse_limit_ack_count = ack.value;
-            st->last_evse_limit_ack = now;
+        }
+        PlcState* target = st;
+        const uint8_t ack_plc = static_cast<uint8_t>(ack.plc_id & 0x0Fu);
+        if (ack_plc != plc_id) {
+            if (PlcState* alt = find_state_by_plc(ack_plc)) {
+                EVLOG_warning << "ConfigAck PLC ID mismatch can_id=" << static_cast<int>(plc_id)
+                              << " payload=" << static_cast<int>(ack_plc) << " (using payload id)";
+                target = alt;
+            } else {
+                EVLOG_warning << "ConfigAck PLC ID mismatch can_id=" << static_cast<int>(plc_id)
+                              << " payload=" << static_cast<int>(ack_plc) << " (no matching PLC state)";
+            }
+        }
+        const int target_plc = target ? target->plc_id : static_cast<int>(plc_id);
+        if (ack.param_id == can_contract::PARAM_EVSE_LIMIT_ACK) {
+            EVLOG_debug << "EVSE limits ack plc=" << target_plc << " count=" << ack.value;
+            target->evse_limit_ack_count = ack.value;
+            target->last_evse_limit_ack = now;
         } else if (ack.param_id == can_contract::PARAM_PROTO_VERSION) {
             const bool ok = (ack.status == 0) && (ack.value == can_contract::PROTOCOL_VERSION);
-            st->protocol_ok = ok;
-            st->protocol_verified = true;
-            st->last_protocol_ack = now;
+            target->protocol_ok = ok;
+            target->protocol_verified = true;
+            target->last_protocol_ack = now;
             if (!ok) {
-                EVLOG_error << "PLC protocol version mismatch plc=" << static_cast<int>(plc_id)
+                EVLOG_error << "PLC protocol version mismatch plc=" << target_plc
                             << " status=" << static_cast<int>(ack.status) << " value=" << ack.value
                             << " expected=" << static_cast<int>(can_contract::PROTOCOL_VERSION);
             } else {
-                EVLOG_info << "PLC protocol version OK plc=" << static_cast<int>(plc_id);
+                EVLOG_info << "PLC protocol version OK plc=" << target_plc;
             }
         }
     } else if (can_id == can_contract::boot_config_id(plc_id)) {
