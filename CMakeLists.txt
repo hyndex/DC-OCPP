@@ -348,6 +348,43 @@ if(DEFINED Boost_INCLUDE_DIRS)
   endif()
 endif()
 
+if(TARGET everest_log OR TARGET everest-log)
+  set(_everest_log_target "")
+  if(TARGET everest_log)
+    set(_everest_log_target everest_log)
+  elseif(TARGET everest-log)
+    set(_everest_log_target everest-log)
+  endif()
+
+  set(_everest_log_fix_targets "")
+  foreach(_tgt evse_security everest_evse_security everest_sqlite everest-sqlite)
+    if(TARGET ${_tgt})
+      set(_real_tgt ${_tgt})
+      get_target_property(_alias_tgt ${_tgt} ALIASED_TARGET)
+      if(_alias_tgt)
+        set(_real_tgt ${_alias_tgt})
+      endif()
+      list(FIND _everest_log_fix_targets ${_real_tgt} _seen_idx)
+      if(_seen_idx EQUAL -1 AND TARGET ${_real_tgt})
+        list(APPEND _everest_log_fix_targets ${_real_tgt})
+        foreach(_prop INTERFACE_LINK_LIBRARIES LINK_LIBRARIES)
+          get_target_property(_libs ${_real_tgt} ${_prop})
+          if(_libs AND NOT _libs STREQUAL "${_prop}-NOTFOUND")
+            list(REMOVE_ITEM _libs everest::log)
+            if(_everest_log_target)
+              list(FIND _libs ${_everest_log_target} _everest_log_idx)
+              if(_everest_log_idx EQUAL -1)
+                list(APPEND _libs ${_everest_log_target})
+              endif()
+            endif()
+            set_target_properties(${_real_tgt} PROPERTIES ${_prop} "${_libs}")
+          endif()
+        endforeach()
+      endif()
+    endif()
+  endforeach()
+endif()
+
 find_package(CURL REQUIRED)
 
 # Keep libocpp lean for this build
@@ -359,6 +396,14 @@ option(BUILD_TESTING "Enable CTest and downstream test targets" OFF)
 option(BUILD_APP_TESTS "Build dc_ocpp/unit test executables" ${BUILD_TESTING})
 if(NOT BUILD_TESTING AND BUILD_APP_TESTS)
   set(BUILD_APP_TESTS OFF CACHE BOOL "Build dc_ocpp/unit test executables" FORCE)
+endif()
+
+if(NOT DEFINED EVEREST_CUSTOM_LOGGING_LIBRARY)
+  if(TARGET everest_log)
+    set(EVEREST_CUSTOM_LOGGING_LIBRARY everest_log)
+  elseif(TARGET everest-log)
+    set(EVEREST_CUSTOM_LOGGING_LIBRARY everest-log)
+  endif()
 endif()
 
 add_subdirectory(libocpp)
@@ -384,7 +429,15 @@ target_include_directories(dc_ocpp PRIVATE include)
 
 # Prefer CMake targets for dependencies when available to avoid stale archive paths
 set(_everest_log_archive "${CMAKE_BINARY_DIR}/_deps/everest_log-build/lib/libeverest_log.a")
-set(EVEREST_LOG_LIBRARY "${_everest_log_archive}" CACHE STRING "everest log lib path" FORCE)
+if(TARGET everest::log)
+  set(EVEREST_LOG_LIBRARY everest::log CACHE STRING "everest log lib path" FORCE)
+elseif(TARGET everest-log)
+  set(EVEREST_LOG_LIBRARY everest-log CACHE STRING "everest log lib path" FORCE)
+elseif(TARGET everest_log)
+  set(EVEREST_LOG_LIBRARY everest_log CACHE STRING "everest log lib path" FORCE)
+elseif(EXISTS "${_everest_log_archive}")
+  set(EVEREST_LOG_LIBRARY "${_everest_log_archive}" CACHE STRING "everest log lib path" FORCE)
+endif()
 
 set(_JSON_SCHEMA_DEP )
 set(_JSON_SCHEMA_ARCHIVE "${CMAKE_BINARY_DIR}/_deps/nlohmann_json_schema_validator-build/libnlohmann_json_schema_validator.a")
@@ -596,6 +649,34 @@ if(BUILD_APP_TESTS)
   target_include_directories(limit_fallback_tests PRIVATE include libocpp/include tests)
   target_link_libraries(limit_fallback_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(limit_fallback_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(status_transition_tests
+    tests/status_transition_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(status_transition_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(status_transition_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(status_transition_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(post_stop_release_tests
+    tests/post_stop_release_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(post_stop_release_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(post_stop_release_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(post_stop_release_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(error_catalog_tests
+    tests/error_catalog_tests.cpp
+  )
+  target_include_directories(error_catalog_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(error_catalog_tests PRIVATE ${_OCPP_APP_LIBS})
 
   add_executable(gc_close_gating_tests
     tests/gc_close_gating_tests.cpp

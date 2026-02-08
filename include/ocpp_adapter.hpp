@@ -16,6 +16,7 @@
 #include <set>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <filesystem>
 
 #include <everest/logging.hpp>
@@ -63,6 +64,20 @@ private:
         AuthToken token;
         std::chrono::steady_clock::time_point expires_at;
         bool defer_until_online{false};
+    };
+
+    struct AuthRequest {
+        std::int32_t connector{0};
+        std::string session_id;
+        PendingToken pending;
+        std::chrono::steady_clock::time_point enqueued_at;
+    };
+
+    struct AuthResult {
+        std::int32_t connector{0};
+        std::string session_id;
+        PendingToken pending;
+        bool accepted{false};
     };
 
     struct HlcControlState {
@@ -138,10 +153,46 @@ public:
             adapter.csms_connected_.store(connected);
         }
 
+        static void update_connector_state(OcppAdapter& adapter, std::int32_t connector, const GunStatus& status,
+                                           bool has_session, bool tx_started, bool authorized, bool fault_active,
+                                           bool disabled, bool post_stop_plugged, bool seamless_retry_active,
+                                           bool suppress_available_event) {
+            adapter.update_connector_state(connector, status, has_session, tx_started, authorized, fault_active,
+                                           disabled, post_stop_plugged, seamless_retry_active,
+                                           suppress_available_event);
+        }
+
+        static ConnectorState connector_state(OcppAdapter& adapter, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(adapter.state_mutex_);
+            const auto it = adapter.connector_state_.find(connector);
+            if (it == adapter.connector_state_.end()) {
+                return ConnectorState::Available;
+            }
+            return it->second;
+        }
+
+        static void process_post_stop_state(OcppAdapter& adapter, std::int32_t connector, const GunStatus& status,
+                                            const std::chrono::steady_clock::time_point& now,
+                                            bool* post_stop_plugged, bool* pending_session_stop,
+                                            std::optional<std::string>* pending_session_stop_id) {
+            adapter.process_post_stop_state(connector, status, now, post_stop_plugged, pending_session_stop,
+                                            pending_session_stop_id);
+        }
+
         static std::mutex& session_mutex(OcppAdapter& adapter) { return adapter.session_mutex_; }
         static std::map<std::int32_t, ActiveSession>& sessions(OcppAdapter& adapter) { return adapter.sessions_; }
         static std::map<std::int32_t, bool>& plugged_in_state(OcppAdapter& adapter) { return adapter.plugged_in_state_; }
         static std::map<int, bool>& power_constrained(OcppAdapter& adapter) { return adapter.power_constrained_; }
+        static std::map<std::int32_t, bool>& post_stop_plugged(OcppAdapter& adapter) { return adapter.post_stop_plugged_; }
+        static std::map<std::int32_t, std::chrono::steady_clock::time_point>& post_stop_time(OcppAdapter& adapter) {
+            return adapter.post_stop_time_;
+        }
+        static std::map<std::int32_t, std::string>& pending_session_stop(OcppAdapter& adapter) {
+            return adapter.pending_session_stop_;
+        }
+        static std::map<std::int32_t, bool>& connector_faulted(OcppAdapter& adapter) {
+            return adapter.connector_faulted_;
+        }
     };
 
 private:
@@ -170,15 +221,20 @@ private:
     std::map<std::int32_t, bool> post_stop_plugged_;
     std::map<std::int32_t, std::chrono::steady_clock::time_point> post_stop_time_;
     std::map<std::int32_t, std::string> pending_session_stop_;
+    std::map<std::int32_t, std::chrono::steady_clock::time_point> pending_session_stop_since_;
     std::vector<std::thread> meter_threads_;
     std::thread planner_thread_;
     std::atomic<bool> planner_thread_running_{false};
     std::thread csms_reconnect_thread_;
     std::atomic<bool> csms_reconnect_thread_running_{false};
+    std::thread auth_thread_;
+    std::atomic<bool> auth_thread_running_{false};
     std::atomic<bool> csms_connected_{false};
     std::map<int, bool> evse_disabled_;
     std::map<int, bool> reserved_connectors_;
     std::map<int, int> reservation_lookup_;
+    std::map<int, int> reservation_id_by_connector_;
+    std::map<int, std::chrono::steady_clock::time_point> reservation_expiry_;
     std::map<int, std::string> reservation_required_tag_;
     std::map<int, std::optional<std::string>> reservation_parent_tag_;
     std::map<int, bool> power_constrained_;
@@ -220,6 +276,11 @@ private:
     std::map<int, uint64_t> limit_ack_stale_events_;
     std::map<int, uint64_t> telemetry_timeout_events_;
     std::map<int, std::map<std::string, std::chrono::steady_clock::time_point>> recent_token_cache_;
+    std::deque<AuthRequest> auth_queue_;
+    std::map<int, AuthResult> auth_results_;
+    std::map<int, std::string> auth_in_flight_;
+    std::mutex auth_queue_mutex_;
+    std::condition_variable auth_queue_cv_;
     struct RfidTapLatch {
         std::string token;
         std::chrono::steady_clock::time_point last_seen{};
@@ -245,6 +306,7 @@ private:
     std::map<int, uint64_t> status_event_seq_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};
+    std::chrono::steady_clock::time_point last_reservation_expiry_check_{};
     std::map<int, int> telemetry_mismatch_count_;
     std::mutex telemetry_mutex_;
     std::optional<std::chrono::steady_clock::time_point> profile_next_refresh_;
@@ -260,6 +322,9 @@ private:
     void update_connector_state(std::int32_t connector, GunStatus status, bool has_session, bool tx_started,
                                 bool authorized, bool fault_active, bool disabled, bool post_stop_plugged,
                                 bool seamless_retry_active, bool suppress_available_event);
+    void process_post_stop_state(std::int32_t connector, const GunStatus& status,
+                                 const std::chrono::steady_clock::time_point& now, bool* post_stop_plugged,
+                                 bool* pending_session_stop, std::optional<std::string>* pending_session_stop_id);
     bool has_active_session(std::int32_t connector);
     void initialize_slots();
     void apply_power_plan();
@@ -290,12 +355,21 @@ private:
     AuthorizationState try_authorize_with_token(std::int32_t connector, ActiveSession& session, const PendingToken& pending);
     AuthorizationState authorize_token_for_session(std::int32_t connector, const std::string& session_id,
                                                    const PendingToken& pending);
+    AuthorizationState apply_authorization_result(std::int32_t connector, const std::string& session_id,
+                                                  const PendingToken& pending, bool accepted);
+    void enqueue_auth_request(std::int32_t connector, const std::string& session_id, const PendingToken& pending);
+    std::optional<AuthResult> pop_auth_result(std::int32_t connector, const std::string& session_id);
+    void clear_auth_queue_for_connector(std::int32_t connector);
+    void auth_loop();
     void clear_local_auth_cache();
     void clear_pending_tokens();
+    void clear_auth_queue();
+    void handle_clear_cache();
     std::string clamp_id_token(const std::string& raw) const;
     void persist_pending_tokens();
     void persist_pending_tokens_snapshot(const std::map<std::int32_t, std::deque<PendingToken>>& snapshot);
     void load_pending_tokens_from_disk();
+    void expire_reservations(const std::chrono::steady_clock::time_point& now);
     std::chrono::steady_clock::time_point to_steady(std::chrono::system_clock::time_point t_sys) const;
     std::chrono::system_clock::time_point to_system(std::chrono::steady_clock::time_point t_steady) const;
     void sync_ocpp_error(std::int32_t connector, const std::string& uuid, ocpp::v16::ChargePointErrorCode error_code,

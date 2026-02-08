@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ocpp_adapter.hpp"
 #include "tie_gating.hpp"
+#include "error_catalog.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,15 @@ constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
 [[maybe_unused]] constexpr std::chrono::seconds STATUS_REFRESH_INTERVAL(60);
 constexpr std::chrono::milliseconds STATUS_REFRESH_MIN_GAP(2000);
 constexpr std::chrono::milliseconds POST_STOP_HOLD_MS(5000);
+constexpr std::chrono::milliseconds POST_STOP_MAX_HOLD_MS(30000);
+constexpr std::chrono::milliseconds RESERVATION_CHECK_INTERVAL(1000);
+
+template <typename TimePoint>
+std::chrono::steady_clock::time_point to_steady_from_utc(const TimePoint& t_utc) {
+    const auto now_utc = ocpp::DateTime().to_time_point();
+    const auto now_steady = std::chrono::steady_clock::now();
+    return now_steady + std::chrono::duration_cast<std::chrono::steady_clock::duration>(t_utc - now_utc);
+}
 
 const char* connector_state_name(ConnectorState state) {
     switch (state) {
@@ -67,6 +77,46 @@ const char* connector_state_name(ConnectorState state) {
     default:
         return "Unknown";
     }
+}
+
+ocpp::v16::ChargePointStatus to_ocpp_status(ConnectorState state) {
+    switch (state) {
+    case ConnectorState::Available:
+        return ocpp::v16::ChargePointStatus::Available;
+    case ConnectorState::Preparing:
+        return ocpp::v16::ChargePointStatus::Preparing;
+    case ConnectorState::Charging:
+        return ocpp::v16::ChargePointStatus::Charging;
+    case ConnectorState::SuspendedEV:
+        return ocpp::v16::ChargePointStatus::SuspendedEV;
+    case ConnectorState::SuspendedEVSE:
+        return ocpp::v16::ChargePointStatus::SuspendedEVSE;
+    case ConnectorState::Finishing:
+        return ocpp::v16::ChargePointStatus::Finishing;
+    case ConnectorState::Unavailable:
+        return ocpp::v16::ChargePointStatus::Unavailable;
+    case ConnectorState::Faulted:
+        return ocpp::v16::ChargePointStatus::Faulted;
+    default:
+        return ocpp::v16::ChargePointStatus::Available;
+    }
+}
+
+ConnectorState initial_state_from_status(const GunStatus& status) {
+    const bool cp_known = status.cp_state != 'U';
+    const bool vehicle_present =
+        status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
+    const bool fault_active = !status.safety_ok || status.cp_fault || status.comm_fault || status.isolation_fault ||
+                              status.overtemp_fault || status.overcurrent_fault || status.gc_welded ||
+                              status.mc_welded || status.earth_fault || status.estop;
+    const bool meter_fault_active = status.meter_stale && status.relay_closed;
+    if (fault_active || meter_fault_active) {
+        return ConnectorState::Faulted;
+    }
+    if (vehicle_present) {
+        return ConnectorState::Preparing;
+    }
+    return ConnectorState::Available;
 }
 
 GunStatus sanitize_status_for_lab(const GunStatus& in) {
@@ -814,7 +864,16 @@ bool OcppAdapter::start() {
     std::map<int, ocpp::v16::ChargePointStatus> connector_status_map;
     connector_status_map.emplace(0, ocpp::v16::ChargePointStatus::Available);
     for (const auto& connector : cfg_.connectors) {
-        connector_status_map.emplace(connector.id, ocpp::v16::ChargePointStatus::Available);
+        ConnectorState initial_state = ConnectorState::Available;
+        if (hardware_) {
+            auto st = sanitize_status_for_lab(hardware_->get_status(connector.id));
+            initial_state = initial_state_from_status(st);
+        }
+        connector_status_map.emplace(connector.id, to_ocpp_status(initial_state));
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            connector_state_[connector.id] = initial_state;
+        }
     }
 
     if (!charge_point_->start(connector_status_map, ocpp::v16::BootReasonEnum::PowerUp)) {
@@ -827,6 +886,8 @@ bool OcppAdapter::start() {
 
     running_ = true;
     csms_connected_.store(false);
+    auth_thread_running_ = true;
+    auth_thread_ = std::thread([this]() { auth_loop(); });
     start_metering_threads();
     planner_thread_running_ = true;
     planner_thread_ = std::thread([this]() {
@@ -840,6 +901,11 @@ bool OcppAdapter::start() {
                 }
                 if (refresh_due) {
                     refresh_charging_profile_limits();
+                }
+                if (last_reservation_expiry_check_.time_since_epoch().count() == 0 ||
+                    (now - last_reservation_expiry_check_) >= RESERVATION_CHECK_INTERVAL) {
+                    expire_reservations(now);
+                    last_reservation_expiry_check_ = now;
                 }
                 apply_power_plan();
                 maybe_refresh_status_notifications(now);
@@ -887,11 +953,16 @@ void OcppAdapter::stop() {
     running_ = false;
     csms_reconnect_thread_running_ = false;
     planner_thread_running_ = false;
+    auth_thread_running_ = false;
+    auth_queue_cv_.notify_all();
     if (csms_reconnect_thread_.joinable()) {
         csms_reconnect_thread_.join();
     }
     if (planner_thread_.joinable()) {
         planner_thread_.join();
+    }
+    if (auth_thread_.joinable()) {
+        auth_thread_.join();
     }
     for (auto& thread : meter_threads_) {
         if (thread.joinable()) {
@@ -1061,16 +1132,39 @@ void OcppAdapter::register_callbacks() {
     charge_point_->register_reserve_now_callback(
         [this](std::int32_t reservation_id, std::int32_t connector, ocpp::DateTime expiryDate,
                ocpp::CiString<20> idTag, std::optional<ocpp::CiString<20>> parent_id) {
+            const auto expiry_tp = to_steady_from_utc(expiryDate.to_time_point());
+            const auto now = std::chrono::steady_clock::now();
+            if (expiry_tp <= now) {
+                EVLOG_warning << "Rejecting reservation " << reservation_id << " on connector " << connector
+                              << " (expiry already passed)";
+                return ocpp::v16::ReservationStatus::Rejected;
+            }
             const auto status = hardware_->reserve(reservation_id, connector, expiryDate, idTag.get(),
                                                    parent_id ? std::optional<std::string>(parent_id->get()) : std::nullopt);
             if (status == ocpp::v16::ReservationStatus::Accepted) {
+                std::optional<int> replaced_connector;
                 charge_point_->on_reservation_start(connector);
-                std::lock_guard<std::mutex> lock(plan_mutex_);
-                reserved_connectors_[connector] = true;
-                reservation_lookup_[reservation_id] = connector;
-                reservation_required_tag_[connector] = idTag.get();
-                reservation_parent_tag_[connector] = parent_id ? std::optional<std::string>(parent_id->get())
-                                                               : std::optional<std::string>{};
+                {
+                    std::lock_guard<std::mutex> lock(plan_mutex_);
+                    auto existing_it = reservation_id_by_connector_.find(connector);
+                    if (existing_it != reservation_id_by_connector_.end()) {
+                        const int old_id = existing_it->second;
+                        reservation_lookup_.erase(old_id);
+                        reservation_expiry_.erase(old_id);
+                        reservation_id_by_connector_.erase(existing_it);
+                        replaced_connector = connector;
+                    }
+                    reserved_connectors_[connector] = true;
+                    reservation_lookup_[reservation_id] = connector;
+                    reservation_id_by_connector_[connector] = reservation_id;
+                    reservation_expiry_[reservation_id] = expiry_tp;
+                    reservation_required_tag_[connector] = idTag.get();
+                    reservation_parent_tag_[connector] = parent_id ? std::optional<std::string>(parent_id->get())
+                                                                   : std::optional<std::string>{};
+                }
+                if (replaced_connector && charge_point_) {
+                    charge_point_->on_reservation_end(*replaced_connector);
+                }
             }
             return status;
         });
@@ -1078,18 +1172,21 @@ void OcppAdapter::register_callbacks() {
     charge_point_->register_cancel_reservation_callback([this](std::int32_t reservation_id) {
         const bool ok = hardware_->cancel_reservation(reservation_id);
         std::optional<int> connector_id;
-        if (ok) {
-            {
-                std::lock_guard<std::mutex> lock(plan_mutex_);
-                auto it = reservation_lookup_.find(reservation_id);
-                if (it != reservation_lookup_.end()) {
-                    connector_id = it->second;
-                    reserved_connectors_[it->second] = false;
-                    reservation_lookup_.erase(it);
-                    reservation_required_tag_.erase(it->second);
-                    reservation_parent_tag_.erase(it->second);
+            if (ok) {
+                {
+                    std::lock_guard<std::mutex> lock(plan_mutex_);
+                    auto it = reservation_lookup_.find(reservation_id);
+                    if (it != reservation_lookup_.end()) {
+                        const int connector = it->second;
+                        connector_id = connector;
+                        reserved_connectors_[connector] = false;
+                        reservation_lookup_.erase(it);
+                        reservation_expiry_.erase(reservation_id);
+                        reservation_id_by_connector_.erase(connector);
+                        reservation_required_tag_.erase(connector);
+                        reservation_parent_tag_.erase(connector);
+                    }
                 }
-            }
             if (connector_id && charge_point_) {
                 charge_point_->on_reservation_end(*connector_id);
             }
@@ -1221,6 +1318,8 @@ void OcppAdapter::register_callbacks() {
 
     charge_point_->register_data_transfer_callback(
         [this](const ocpp::v16::DataTransferRequest& request) { return handle_data_transfer_request(request); });
+
+    charge_point_->register_clear_cache_callback([this]() { handle_clear_cache(); });
 
     charge_point_->register_is_token_reserved_for_connector_callback(
         [this](const std::int32_t connector, const std::string& id_token) {
@@ -1433,33 +1532,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             bool pending_session_stop = false;
             bool suppress_available_event = false; // avoid duplicate Available after deferred session stop
             std::optional<std::string> pending_session_stop_id;
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                if (!vehicle_present) {
-                    post_stop_plugged_[connector] = false;
-                    post_stop_time_[connector] = std::chrono::steady_clock::time_point{};
-                }
-                auto pending_it = pending_session_stop_.find(connector);
-                if (!vehicle_present && pending_it != pending_session_stop_.end()) {
-                    pending_session_stop_id = pending_it->second;
-                    pending_session_stop_.erase(pending_it);
-                }
-                pending_session_stop = pending_session_stop_.count(connector) != 0;
-                if (post_stop_plugged_[connector]) {
-                    const auto it_fault = connector_faulted_.find(connector);
-                    const bool fault_latched = (it_fault != connector_faulted_.end()) && it_fault->second;
-                    const auto it_time = post_stop_time_.find(connector);
-                    const bool hold_expired =
-                        it_time != post_stop_time_.end() && it_time->second.time_since_epoch().count() != 0 &&
-                        (now - it_time->second) >= POST_STOP_HOLD_MS;
-                    if (!fault_latched && !pending_session_stop && hold_expired) {
-                        post_stop_plugged_[connector] = false;
-                        post_stop_time_[connector] = std::chrono::steady_clock::time_point{};
-                        EVLOG_info << "Clearing post-stop hold on connector " << connector;
-                    }
-                }
-                post_stop_plugged = post_stop_plugged_[connector];
-            }
+            process_post_stop_state(connector, status, now, &post_stop_plugged, &pending_session_stop,
+                                    &pending_session_stop_id);
             if (pending_session_stop_id && charge_point_) {
                 charge_point_->on_session_stopped(connector, *pending_session_stop_id);
                 suppress_available_event = true;
@@ -1548,6 +1622,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             std::optional<PendingToken> pending_auth;
             std::string pending_auth_session_id;
             bool auto_auth_granted = false;
+            bool auth_in_flight = false;
             {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                 constrained = power_constrained_[connector];
@@ -1560,6 +1635,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (reservation_parent_tag_.count(connector)) {
                     parent_tag = reservation_parent_tag_[connector];
                 }
+            }
+            {
+                std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+                auth_in_flight = auth_in_flight_.count(connector) > 0;
             }
 
             bool notify_session_started = false;
@@ -1597,12 +1676,15 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     s.pending_started = now;
                     s.last_seen_plugged = status.plugged_in ? now : std::chrono::steady_clock::time_point{};
                     bool have_token = false;
-                    if (auto pending = pop_next_pending_token(connector, now, reservation_required, reservation_parent,
-                                                              &pending_changed)) {
-                        pending_auth = pending;
-                        pending_auth_session_id = s.session_id;
-                        have_token = true;
-                    } else if (!reserved) {
+                    if (!auth_in_flight) {
+                        if (auto pending = pop_next_pending_token(connector, now, reservation_required,
+                                                                  reservation_parent, &pending_changed)) {
+                            pending_auth = pending;
+                            pending_auth_session_id = s.session_id;
+                            have_token = true;
+                        }
+                    }
+                    if (!have_token && !reserved) {
                         if (cfg_.free_mode) {
                             const auto tag = clamp_id_token(cfg_.default_tag);
                             if (!tag.empty()) {
@@ -1645,11 +1727,14 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         it->second.last_seen_plugged = now;
                     }
                     if (!it->second.authorized) {
-                        if (auto pending = pop_next_pending_token(connector, now, std::nullopt, std::nullopt,
-                                                                  &pending_changed)) {
-                            pending_auth = pending;
-                            pending_auth_session_id = it->second.session_id;
-                        } else {
+                        if (!auth_in_flight) {
+                            if (auto pending = pop_next_pending_token(connector, now, std::nullopt, std::nullopt,
+                                                                      &pending_changed)) {
+                                pending_auth = pending;
+                                pending_auth_session_id = it->second.session_id;
+                            }
+                        }
+                        if (!pending_auth) {
                             const auto auth_state = get_auth_state(connector);
                             if (auth_state == AuthorizationState::Denied) {
                                 if (cfg_.auth_denied_hold_s <= 0) {
@@ -1687,21 +1772,45 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (auto_auth_granted) {
                 set_auth_state(connector, AuthorizationState::Granted);
             }
-            AuthorizationState pending_auth_state = AuthorizationState::Unknown;
             bool force_auth_denied = false;
             std::optional<std::string> autocharge_reject_id;
             if (pending_auth) {
-                pending_auth_state = authorize_token_for_session(connector, pending_auth_session_id, *pending_auth);
-                if (pending_auth->token.source == AuthTokenSource::Autocharge &&
-                    pending_auth_state == AuthorizationState::Denied) {
-                    autocharge_reject_id = pending_auth->token.id_token;
-                    force_auth_denied = true;
+                if (pending_auth->token.prevalidated) {
+                    const auto state = apply_authorization_result(connector, pending_auth_session_id, *pending_auth, true);
+                    if (pending_auth->token.source == AuthTokenSource::Autocharge &&
+                        state == AuthorizationState::Denied) {
+                        autocharge_reject_id = pending_auth->token.id_token;
+                        force_auth_denied = true;
+                    }
+                } else {
+                    set_auth_state(connector, AuthorizationState::Pending);
+                    enqueue_auth_request(connector, pending_auth_session_id, *pending_auth);
                 }
-                std::lock_guard<std::mutex> lock(session_mutex_);
-                auto it = sessions_.find(connector);
-                if (it != sessions_.end()) {
-                    session = it->second;
-                    had_session = true;
+                {
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    auto it = sessions_.find(connector);
+                    if (it != sessions_.end()) {
+                        session = it->second;
+                        had_session = true;
+                    }
+                }
+            }
+            if (had_session) {
+                if (auto auth_result = pop_auth_result(connector, session.session_id)) {
+                    const auto state =
+                        apply_authorization_result(connector, auth_result->session_id, auth_result->pending,
+                                                   auth_result->accepted);
+                    if (auth_result->pending.token.source == AuthTokenSource::Autocharge &&
+                        state == AuthorizationState::Denied) {
+                        autocharge_reject_id = auth_result->pending.token.id_token;
+                        force_auth_denied = true;
+                    }
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    auto it = sessions_.find(connector);
+                    if (it != sessions_.end()) {
+                        session = it->second;
+                        had_session = true;
+                    }
                 }
             }
             if (notify_session_started) {
@@ -1720,8 +1829,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 reserved_connectors_[connector] = false;
                 reservation_required_tag_.erase(connector);
                 reservation_parent_tag_.erase(connector);
+                reservation_id_by_connector_.erase(connector);
                 for (auto rit = reservation_lookup_.begin(); rit != reservation_lookup_.end();) {
                     if (rit->second == connector) {
+                        reservation_expiry_.erase(rit->first);
                         rit = reservation_lookup_.erase(rit);
                     } else {
                         ++rit;
@@ -2080,34 +2191,62 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const bool ocpp_module_degraded = !ocpp_module_fault && module_fault_mask != 0;
             const bool ocpp_lock_fault = lock_required && !status.lock_engaged && (status.plugged_in || had_session);
 
-            sync_ocpp_error(connector, "cp_fault", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_cp_fault);
+            const auto cp_desc = errors::descriptor(errors::ErrorKey::CpFault);
+            sync_ocpp_error(connector, "cp_fault", cp_desc.ocpp_code, cp_desc.is_fault, ocpp_cp_fault,
+                            cp_desc.info, cfg_.vendor, cp_desc.vendor_code);
+
             // OCPP 1.6 has no dedicated "EmergencyStop" error code; avoid mislabeling it as PowerSwitchFailure.
-            sync_ocpp_error(connector, "estop", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_estop,
-                            "EmergencyStop", cfg_.vendor, "ESTOP");
-            sync_ocpp_error(connector, "comm", ocpp::v16::ChargePointErrorCode::InternalError, true, ocpp_comm,
-                            telemetry_stale ? "TelemetryStale" : "PlcCommFault", cfg_.vendor,
-                            telemetry_stale ? "TELEM_STALE" : "PLC_COMM");
-            sync_ocpp_error(connector, "earth", ocpp::v16::ChargePointErrorCode::GroundFailure, true, ocpp_earth);
-            sync_ocpp_error(connector, "safety", ocpp::v16::ChargePointErrorCode::OtherError, true, ocpp_safety,
-                            "SafetyTrip", cfg_.vendor, "SAFETY");
-            sync_ocpp_error(connector, "isolation_fault", ocpp::v16::ChargePointErrorCode::GroundFailure, true,
-                            ocpp_isolation);
-            sync_ocpp_error(connector, "overtemp", ocpp::v16::ChargePointErrorCode::HighTemperature, true,
-                            ocpp_overtemp);
-            sync_ocpp_error(connector, "overcurrent", ocpp::v16::ChargePointErrorCode::OverCurrentFailure, true,
-                            ocpp_overcurrent);
-            sync_ocpp_error(connector, "gc_welded", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
-                            ocpp_gc_welded);
-            sync_ocpp_error(connector, "mc_welded", ocpp::v16::ChargePointErrorCode::PowerSwitchFailure, true,
-                            ocpp_mc_welded);
-            sync_ocpp_error(connector, "module_fault", ocpp::v16::ChargePointErrorCode::OtherError, true,
-                            ocpp_module_fault, "ModulesUnavailable", cfg_.vendor, "MODULES");
-            sync_ocpp_error(connector, "module_degraded", ocpp::v16::ChargePointErrorCode::OtherError, false,
-                            ocpp_module_degraded);
-            sync_ocpp_error(connector, "lock_fault", ocpp::v16::ChargePointErrorCode::ConnectorLockFailure, true,
-                            ocpp_lock_fault);
-            sync_ocpp_error(connector, "meter_stale", ocpp::v16::ChargePointErrorCode::PowerMeterFailure, false,
-                            meter_fault_relevant);
+            const auto estop_desc = errors::descriptor(errors::ErrorKey::EmergencyStop);
+            sync_ocpp_error(connector, "estop", estop_desc.ocpp_code, estop_desc.is_fault, ocpp_estop,
+                            estop_desc.info, cfg_.vendor, estop_desc.vendor_code);
+
+            const auto comm_desc = errors::comm_descriptor(telemetry_stale);
+            sync_ocpp_error(connector, "comm", comm_desc.ocpp_code, comm_desc.is_fault, ocpp_comm,
+                            comm_desc.info, cfg_.vendor, comm_desc.vendor_code);
+
+            const auto earth_desc = errors::descriptor(errors::ErrorKey::EarthFault);
+            sync_ocpp_error(connector, "earth", earth_desc.ocpp_code, earth_desc.is_fault, ocpp_earth,
+                            earth_desc.info, cfg_.vendor, earth_desc.vendor_code);
+
+            const auto safety_desc = errors::descriptor(errors::ErrorKey::SafetyTrip);
+            sync_ocpp_error(connector, "safety", safety_desc.ocpp_code, safety_desc.is_fault, ocpp_safety,
+                            safety_desc.info, cfg_.vendor, safety_desc.vendor_code);
+
+            const auto iso_desc = errors::descriptor(errors::ErrorKey::IsolationFault);
+            sync_ocpp_error(connector, "isolation_fault", iso_desc.ocpp_code, iso_desc.is_fault, ocpp_isolation,
+                            iso_desc.info, cfg_.vendor, iso_desc.vendor_code);
+
+            const auto overtemp_desc = errors::descriptor(errors::ErrorKey::OverTemp);
+            sync_ocpp_error(connector, "overtemp", overtemp_desc.ocpp_code, overtemp_desc.is_fault, ocpp_overtemp,
+                            overtemp_desc.info, cfg_.vendor, overtemp_desc.vendor_code);
+
+            const auto overcurrent_desc = errors::descriptor(errors::ErrorKey::OverCurrent);
+            sync_ocpp_error(connector, "overcurrent", overcurrent_desc.ocpp_code, overcurrent_desc.is_fault,
+                            ocpp_overcurrent, overcurrent_desc.info, cfg_.vendor, overcurrent_desc.vendor_code);
+
+            const auto gc_desc = errors::descriptor(errors::ErrorKey::GcWelded);
+            sync_ocpp_error(connector, "gc_welded", gc_desc.ocpp_code, gc_desc.is_fault, ocpp_gc_welded,
+                            gc_desc.info, cfg_.vendor, gc_desc.vendor_code);
+
+            const auto mc_desc = errors::descriptor(errors::ErrorKey::McWelded);
+            sync_ocpp_error(connector, "mc_welded", mc_desc.ocpp_code, mc_desc.is_fault, ocpp_mc_welded,
+                            mc_desc.info, cfg_.vendor, mc_desc.vendor_code);
+
+            const auto modules_desc = errors::descriptor(errors::ErrorKey::ModulesUnavailable);
+            sync_ocpp_error(connector, "module_fault", modules_desc.ocpp_code, modules_desc.is_fault,
+                            ocpp_module_fault, modules_desc.info, cfg_.vendor, modules_desc.vendor_code);
+
+            const auto degraded_desc = errors::descriptor(errors::ErrorKey::ModuleDegraded);
+            sync_ocpp_error(connector, "module_degraded", degraded_desc.ocpp_code, degraded_desc.is_fault,
+                            ocpp_module_degraded, degraded_desc.info, cfg_.vendor, degraded_desc.vendor_code);
+
+            const auto lock_desc = errors::descriptor(errors::ErrorKey::LockFault);
+            sync_ocpp_error(connector, "lock_fault", lock_desc.ocpp_code, lock_desc.is_fault, ocpp_lock_fault,
+                            lock_desc.info, cfg_.vendor, lock_desc.vendor_code);
+
+            const auto meter_desc = errors::descriptor(errors::ErrorKey::MeterStale);
+            sync_ocpp_error(connector, "meter_stale", meter_desc.ocpp_code, meter_desc.is_fault,
+                            meter_fault_relevant, meter_desc.info, cfg_.vendor, meter_desc.vendor_code);
 
             if (!fault) {
                 std::lock_guard<std::mutex> lock(state_mutex_);
@@ -2302,6 +2441,7 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         pending_changed = pending_tokens_.erase(connector) > 0;
         sessions_.erase(connector);
     }
+    clear_auth_queue_for_connector(connector);
     if (pending_changed) {
         persist_pending_tokens();
     }
@@ -2311,9 +2451,11 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (defer_session_stop) {
             pending_session_stop_[connector] = session_id;
+            pending_session_stop_since_[connector] = std::chrono::steady_clock::now();
             notify_session_stop = false;
         } else {
             pending_session_stop_.erase(connector);
+            pending_session_stop_since_.erase(connector);
         }
     }
     if (charge_point_ && notify_session_stop) {
@@ -2445,7 +2587,8 @@ void OcppAdapter::ingest_auth_tokens(const std::vector<AuthToken>& tokens,
                 }
             }
             const int target = select_connector_for_token(token);
-            const bool bypass_dedup = should_bypass_token_dedup(target, token);
+            const bool bypass_dedup =
+                (token.source == AuthTokenSource::RemoteStart) || should_bypass_token_dedup(target, token);
             auto& dedup_cache = recent_token_cache_[target];
             for (auto it = dedup_cache.begin(); it != dedup_cache.end();) {
                 if ((now - it->second) >= RECENT_TOKEN_DEDUP_WINDOW) {
@@ -2690,7 +2833,6 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
 AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connector,
                                                             const std::string& session_id,
                                                             const PendingToken& pending) {
-    const auto now = std::chrono::steady_clock::now();
     if (pending.token.source == AuthTokenSource::Autocharge && !autocharge_enabled_.load()) {
         set_auth_state(connector, AuthorizationState::Pending);
         return AuthorizationState::Pending;
@@ -2699,10 +2841,24 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
     bool accepted = pending.token.prevalidated;
     if (!accepted && charge_point_) {
         set_auth_state(connector, AuthorizationState::Pending);
-        const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
-        accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
+        try {
+            const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
+            accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
+        } catch (const std::exception& e) {
+            EVLOG_warning << "Authorization exception on connector " << connector << ": " << e.what();
+            accepted = false;
+        }
     }
 
+    return apply_authorization_result(connector, session_id, pending, accepted);
+}
+
+AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connector,
+                                                           const std::string& session_id,
+                                                           const PendingToken& pending,
+                                                           bool accepted) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto trimmed = clamp_id_token(pending.token.id_token);
     AuthorizationState new_state = accepted ? AuthorizationState::Granted : AuthorizationState::Denied;
     const bool csms_offline = !charge_point_ || !csms_connected_.load();
     bool pending_changed = false;
@@ -2765,6 +2921,105 @@ AuthorizationState OcppAdapter::authorize_token_for_session(std::int32_t connect
     return new_state;
 }
 
+void OcppAdapter::enqueue_auth_request(std::int32_t connector, const std::string& session_id, const PendingToken& pending) {
+    if (!auth_thread_running_) {
+        return;
+    }
+    AuthRequest req;
+    req.connector = connector;
+    req.session_id = session_id;
+    req.pending = pending;
+    req.enqueued_at = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+        auto inflight = auth_in_flight_.find(connector);
+        if (inflight != auth_in_flight_.end()) {
+            if (inflight->second == session_id) {
+                return;
+            }
+            auth_in_flight_.erase(connector);
+            auth_results_.erase(connector);
+            auth_queue_.erase(std::remove_if(auth_queue_.begin(), auth_queue_.end(),
+                                             [connector](const AuthRequest& r) { return r.connector == connector; }),
+                              auth_queue_.end());
+        }
+        auth_in_flight_[connector] = session_id;
+        auth_queue_.push_back(std::move(req));
+    }
+    auth_queue_cv_.notify_one();
+}
+
+std::optional<OcppAdapter::AuthResult> OcppAdapter::pop_auth_result(std::int32_t connector,
+                                                                    const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+    auto it = auth_results_.find(connector);
+    if (it == auth_results_.end()) {
+        return std::nullopt;
+    }
+    AuthResult res = it->second;
+    auth_results_.erase(it);
+    auth_in_flight_.erase(connector);
+    if (!session_id.empty() && res.session_id != session_id) {
+        EVLOG_warning << "Discarding auth result for stale session " << res.session_id
+                      << " (current=" << session_id << ") connector " << connector;
+        return std::nullopt;
+    }
+    return res;
+}
+
+void OcppAdapter::clear_auth_queue_for_connector(std::int32_t connector) {
+    std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+    auth_in_flight_.erase(connector);
+    auth_results_.erase(connector);
+    auth_queue_.erase(std::remove_if(auth_queue_.begin(), auth_queue_.end(),
+                                     [connector](const AuthRequest& req) { return req.connector == connector; }),
+                      auth_queue_.end());
+}
+
+void OcppAdapter::auth_loop() {
+    while (running_ && auth_thread_running_) {
+        AuthRequest req;
+        {
+            std::unique_lock<std::mutex> lock(auth_queue_mutex_);
+            auth_queue_cv_.wait(lock, [this]() {
+                return !auth_thread_running_ || !running_ || !auth_queue_.empty();
+            });
+            if (!running_ || !auth_thread_running_) {
+                break;
+            }
+            if (auth_queue_.empty()) {
+                continue;
+            }
+            req = std::move(auth_queue_.front());
+            auth_queue_.pop_front();
+        }
+
+        bool accepted = req.pending.token.prevalidated;
+        if (!accepted && charge_point_) {
+            try {
+                const auto trimmed = clamp_id_token(req.pending.token.id_token);
+                const auto info = charge_point_->authorize_id_token(ocpp::CiString<20>(trimmed));
+                accepted = (info.id_tag_info.status == ocpp::v16::AuthorizationStatus::Accepted);
+            } catch (const std::exception& e) {
+                EVLOG_warning << "Authorization worker exception on connector " << req.connector << ": " << e.what();
+                accepted = false;
+            }
+        }
+
+        AuthResult res;
+        res.connector = req.connector;
+        res.session_id = req.session_id;
+        res.pending = std::move(req.pending);
+        res.accepted = accepted;
+
+        {
+            std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+            auth_results_[res.connector] = std::move(res);
+        }
+    }
+}
+
 void OcppAdapter::clear_local_auth_cache() {
     fs::path db_path = cfg_.database_dir;
     std::error_code ec;
@@ -2800,6 +3055,28 @@ void OcppAdapter::clear_pending_tokens() {
         pending_tokens_.clear();
     }
     persist_pending_tokens();
+}
+
+void OcppAdapter::clear_auth_queue() {
+    std::lock_guard<std::mutex> lock(auth_queue_mutex_);
+    auth_queue_.clear();
+    auth_results_.clear();
+    auth_in_flight_.clear();
+}
+
+void OcppAdapter::handle_clear_cache() {
+    clear_pending_tokens();
+    clear_auth_queue();
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        auth_denied_since_.clear();
+        last_denied_token_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        recent_token_cache_.clear();
+    }
+    EVLOG_info << "Cleared adapter-side auth caches after ClearCache";
 }
 
 std::string OcppAdapter::clamp_id_token(const std::string& raw) const {
@@ -3600,6 +3877,7 @@ void OcppAdapter::apply_power_plan() {
         double module_voltage_v{0.0};
         double module_current_a{0.0};
         double module_power_kw{0.0};
+        uint8_t slot_cfg_mask{0};
         bool modules_healthy{true};
         int modules_final{0};
         uint8_t mask_final{0};
@@ -3716,6 +3994,19 @@ void OcppAdapter::apply_power_plan() {
             info.modules_final = 0;
             info.mask_final = 0;
         }
+
+        uint8_t cfg_mask = 0u;
+        for (const auto& module_id : slot.modules) {
+            auto bit_it = module_slot_index.find(module_id);
+            if (bit_it == module_slot_index.end()) {
+                continue;
+            }
+            const int bit = bit_it->second;
+            if (bit >= 0 && bit < 8) {
+                cfg_mask |= static_cast<uint8_t>(1u << bit);
+            }
+        }
+        info.slot_cfg_mask = cfg_mask;
 
         slot_info[slot.id] = info;
     }
@@ -4190,6 +4481,8 @@ void OcppAdapter::apply_power_plan() {
         const bool hlc_known = status.hlc_stage > 0 || status.hlc_precharge_active || status.hlc_power_ready;
         const bool ev_requesting = status.cp_state == 'C' || status.cp_state == 'D';
         const bool ev_current_req = status.target_current_a && status.target_current_a.value() > 0.5;
+        const bool ev_power_phase_req = hlc_power_phase && ev_requesting &&
+                                        (ev_current_req || status.hlc_power_ready);
         bool gc_close_blocked = false;
         if (gc_closed_cmd && is_home && !status.relay_closed) {
             if (hlc_known && !hlc_power_phase) {
@@ -4321,7 +4614,7 @@ void OcppAdapter::apply_power_plan() {
             gc_switch_ready_since_.erase(slot->gc_id);
         }
         if (gc_close_requested && is_home && !status.relay_closed && !local_fault && !info.disabled_by_csms &&
-            hlc_power_phase && ev_requesting && ev_current_req) {
+            ev_power_phase_req) {
             if (!gc_closed_cmd || gc_close_blocked) {
                 auto& ts = gc_close_request_time_[c.id];
                 if (ts.time_since_epoch().count() == 0) {
@@ -4347,7 +4640,7 @@ void OcppAdapter::apply_power_plan() {
             gc_close_request_time_.erase(c.id);
         }
 
-        const bool power_request_active = hlc_power_phase && ev_requesting && ev_current_req;
+        const bool power_request_active = ev_power_phase_req;
         bool current_valid = false;
         if (snap_it != snapshots.end()) {
             current_valid = tie_mode && status.relay_closed ? snap_it->second.island_telem_complete
@@ -4449,9 +4742,11 @@ void OcppAdapter::apply_power_plan() {
         const bool allow_energy_home = is_home && allow_energy_for_gun;
 
         uint8_t relay_mask_cmd = 0u;
+        bool module_slots_valid = false;
         const auto module_slots_it = connector_module_slots_.find(c.id);
         if (module_slots_it != connector_module_slots_.end()) {
             const auto& module_slots = module_slots_it->second;
+            module_slots_valid = (module_slots[0] > 0 || module_slots[1] > 0);
             auto slot_closed = [&](int slot_id) -> bool {
                 if (slot_id <= 0) {
                     return false;
@@ -4490,6 +4785,37 @@ void OcppAdapter::apply_power_plan() {
         cmd.voltage_set_v = dispatch.voltage_set_v;
         cmd.current_limit_a = allow_energy_home ? dispatch.current_limit_a : 0.0;
         cmd.power_kw = allow_energy_home ? dispatch.p_set_kw : 0.0;
+
+        if (cmd.module_count > 0 && cmd.module_mask == 0 && !info.disabled_by_csms && !connector_fault && !local_fault) {
+            if (!module_slots_valid && mc_closed_cmd) {
+                uint8_t fallback_mask = info.slot_cfg_mask;
+                if (fallback_mask == 0) {
+                    const auto last_it = last_module_mask_cmd_.find(c.id);
+                    if (last_it != last_module_mask_cmd_.end()) {
+                        fallback_mask = last_it->second;
+                    }
+                }
+                if (fallback_mask == 0) {
+                    const int max_bits = std::numeric_limits<uint8_t>::digits;
+                    const int capped = std::max(0, std::min(cmd.module_count, max_bits));
+                    fallback_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
+                }
+                if (fallback_mask != 0) {
+                    static std::map<int, std::chrono::steady_clock::time_point> last_log;
+                    auto& last_ts = last_log[c.id];
+                    const bool allow_log = last_ts.time_since_epoch().count() == 0 ||
+                                           (now - last_ts) > std::chrono::seconds(1);
+                    if (allow_log) {
+                        EVLOG_warning << "Connector " << c.id
+                                      << " module mask missing; using fallback mask 0x"
+                                      << std::hex << static_cast<int>(fallback_mask) << std::dec
+                                      << " for module_count=" << cmd.module_count;
+                        last_ts = now;
+                    }
+                    cmd.module_mask = fallback_mask;
+                }
+            }
+        }
 
         if (cmd.module_count <= 0) {
             cmd.module_mask = 0;
@@ -4570,24 +4896,7 @@ void OcppAdapter::apply_power_plan() {
         }
 
         auto local_fault_error_code = [&](const std::string& reason) {
-            if (reason == "GCWelded" || reason == "MCWelded" ||
-                reason == "GCOpenTimeout" || reason == "GCCloseTimeout" ||
-                reason == "MCOpenTimeout" || reason == "PowerDeliveryStalled") {
-                return ocpp::v16::ChargePointErrorCode::PowerSwitchFailure;
-            }
-            if (reason == "Isolation") {
-                return ocpp::v16::ChargePointErrorCode::GroundFailure;
-            }
-            if (reason == "Overtemp") {
-                return ocpp::v16::ChargePointErrorCode::HighTemperature;
-            }
-            if (reason == "Overcurrent") {
-                return ocpp::v16::ChargePointErrorCode::OverCurrentFailure;
-            }
-            if (reason == "CommFault") {
-                return ocpp::v16::ChargePointErrorCode::InternalError;
-            }
-            return ocpp::v16::ChargePointErrorCode::OtherError;
+            return errors::local_fault_error_code(reason);
         };
 
         std::string prev_local_fault;
@@ -4678,18 +4987,7 @@ void OcppAdapter::apply_power_plan() {
 
             const int slot_module_cmd = slot_modules_allowed ? info.modules_final : 0;
             const uint8_t slot_mask_cmd = slot_modules_allowed ? info.mask_final : 0u;
-            uint8_t slot_cfg_mask = 0u;
-            for (std::size_t idx = 0; idx < slot.modules.size(); ++idx) {
-                const auto& module_id = slot.modules[idx];
-                int bit = static_cast<int>(idx);
-                const auto it = module_slot_index.find(module_id);
-                if (it != module_slot_index.end()) {
-                    bit = it->second;
-                }
-                if (bit >= 0 && bit < 8) {
-                    slot_cfg_mask |= static_cast<uint8_t>(1U << bit);
-                }
-            }
+            const uint8_t slot_cfg_mask = info.slot_cfg_mask;
 
             const bool drive_modules_for_gun =
                 gun_id > 0 && gun_drive_modules.count(gun_id) ? gun_drive_modules.at(gun_id) : false;
@@ -4741,22 +5039,12 @@ void OcppAdapter::enter_global_fault(const std::string& reason, ocpp::v16::Reaso
     }
     global_fault_reason_ = reason;
     EVLOG_error << "Global fault latched: " << reason;
-    ocpp::v16::ChargePointErrorCode error_code = ocpp::v16::ChargePointErrorCode::OtherError;
-    std::string vendor_error = "FAULT";
-    if (reason == "estop") {
-        error_code = ocpp::v16::ChargePointErrorCode::OtherError;
-        vendor_error = "ESTOP";
-    } else if (reason == "earth") {
-        error_code = ocpp::v16::ChargePointErrorCode::GroundFailure;
-        vendor_error = "EARTH";
-    } else if (reason == "safety") {
-        error_code = ocpp::v16::ChargePointErrorCode::OtherError;
-        vendor_error = "SAFETY";
-    }
+    const auto desc = errors::global_fault_descriptor(reason);
     for (const auto& c : cfg_.connectors) {
         finish_transaction(c.id, stop_reason, std::nullopt);
         hardware_->disable(c.id);
-        sync_ocpp_error(c.id, reason, error_code, true, true, "GlobalFault", cfg_.vendor, vendor_error);
+        sync_ocpp_error(c.id, reason, desc.ocpp_code, desc.is_fault, true, desc.info, cfg_.vendor,
+                        desc.vendor_code);
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             connector_faulted_[c.id] = true;
@@ -4937,6 +5225,95 @@ void OcppAdapter::maybe_refresh_status_notifications(const std::chrono::steady_c
     charge_point_->trigger_status_notifications();
 }
 
+void OcppAdapter::expire_reservations(const std::chrono::steady_clock::time_point& now) {
+    std::vector<int> expired_connectors;
+    {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        for (auto it = reservation_id_by_connector_.begin(); it != reservation_id_by_connector_.end();) {
+            const int connector = it->first;
+            const int reservation_id = it->second;
+            auto exp_it = reservation_expiry_.find(reservation_id);
+            if (exp_it == reservation_expiry_.end()) {
+                ++it;
+                continue;
+            }
+            if (exp_it->second <= now) {
+                reserved_connectors_[connector] = false;
+                reservation_required_tag_.erase(connector);
+                reservation_parent_tag_.erase(connector);
+                reservation_lookup_.erase(reservation_id);
+                reservation_expiry_.erase(exp_it);
+                expired_connectors.push_back(connector);
+                it = reservation_id_by_connector_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (charge_point_) {
+        for (const int connector : expired_connectors) {
+            EVLOG_info << "Reservation expired on connector " << connector;
+            charge_point_->on_reservation_end(connector);
+        }
+    }
+}
+
+void OcppAdapter::process_post_stop_state(std::int32_t connector, const GunStatus& status,
+                                          const std::chrono::steady_clock::time_point& now,
+                                          bool* post_stop_plugged, bool* pending_session_stop,
+                                          std::optional<std::string>* pending_session_stop_id) {
+    if (!post_stop_plugged || !pending_session_stop || !pending_session_stop_id) {
+        return;
+    }
+    const bool cp_known = status.cp_state != 'U';
+    const bool vehicle_present =
+        status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
+
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    bool hold_expired = false;
+    if (!vehicle_present) {
+        post_stop_plugged_[connector] = false;
+        post_stop_time_[connector] = std::chrono::steady_clock::time_point{};
+    }
+    if (post_stop_plugged_[connector]) {
+        const auto it_time = post_stop_time_.find(connector);
+        hold_expired =
+            it_time != post_stop_time_.end() && it_time->second.time_since_epoch().count() != 0 &&
+            (now - it_time->second) >= POST_STOP_HOLD_MS;
+    }
+
+    auto pending_it = pending_session_stop_.find(connector);
+    bool pending_expired = false;
+    auto pending_since_it = pending_session_stop_since_.find(connector);
+    if (pending_since_it != pending_session_stop_since_.end() &&
+        pending_since_it->second.time_since_epoch().count() != 0 &&
+        (now - pending_since_it->second) >= POST_STOP_MAX_HOLD_MS) {
+        pending_expired = true;
+    }
+    if (pending_it != pending_session_stop_.end() && (!vehicle_present || hold_expired || pending_expired)) {
+        *pending_session_stop_id = pending_it->second;
+        pending_session_stop_.erase(pending_it);
+        pending_session_stop_since_.erase(connector);
+        if (pending_expired) {
+            EVLOG_warning << "Pending session stop exceeded max hold on connector " << connector
+                          << "; releasing session stop";
+        }
+    }
+    *pending_session_stop = pending_session_stop_.count(connector) != 0;
+
+    if (post_stop_plugged_[connector]) {
+        const auto it_fault = connector_faulted_.find(connector);
+        const bool fault_latched = (it_fault != connector_faulted_.end()) && it_fault->second;
+        if (!fault_latched && !(*pending_session_stop) && hold_expired) {
+            post_stop_plugged_[connector] = false;
+            post_stop_time_[connector] = std::chrono::steady_clock::time_point{};
+            EVLOG_info << "Clearing post-stop hold on connector " << connector;
+        }
+    }
+
+    *post_stop_plugged = post_stop_plugged_[connector];
+}
+
 void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus status, bool has_session,
                                          bool tx_started, bool authorized, bool fault_active, bool disabled,
                                          bool post_stop_plugged, bool seamless_retry_active,
@@ -4952,6 +5329,9 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
     const bool vehicle_present =
         status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
     const bool finishing_hint = post_stop_plugged || status.hlc_charge_complete;
+    const bool hlc_precharge_phase =
+        status.hlc_precharge_active ||
+        (status.hlc_stage > 0 && status.hlc_stage < HLC_MIN_POWER_STAGE && !status.hlc_power_ready);
     bool paused = false;
     bool constrained = false;
     {
@@ -4970,10 +5350,44 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         } else if (!vehicle_present || status.hlc_charge_complete) {
             next = ConnectorState::Finishing;
         } else if (paused || constrained) {
-            next = ConnectorState::SuspendedEVSE;
+            // Avoid false SuspendedEVSE when energy is still flowing (e.g., load-sharing throttling).
+            if (status.relay_closed) {
+                next = ConnectorState::Charging;
+            } else if (hlc_precharge_phase) {
+                next = ConnectorState::Preparing;
+            } else {
+                constexpr double kMinEvRequestCurrentA = 0.5;
+                bool ev_requesting = false;
+                const bool hlc_req =
+                    status.hlc_power_ready ||
+                    (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+                if (cp_known) {
+                    ev_requesting = (status.cp_state == 'C' || status.cp_state == 'D');
+                } else {
+                    ev_requesting = hlc_req ||
+                        (hlc_req && status.target_current_a &&
+                         status.target_current_a.value() > kMinEvRequestCurrentA);
+                }
+                next = ev_requesting ? ConnectorState::SuspendedEVSE : ConnectorState::SuspendedEV;
+            }
         } else if (!status.relay_closed) {
-            const bool ev_requesting = cp_known ? (status.cp_state == 'C' || status.cp_state == 'D') : authorized;
-            next = ev_requesting ? ConnectorState::SuspendedEVSE : ConnectorState::SuspendedEV;
+            constexpr double kMinEvRequestCurrentA = 0.5;
+            bool ev_requesting = false;
+            const bool hlc_req =
+                status.hlc_power_ready ||
+                (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+            if (cp_known) {
+                ev_requesting = (status.cp_state == 'C' || status.cp_state == 'D');
+            } else {
+                ev_requesting = hlc_req ||
+                    (hlc_req && status.target_current_a &&
+                     status.target_current_a.value() > kMinEvRequestCurrentA);
+            }
+            if (hlc_precharge_phase) {
+                next = ConnectorState::Preparing;
+            } else {
+                next = ev_requesting ? ConnectorState::SuspendedEVSE : ConnectorState::SuspendedEV;
+            }
         } else {
             next = ConnectorState::Charging;
         }
@@ -5005,6 +5419,12 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
                << " meter_stale=" << (status.meter_stale ? "1" : "0")
                << " plc_seq=" << (status.plc_state_seq_valid ? std::to_string(status.plc_state_seq) : "n/a")
                << " plc_missed=" << status.plc_state_seq_missed;
+
+    if (!charge_point_) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        connector_state_[connector] = next;
+        return;
+    }
 
     switch (next) {
     case ConnectorState::Faulted:

@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iomanip>
+#include <map>
 #include <sstream>
 
 namespace charger {
@@ -1757,6 +1758,22 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     // `cmd.module_mask` drives the two auxiliary relay outputs as KM_A/KM_B
     // (module bus sectionalizers owned by this PLC).
     uint8_t relay_mask = static_cast<uint8_t>(cmd.module_mask & 0x03u);
+    if (relay_mask == 0u && cmd.module_count > 0 && cmd.mc_closed && cfg_.plc_module_relays_enabled) {
+        const int capped = std::max(0, std::min(cmd.module_count, 2));
+        const uint8_t fallback_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
+        if (fallback_mask != 0u) {
+            static std::map<int, std::chrono::steady_clock::time_point> last_log;
+            auto& last_ts = last_log[cmd.connector];
+            const auto now = std::chrono::steady_clock::now();
+            if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
+                EVLOG_warning << "PLC fallback module mask on connector " << cmd.connector
+                              << " mask=0x" << std::hex << static_cast<int>(fallback_mask) << std::dec
+                              << " module_count=" << cmd.module_count;
+                last_ts = now;
+            }
+        }
+        relay_mask = fallback_mask;
+    }
     const bool gun_on = cmd.gc_closed;
     const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && relay_mask != 0);
     st.output_enabled = gun_on;
