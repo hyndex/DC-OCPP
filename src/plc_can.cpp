@@ -51,6 +51,7 @@ constexpr uint8_t kRelayModule1Mask = 0x04u;
 constexpr std::chrono::milliseconds kBackpressureHoldMs(1500);
 constexpr int kBackpressureMaxLevel = 3;
 constexpr int kBackpressureLogIntervalMs = 1000;
+constexpr auto kProtocolRefreshInterval = std::chrono::seconds(30);
 constexpr int kPresentMaxIntervalMs = 500;
 constexpr int kLimitsMaxIntervalMs = 1500;
 
@@ -458,11 +459,16 @@ void PlcCanHardware::tx_loop() {
                 if (!severe_backpressure) {
                     update_slow_v2_tx(st, now, eff_backoff);
                 }
-                const auto proto_elapsed =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_protocol_tx).count();
-                const bool proto_due = (st.last_protocol_tx.time_since_epoch().count() == 0) || (proto_elapsed >= 1000);
                 const bool proto_needed = (!st.protocol_verified || !st.protocol_ok);
-                if ((!severe_backpressure || proto_needed) && proto_due) {
+                const bool have_ack = st.last_protocol_ack.time_since_epoch().count() != 0;
+                const bool proto_refresh =
+                    have_ack && (now - st.last_protocol_ack) >= kProtocolRefreshInterval;
+                const auto proto_interval = proto_needed ? std::chrono::milliseconds(1000)
+                                                        : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                              kProtocolRefreshInterval);
+                const bool proto_due = (st.last_protocol_tx.time_since_epoch().count() == 0) ||
+                                       ((now - st.last_protocol_tx) >= proto_interval);
+                if ((proto_needed || proto_refresh) && proto_due && (!severe_backpressure || proto_needed)) {
                     const auto payload =
                         can_contract::build_config_cmd(can_contract::PARAM_PROTO_VERSION, 1, 0, use_crc_);
                     (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload,

@@ -1,7 +1,7 @@
 {
   "controller": {
     "defaultTag": "1234567890",
-    "freeMode": true
+    "freeMode": false
   },
   "chargePoint": {
     "centralSystemURI": "ws://ocpp.joulepoint.com:80",
@@ -14,16 +14,6 @@
   "connectors": [
     {
       "id": 1,
-      "plcId": 0,
-      "maxCurrentA": 200,
-      "maxPowerW": 30000,
-      "maxVoltageV": 1000,
-      "minVoltageV": 200,
-      "meterSource": "module",
-      "requireLock": false
-    },
-    {
-      "id": 2,
       "plcId": 1,
       "maxCurrentA": 200,
       "maxPowerW": 30000,
@@ -57,7 +47,8 @@
     "gunRelayOwnedByPlc": false,
     "moduleRelaysEnabled": true,
     "relayFeedbackAvailable": false,
-    "relayMode": "ties"
+    "relayMode": "ties",
+    "autochargeIdSource": "evmac"
   },
   "security": {
     "clientCertDir": "../data/certs/client/csms",
@@ -84,27 +75,6 @@
           "group": 0,
           "id": "M1_0",
           "mn": "MN_1_0",
-          "ratedPowerKW": 30,
-          "type": "maxwell-mxr",
-          "pollMs": 1000,
-          "cmdIntervalMs": 1000,
-          "telemetryStaleMs": 3000
-        }
-      ]
-    },
-    {
-      "id": 2,
-      "gunId": 2,
-      "gc": "GC_2",
-      "mc": "MC_2",
-      "cw": 1,
-      "ccw": 1,
-      "modules": [
-        {
-          "address": 3,
-          "group": 0,
-          "id": "M2_0",
-          "mn": "MN_2_0",
           "ratedPowerKW": 30,
           "type": "maxwell-mxr",
           "pollMs": 1000,

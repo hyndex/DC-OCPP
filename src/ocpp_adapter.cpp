@@ -413,7 +413,6 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
     HlcControlOutcome out{};
     out.force_auth_denied = force_auth_denied;
     const bool autocharge_allowed = autocharge_enabled_.load();
-    const bool pseudo_pnc = (cfg_.autocharge_id_source == "evmac");
 
     bool pending_changed = false;
     {
@@ -472,11 +471,14 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
 
         // Advertise digital communication (SLAC/ISO15118/DIN) as soon as the EV is plugged in so the PLC can
         // reach the authorization stage and, for AutoCharge, publish the EV identity (e.g., MAC) early.
-        out.desired_digital = status.plugged_in && !post_stop_plugged;
+        const bool cp_known = status.cp_state != 'U';
+        const bool plugged_hint = status.plugged_in || (cp_known && status.cp_state != 'A');
+        out.desired_digital = plugged_hint && !post_stop_plugged;
         if (flow.pnc_blocked && !session_authorized) {
             out.desired_digital = false;
         }
-        out.desired_pnc_blocked = (!autocharge_allowed) || pseudo_pnc || flow.pnc_blocked;
+        // Keep PnC available unless explicitly blocked; MAC-based AutoCharge should not force-disable HLC.
+        out.desired_pnc_blocked = (!autocharge_allowed) || flow.pnc_blocked;
 
         if (out.desired_digital != flow.digital_enabled) {
             flow.digital_enabled = out.desired_digital;
