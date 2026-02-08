@@ -139,6 +139,10 @@ private:
         can_contract::MeterReading last_meter{};
         uint32_t evse_limit_ack_count{0};
         std::chrono::steady_clock::time_point last_evse_limit_ack{};
+        uint32_t last_plc_state_seq{0};
+        bool plc_state_seq_valid{false};
+        uint64_t plc_state_seq_missed{0};
+        std::chrono::steady_clock::time_point last_plc_state_seq_warn{};
         std::chrono::steady_clock::time_point last_energy_update{};
         std::chrono::steady_clock::time_point last_status_rx{};
         std::chrono::steady_clock::time_point last_relay_rx{};

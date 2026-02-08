@@ -519,6 +519,41 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
             }
             return;
         }
+        const uint32_t seq_mask = 0xFFFFFFu;
+        const uint32_t seq_half = 0x800000u;
+        const uint32_t seq = info.state_seq & seq_mask;
+        if (!st->plc_state_seq_valid) {
+            st->plc_state_seq_valid = true;
+            st->last_plc_state_seq = seq;
+        } else {
+            const uint32_t last = st->last_plc_state_seq & seq_mask;
+            const uint32_t delta = (seq - last) & seq_mask;
+            if (delta != 0) {
+                if (delta > seq_half) {
+                    if (st->last_plc_state_seq_warn.time_since_epoch().count() == 0 ||
+                        (now - st->last_plc_state_seq_warn) > std::chrono::seconds(2)) {
+                        EVLOG_warning << "PLC state seq reset/backwards on plc=" << static_cast<int>(plc_id)
+                                      << " connector=" << st->connector_id << " last=" << last
+                                      << " now=" << seq;
+                        st->last_plc_state_seq_warn = now;
+                    }
+                    st->last_plc_state_seq = seq;
+                } else {
+                    if (delta > 1) {
+                        st->plc_state_seq_missed += static_cast<uint64_t>(delta - 1);
+                        if (st->last_plc_state_seq_warn.time_since_epoch().count() == 0 ||
+                            (now - st->last_plc_state_seq_warn) > std::chrono::seconds(2)) {
+                            EVLOG_warning << "PLC state seq jump on plc=" << static_cast<int>(plc_id)
+                                          << " connector=" << st->connector_id << " last=" << last
+                                          << " now=" << seq << " missed=" << (delta - 1)
+                                          << " total_missed=" << st->plc_state_seq_missed;
+                            st->last_plc_state_seq_warn = now;
+                        }
+                    }
+                    st->last_plc_state_seq = seq;
+                }
+            }
+        }
         st->cp_state_raw = info.cp_state;
         st->cp_duty_raw = info.duty_pct;
         st->cp_state_session = info.cp_state;
@@ -1665,6 +1700,9 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.earth_fault = false;
         gs.cp_fault = false;
     }
+    gs.plc_state_seq = st.last_plc_state_seq;
+    gs.plc_state_seq_valid = st.plc_state_seq_valid;
+    gs.plc_state_seq_missed = st.plc_state_seq_missed;
     gs.backpressure_level = static_cast<uint8_t>(backpressure_level_.load(std::memory_order_relaxed));
     gs.degraded_mode = gs.comm_fault || gs.backpressure_level > 0;
     gs.tx_error_count = st.tx_failures;

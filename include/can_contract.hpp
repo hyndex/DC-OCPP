@@ -196,6 +196,7 @@ struct PlcStateV2 {
     bool charge_complete{false};
     bool precharge_active{false};
     bool cable_checked{false};
+    uint32_t state_seq{0};
     bool crc_ok{true};
 };
 
@@ -342,6 +343,8 @@ inline PlcStateV2 decode_plc_state_v2(const uint8_t in[8], bool use_crc8) {
     st.charge_complete = (flags & 0x08u) != 0;
     st.precharge_active = (flags & 0x10u) != 0;
     st.cable_checked = (flags & 0x20u) != 0;
+    st.state_seq = static_cast<uint32_t>(in[4]) | (static_cast<uint32_t>(in[5]) << 8) |
+                   (static_cast<uint32_t>(in[6]) << 16);
     return st;
 }
 

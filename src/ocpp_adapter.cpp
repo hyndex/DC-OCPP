@@ -42,6 +42,31 @@ constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::seconds RFID_TAP_LATCH_WINDOW(3);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(8000);
 constexpr std::chrono::milliseconds CP_FAULT_GRACE_MS(3000);
+constexpr std::chrono::seconds STATUS_REFRESH_INTERVAL(60);
+constexpr std::chrono::milliseconds STATUS_REFRESH_MIN_GAP(2000);
+
+const char* connector_state_name(ConnectorState state) {
+    switch (state) {
+    case ConnectorState::Available:
+        return "Available";
+    case ConnectorState::Preparing:
+        return "Preparing";
+    case ConnectorState::Charging:
+        return "Charging";
+    case ConnectorState::SuspendedEV:
+        return "SuspendedEV";
+    case ConnectorState::SuspendedEVSE:
+        return "SuspendedEVSE";
+    case ConnectorState::Finishing:
+        return "Finishing";
+    case ConnectorState::Unavailable:
+        return "Unavailable";
+    case ConnectorState::Faulted:
+        return "Faulted";
+    default:
+        return "Unknown";
+    }
+}
 
 GunStatus sanitize_status_for_lab(const GunStatus& in) {
     GunStatus st = in;
@@ -811,6 +836,7 @@ bool OcppAdapter::start() {
                     refresh_charging_profile_limits();
                 }
                 apply_power_plan();
+                maybe_refresh_status_notifications(now);
             } catch (const std::exception& e) {
                 EVLOG_warning << "Planner thread error: " << e.what();
             }
@@ -1221,16 +1247,24 @@ void OcppAdapter::register_callbacks() {
         [](const std::string& system_time) { EVLOG_info << "CSMS provided system time: " << system_time; });
 
     charge_point_->register_boot_notification_response_callback(
-        [](const ocpp::v16::BootNotificationResponse& resp) {
+        [this](const ocpp::v16::BootNotificationResponse& resp) {
             std::stringstream ss;
             ss << resp.currentTime;
             EVLOG_info << "BootNotification response status=" << resp.status << " interval=" << resp.interval
                        << " currentTime=" << ss.str();
+            const bool accepted = resp.status == ocpp::v16::RegistrationStatus::Accepted;
+            boot_accepted_.store(accepted);
+            if (accepted) {
+                request_status_refresh("boot_accepted");
+            }
         });
 
     charge_point_->register_connection_state_changed_callback([this](bool is_connected) {
         csms_connected_.store(is_connected);
         EVLOG_info << "CSMS websocket state changed: " << (is_connected ? "connected" : "disconnected");
+        if (is_connected) {
+            request_status_refresh("csms_connected");
+        }
     });
 
     charge_point_->register_signal_set_charging_profiles_callback([this]() { refresh_charging_profile_limits(); });
@@ -4852,6 +4886,39 @@ void OcppAdapter::refresh_charging_profile_limits() {
     }
 }
 
+void OcppAdapter::request_status_refresh(const std::string& reason) {
+    std::lock_guard<std::mutex> lock(status_refresh_mutex_);
+    pending_status_refresh_.store(true);
+    pending_status_refresh_reason_ = reason;
+}
+
+void OcppAdapter::maybe_refresh_status_notifications(const std::chrono::steady_clock::time_point& now) {
+    if (!charge_point_ || !csms_connected_.load() || !boot_accepted_.load()) {
+        return;
+    }
+    std::string reason;
+    bool do_refresh = false;
+    {
+        std::lock_guard<std::mutex> lock(status_refresh_mutex_);
+        const bool pending = pending_status_refresh_.load();
+        const bool have_last = last_status_refresh_.time_since_epoch().count() != 0;
+        const bool interval_due = !have_last || (now - last_status_refresh_) >= STATUS_REFRESH_INTERVAL;
+        const bool min_gap_ok = !have_last || (now - last_status_refresh_) >= STATUS_REFRESH_MIN_GAP;
+        if ((pending && min_gap_ok) || (!pending && interval_due)) {
+            do_refresh = true;
+            reason = pending ? pending_status_refresh_reason_ : "periodic";
+            pending_status_refresh_.store(false);
+            pending_status_refresh_reason_.clear();
+            last_status_refresh_ = now;
+        }
+    }
+    if (!do_refresh) {
+        return;
+    }
+    EVLOG_info << "Triggering StatusNotification refresh (reason=" << (reason.empty() ? "unknown" : reason) << ")";
+    charge_point_->trigger_status_notifications();
+}
+
 void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus status, bool has_session,
                                          bool tx_started, bool authorized, bool fault_active, bool disabled,
                                          bool post_stop_plugged, bool seamless_retry_active,
@@ -4899,13 +4966,27 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
     }
 
     ConnectorState current;
+    uint64_t event_seq = 0;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         current = connector_state_[connector];
+        if (next == current) {
+            return;
+        }
+        event_seq = ++status_event_seq_[connector];
     }
-    if (next == current) {
-        return;
-    }
+    EVLOG_info << "Connector " << connector << " state " << connector_state_name(current) << " -> "
+               << connector_state_name(next) << " seq=" << event_seq
+               << " cp=" << status.cp_state
+               << " plugged=" << (status.plugged_in ? "1" : "0")
+               << " relay=" << (status.relay_closed ? "1" : "0")
+               << " auth=" << (status.authorization_granted ? "1" : "0")
+               << " hlc_stage=" << static_cast<int>(status.hlc_stage)
+               << " hlc_ready=" << (status.hlc_power_ready ? "1" : "0")
+               << " fault=" << (fault_active ? "1" : "0")
+               << " meter_stale=" << (status.meter_stale ? "1" : "0")
+               << " plc_seq=" << (status.plc_state_seq_valid ? std::to_string(status.plc_state_seq) : "n/a")
+               << " plc_missed=" << status.plc_state_seq_missed;
 
     switch (next) {
     case ConnectorState::Faulted:

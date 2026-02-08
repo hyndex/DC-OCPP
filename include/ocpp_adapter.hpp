@@ -236,6 +236,13 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> auth_denied_since_;
     std::map<int, std::string> last_denied_token_;
     std::atomic<bool> autocharge_enabled_{true};
+    std::atomic<bool> boot_accepted_{false};
+    std::atomic<bool> pending_status_refresh_{false};
+    std::chrono::steady_clock::time_point last_status_refresh_{};
+    std::chrono::steady_clock::time_point last_status_refresh_log_{};
+    std::string pending_status_refresh_reason_{};
+    std::mutex status_refresh_mutex_;
+    std::map<int, uint64_t> status_event_seq_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};
     std::map<int, int> telemetry_mismatch_count_;
@@ -257,6 +264,8 @@ private:
     void initialize_slots();
     void apply_power_plan();
     void refresh_charging_profile_limits();
+    void request_status_refresh(const std::string& reason);
+    void maybe_refresh_status_notifications(const std::chrono::steady_clock::time_point& now);
     void enter_global_fault(const std::string& reason, ocpp::v16::Reason stop_reason);
     void apply_zero_power_plan();
     bool safety_trip_needed(const GunStatus& status) const;
