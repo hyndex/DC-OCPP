@@ -4485,14 +4485,15 @@ void OcppAdapter::apply_power_plan() {
         const bool gc_close_requested = gc_closed_cmd;
         const bool hlc_power_phase =
             status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
-        const bool hlc_known = status.hlc_stage > 0 || status.hlc_precharge_active || status.hlc_power_ready;
+        const bool hlc_precharge_phase = status.hlc_precharge_active;
+        const bool hlc_known = status.hlc_stage > 0 || hlc_precharge_phase || status.hlc_power_ready;
         const bool ev_requesting = status.cp_state == 'C' || status.cp_state == 'D';
         const bool ev_current_req = status.target_current_a && status.target_current_a.value() > 0.5;
         const bool ev_power_phase_req = hlc_power_phase && ev_requesting &&
                                         (ev_current_req || status.hlc_power_ready);
         bool gc_close_blocked = false;
         if (gc_closed_cmd && is_home && !status.relay_closed) {
-            if (hlc_known && !hlc_power_phase) {
+            if (hlc_known && !(hlc_power_phase || hlc_precharge_phase)) {
                 static std::map<std::string, std::chrono::steady_clock::time_point> last_hlc_log;
                 auto& last_log = last_hlc_log[slot->gc_id];
                 const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
