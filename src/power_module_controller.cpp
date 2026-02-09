@@ -514,12 +514,28 @@ private:
         const uint8_t dst_addr = static_cast<uint8_t>((id >> 11) & 0xFF);
         const uint8_t src_addr = static_cast<uint8_t>((id >> 3) & 0xFF);
         const uint8_t group = static_cast<uint8_t>(id & 0x07u);
-        const bool group_match = (spec_.group <= 7) ? (group == (spec_.group & 0x07))
-                                                    : (group == 0);
+        uint8_t expected_group = 0;
+        if (resolved_group_.has_value()) {
+            expected_group = static_cast<uint8_t>(*resolved_group_ & 0x07u);
+        } else if (spec_.group <= 7) {
+            expected_group = static_cast<uint8_t>(spec_.group & 0x07u);
+        } else {
+            expected_group = 0;
+        }
+        bool group_match = (spec_.group <= 7) ? (group == expected_group) : (group == 0);
         const uint8_t match_addr = resolved_addr_.has_value() ? *resolved_addr_ : static_cast<uint8_t>(spec_.address & 0xFF);
         const bool src_match = src_addr == match_addr;
         const bool broadcast_accept = spec_.broadcast &&
                                       (spec_.address == 0xFE || spec_.address == 0xFF);
+        if (!group_match && !resolved_group_.has_value() && spec_.group <= 7 && src_match) {
+            resolved_group_ = group;
+            expected_group = static_cast<uint8_t>(*resolved_group_ & 0x07u);
+            group_match = true;
+            EVLOG_warning << "MXR module " << spec_.id
+                          << " group mismatch (cfg=" << static_cast<int>(spec_.group & 0x07u)
+                          << " rx=" << static_cast<int>(group)
+                          << "); auto-adopting group " << static_cast<int>(expected_group);
+        }
         if (prot != MAXWELL_PROT_NO || dst_addr != MAXWELL_CONTROLLER_ADDR || !group_match ||
             (!src_match && !broadcast_accept)) {
             return;
