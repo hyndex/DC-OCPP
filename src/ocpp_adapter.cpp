@@ -1419,6 +1419,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const auto power_request_timeout = std::chrono::seconds(power_request_timeout_enabled
                                                                          ? std::max(1, cfg_.power_request_timeout_s)
                                                                          : 0);
+            auto disable_local = [&](const char* reason) {
+                mark_local_hw_disable(connector, reason ? reason : "");
+                hardware_->disable(connector);
+            };
             auto hw_tokens = hardware_->poll_auth_tokens();
             if (!hw_tokens.empty()) {
                 std::set<std::int32_t> rfid_active_connectors;
@@ -1600,12 +1604,12 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         count = 0;
                     }
                 }
-                if (telemetry_mismatch_trip) {
-                    EVLOG_error << "Telemetry mismatch on connector " << connector
-                                << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
-                                << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")";
+                    if (telemetry_mismatch_trip) {
+                        EVLOG_error << "Telemetry mismatch on connector " << connector
+                                    << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
+                                    << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")";
                     finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("telemetry_mismatch");
                     had_session = false;
                     fault = true;
                 }
@@ -1867,7 +1871,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     }
                 }
                 if (cp_fault_grace) {
-                    hardware_->disable(connector);
+                    disable_local("cp_fault_grace");
                 }
             } else {
                 std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1882,10 +1886,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (had_session) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("cp_fault");
                     had_session = false;
                 } else if (!already_faulted) {
-                    hardware_->disable(connector);
+                    disable_local("cp_fault");
                 }
                 fault = true;
             }
@@ -1910,7 +1914,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(stop_reason, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("safety_or_comm_fault");
                     had_session = false;
                 }
                 fault = true;
@@ -1924,7 +1928,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("isolation_fault");
                     had_session = false;
                 }
                 fault = true;
@@ -1938,7 +1942,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("overtemp_fault");
                     had_session = false;
                 }
                 fault = true;
@@ -1952,7 +1956,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("overcurrent_fault");
                     had_session = false;
                 }
                 fault = true;
@@ -1966,7 +1970,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("gc_welded");
                     had_session = false;
                 }
                 fault = true;
@@ -1980,7 +1984,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("mc_welded");
                     had_session = false;
                 }
                 fault = true;
@@ -2078,7 +2082,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     EVLOG_error << "No healthy power modules available on connector " << connector
                                 << " during precharge/power delivery; stopping session";
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("modules_unavailable");
                     had_session = false;
                 }
                 fault = true;
@@ -2093,7 +2097,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!already_faulted) {
                     finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("lock_fault");
                     had_session = false;
                 }
                 fault = true;
@@ -2269,7 +2273,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         limit_ack_stale_events_[connector]++;
                     }
                     finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("evse_limit_ack_stale");
                     had_session = false;
                     fault = true;
                 }
@@ -2293,7 +2297,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
                         had_session = false;
                     }
-                    hardware_->disable(connector);
+                    disable_local("telemetry_stale");
                 } else {
                     if (telemetry_stale_log_ts.time_since_epoch().count() == 0 ||
                         (now - telemetry_stale_log_ts) > std::chrono::seconds(10)) {
@@ -2306,7 +2310,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     if (telemetry_stale_disable_ts.time_since_epoch().count() == 0 ||
                         (now - telemetry_stale_disable_ts) > std::chrono::seconds(1)) {
                         telemetry_stale_disable_ts = now;
-                        hardware_->disable(connector);
+                        disable_local("telemetry_stale");
                     }
                 }
             } else if (telemetry_stale_active) {
@@ -2319,7 +2323,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (!fault && had_session && session.transaction_started && status.hlc_charge_complete) {
                 EVLOG_info << "Charge complete reported on connector " << connector << ", ending session";
                 finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
+                disable_local("charge_complete");
                 had_session = false;
                 session = ActiveSession{};
             }
@@ -2332,10 +2336,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (last_plug.time_since_epoch().count() != 0 &&
                     (now - last_plug) < SEAMLESS_RETRY_GRACE_MS) {
                     seamless_retry_active = true;
-                    hardware_->disable(connector);
+                    disable_local("seamless_retry");
                 } else {
                     finish_and_mark(ocpp::v16::Reason::EVDisconnected, std::nullopt);
-                    hardware_->disable(connector);
+                    disable_local("ev_disconnected");
                     had_session = false;
                 }
             } else if (had_session && !session.authorized && session.connected_at.time_since_epoch().count() &&
@@ -2344,7 +2348,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                               << " timed out waiting for authorization, stopping session";
                 set_auth_state(connector, AuthorizationState::Denied);
                 finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
+                disable_local("auth_timeout");
                 had_session = false;
             } else if (had_session && session.authorized && !power_ready && session.authorized_at &&
                        power_request_timeout_enabled && !constrained && !paused &&
@@ -2352,7 +2356,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 EVLOG_warning << "Session on connector " << connector
                               << " timed out waiting for EV power request after authorization";
                 finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
-                hardware_->disable(connector);
+                disable_local("power_request_timeout");
                 had_session = false;
             } else if (had_session && session.authorized && session.ev_connected && !session.transaction_started) {
                 // Start OCPP transaction as soon as authorization is granted while the EV is connected.
@@ -2378,6 +2382,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (!had_session) {
                 session = ActiveSession{};
             }
+            maybe_reenable_local_hw(connector, fault, disabled, paused);
             update_connector_state(connector, status, had_session, session.transaction_started, session.authorized,
                                    fault, disabled, post_stop_plugged, seamless_retry_active, suppress_available_event);
         } catch (const std::exception& e) {
@@ -3748,7 +3753,9 @@ void OcppAdapter::apply_power_plan() {
         g.i_meas_a = measured_i;
 
         const bool blocked = !g.safety_ok || module_unavailable_fault || st.gc_welded || st.mc_welded;
-        g.ev_session_active = session_ready;
+        // Allow module allocation during ISO15118 precharge even if OCPP authorization is still pending.
+        // This prevents deadlock where the EV requests precharge but modules never engage.
+        g.ev_session_active = session_ready || (session_present && precharge_hint);
         const bool ready_for_power = (power_ready || precharge_hint) && !blocked;
 
         if (blocked) {
@@ -4910,6 +4917,7 @@ void OcppAdapter::apply_power_plan() {
 
         if (local_fault && is_home && g.ev_session_active) {
             finish_transaction(c.id, ocpp::v16::Reason::PowerLoss, std::nullopt);
+            mark_local_hw_disable(c.id, !info.fault_reason.empty() ? info.fault_reason : "LocalFault");
             hardware_->disable(c.id);
             const std::string reason = !info.fault_reason.empty() ? info.fault_reason : "LocalFault";
             if (!prev_local_fault.empty() && prev_local_fault != reason) {
@@ -5031,6 +5039,43 @@ void OcppAdapter::apply_power_plan() {
 
 bool OcppAdapter::safety_trip_needed(const GunStatus& status) const {
     return !status.safety_ok || status.estop || status.earth_fault;
+}
+
+void OcppAdapter::mark_local_hw_disable(std::int32_t connector, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    local_hw_disable_[connector] = true;
+    if (!reason.empty()) {
+        local_hw_disable_reason_[connector] = reason;
+    }
+}
+
+void OcppAdapter::maybe_reenable_local_hw(std::int32_t connector, bool fault, bool disabled, bool paused) {
+    if (global_fault_latched_.load()) {
+        return;
+    }
+    bool should_enable = false;
+    std::string reason;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const auto it = local_hw_disable_.find(connector);
+        if (it != local_hw_disable_.end() && it->second && !fault && !disabled && !paused) {
+            should_enable = true;
+            it->second = false;
+            const auto rit = local_hw_disable_reason_.find(connector);
+            if (rit != local_hw_disable_reason_.end()) {
+                reason = rit->second;
+                local_hw_disable_reason_.erase(rit);
+            }
+        }
+    }
+    if (should_enable && hardware_) {
+        if (!reason.empty()) {
+            EVLOG_info << "Re-enabling EVSE hardware on connector " << connector << " after " << reason;
+        } else {
+            EVLOG_info << "Re-enabling EVSE hardware on connector " << connector;
+        }
+        hardware_->enable(connector);
+    }
 }
 
 void OcppAdapter::enter_global_fault(const std::string& reason, ocpp::v16::Reason stop_reason) {

@@ -231,6 +231,8 @@ private:
     std::atomic<bool> auth_thread_running_{false};
     std::atomic<bool> csms_connected_{false};
     std::map<int, bool> evse_disabled_;
+    std::map<int, bool> local_hw_disable_;
+    std::map<int, std::string> local_hw_disable_reason_;
     std::map<int, bool> reserved_connectors_;
     std::map<int, int> reservation_lookup_;
     std::map<int, int> reservation_id_by_connector_;
@@ -332,6 +334,8 @@ private:
     void request_status_refresh(const std::string& reason);
     void maybe_refresh_status_notifications(const std::chrono::steady_clock::time_point& now);
     void enter_global_fault(const std::string& reason, ocpp::v16::Reason stop_reason);
+    void mark_local_hw_disable(std::int32_t connector, const std::string& reason);
+    void maybe_reenable_local_hw(std::int32_t connector, bool fault, bool disabled, bool paused);
     void apply_zero_power_plan();
     bool safety_trip_needed(const GunStatus& status) const;
     void record_presence_state(std::int32_t connector, bool plugged_in,
