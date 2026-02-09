@@ -4472,9 +4472,22 @@ void OcppAdapter::apply_power_plan() {
         const int current_island =
             telemetry_slot_to_island.count(slot->id) ? telemetry_slot_to_island.at(slot->id) : 0;
         if (current_island > 0 && switching_islands.count(current_island)) {
-            isolation_ready = false;
-            if (is_home) {
-                power_constrained_[c.id] = true;
+            bool block_isolation = true;
+            if (is_home && gun_for_slot > 0) {
+                const bool island_conflict =
+                    gun_blocked_by_island_conflict.count(gun_for_slot) &&
+                    gun_blocked_by_island_conflict.at(gun_for_slot);
+                // If only one gun is active in the island and this slot's MC is already closed,
+                // allow GC sequencing to proceed even if tie boundaries are still settling.
+                if (!island_conflict && mc_closed_cmd) {
+                    block_isolation = false;
+                }
+            }
+            if (block_isolation) {
+                isolation_ready = false;
+                if (is_home) {
+                    power_constrained_[c.id] = true;
+                }
             }
         }
 
@@ -4553,17 +4566,22 @@ void OcppAdapter::apply_power_plan() {
                 double close_v = info.meas_voltage;
                 const double close_i = meas_i;
                 bool close_v_from_module = false;
+                bool close_v_from_command = false;
                 if (!status.relay_closed && hlc_precharge_phase) {
                     if (info.module_telem_valid && info.module_voltage_v > 0.0) {
                         close_v = info.module_voltage_v;
                         close_v_from_module = true;
+                    } else if (dispatch.modules_assigned > 0 && info.modules_healthy &&
+                               dispatch.voltage_set_v > 0.0) {
+                        close_v = dispatch.voltage_set_v;
+                        close_v_from_command = true;
                     }
                 }
                 const bool have_target = v_target > 0.0;
                 const bool have_close_v = close_v > 0.0;
                 const double dv_fallback = (have_target && have_close_v) ? std::fabs(close_v - v_target) : 0.0;
                 const bool fallback_allowed =
-                    hlc_power_phase || (hlc_precharge_phase && close_v_from_module);
+                    hlc_power_phase || (hlc_precharge_phase && (close_v_from_module || close_v_from_command));
                 const bool fallback_ready =
                     !safe_close && fallback_allowed && have_target && have_close_v &&
                     dv_fallback <= gc_close_max_dv && std::fabs(close_i) < switch_i_thresh;
@@ -4616,7 +4634,8 @@ void OcppAdapter::apply_power_plan() {
                                    << " V_island=" << island_v
                                    << " I_island=" << island_i
                                    << " V_meas=" << close_v
-                                   << " V_meas_src=" << (close_v_from_module ? "module" : "present")
+                                   << " V_meas_src="
+                                   << (close_v_from_module ? "module" : (close_v_from_command ? "command" : "present"))
                                    << " V_target=" << v_target
                                    << " dv=" << dv
                                    << " dv_meas=" << dv_fallback
@@ -5026,18 +5045,18 @@ void OcppAdapter::apply_power_plan() {
                     warmup_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
                 }
                 if (warmup_mask == 0u) {
-                    const auto last_it = last_module_mask_cmd_.find(c.id);
+                    const auto last_it = last_module_mask_cmd_.find(owner_id);
                     if (last_it != last_module_mask_cmd_.end()) {
                         warmup_mask = last_it->second;
                     }
                 }
                 if (warmup_mask != 0u) {
                     static std::map<int, std::chrono::steady_clock::time_point> last_log;
-                    auto& last_ts = last_log[c.id];
+                    auto& last_ts = last_log[owner_id];
                     const bool allow_log = last_ts.time_since_epoch().count() == 0 ||
                                            (now - last_ts) > std::chrono::seconds(1);
                     if (allow_log) {
-                        EVLOG_warning << "Connector " << c.id
+                        EVLOG_warning << "Connector " << owner_id
                                       << " warmup mask missing; using fallback mask 0x"
                                       << std::hex << static_cast<int>(warmup_mask) << std::dec;
                         last_ts = now;

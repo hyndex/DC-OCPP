@@ -153,7 +153,33 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
     if (!find_slot(g.slot_id)) return slots;
     slots.push_back(g.slot_id);
     claimed_slots.insert(g.slot_id);
+
+    auto maybe_add_passthrough = [&](int candidate_id, bool prepend) {
+        if (candidate_id == 0 || claimed_slots.count(candidate_id) || active_home_slots.count(candidate_id)) {
+            return false;
+        }
+        const auto* cand = find_slot(candidate_id);
+        if (!cand) return false;
+        if (!cand->modules.empty() || cand->gun_id > 0) return false;
+        if (reserved_slots.count(candidate_id) && candidate_id != g.slot_id) return false;
+        if (prepend) {
+            slots.insert(slots.begin(), candidate_id);
+        } else {
+            slots.push_back(candidate_id);
+        }
+        claimed_slots.insert(candidate_id);
+        return true;
+    };
+
     if (!cfg_.allow_cross_slot_islands || n_needed <= count_healthy_modules_in_slot(g.slot_id)) {
+        // Keep single-module islands from opening the module's own MC contactor by
+        // including an adjacent pass-through slot (no modules, no gun) when present.
+        const auto* home = find_slot(g.slot_id);
+        if (home) {
+            if (!maybe_add_passthrough(home->cw_id, false)) {
+                (void)maybe_add_passthrough(home->ccw_id, true);
+            }
+        }
         return slots;
     }
 
