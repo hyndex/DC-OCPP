@@ -38,6 +38,8 @@ constexpr int kPlugInDebounceMs = 200;
 constexpr int kPlugOutDebounceMs = 1000;
 constexpr int kCpFaultOnDebounceMs = 500;
 constexpr int kCpFaultOffDebounceMs = 1000;
+constexpr uint8_t kHlcMinPowerStage = 9;
+constexpr int kHlcTransitionGraceMs = 1500;
 
 constexpr double kPresentVoltageEps = 1.0;
 constexpr double kPresentCurrentEps = 0.5;
@@ -1585,7 +1587,10 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.module_fault_mask = 0x00;
     gs.hlc_stage = hlc_fresh ? st.hlc_stage : 0;
     gs.hlc_cable_check_ok = true;
-    gs.hlc_precharge_active = chargeinfo_fresh ? st.hlc_precharge_active : false;
+    const bool precharge_from_stage =
+        chargeinfo_fresh && st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete;
+    gs.hlc_precharge_active =
+        chargeinfo_fresh ? (st.hlc_precharge_active || precharge_from_stage) : false;
     gs.hlc_charge_complete = chargeinfo_fresh ? st.hlc_charge_complete : false;
     const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 &&
                            !gs.hlc_precharge_active && !gs.hlc_charge_complete;
@@ -1755,6 +1760,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     auto it = connectors_.find(cmd.connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
+    const auto now = std::chrono::steady_clock::now();
     // `cmd.module_mask` drives the two auxiliary relay outputs as KM_A/KM_B
     // (module bus sectionalizers owned by this PLC).
     uint8_t relay_mask = static_cast<uint8_t>(cmd.module_mask & 0x03u);
@@ -1764,7 +1770,6 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
         if (fallback_mask != 0u) {
             static std::map<int, std::chrono::steady_clock::time_point> last_log;
             auto& last_ts = last_log[cmd.connector];
-            const auto now = std::chrono::steady_clock::now();
             if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
                 EVLOG_warning << "PLC fallback module mask on connector " << cmd.connector
                               << " mask=0x" << std::hex << static_cast<int>(fallback_mask) << std::dec
@@ -1774,7 +1779,77 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
         }
         relay_mask = fallback_mask;
     }
-    const bool gun_on = cmd.gc_closed;
+    bool gun_on = cmd.gc_closed;
+    bool force_off = false;
+    if (cfg_.use_plc) {
+        const bool hlc_fresh =
+            st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool hlc_precharge_phase =
+            hlc_fresh &&
+            (st.hlc_precharge_active ||
+             (st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete));
+        const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
+        const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
+        if (hlc_active) {
+            st.last_hlc_active = now;
+        }
+        if (st.hlc_charge_complete || !st.plugged_in) {
+            st.last_hlc_active = std::chrono::steady_clock::time_point{};
+        }
+        const bool hlc_recent =
+            st.last_hlc_active.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_hlc_active) <=
+                std::chrono::milliseconds(kHlcTransitionGraceMs);
+        const bool ev_targets_fresh =
+            st.last_ev_targets_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_ev_targets_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_ready = (st.cp_state_session == 'C' || st.cp_state_session == 'D');
+        const bool ev_requesting =
+            ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+        if (ev_requesting) {
+            st.last_hlc_active = now;
+        }
+        bool relays_closed = false;
+        if (cfg_.plc_relay_feedback) {
+            const bool relay_fresh =
+                st.last_relay_rx.time_since_epoch().count() != 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() <=
+                    telemetry_timeout_ms_;
+            if (relay_fresh) {
+                relays_closed = st.last_relay.relay[0] || st.last_relay.relay[1] || st.last_relay.relay[2];
+            }
+        } else {
+            relays_closed = st.relay_cmd_mask != 0u;
+        }
+        const bool hlc_allows_relays =
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && !st.hlc_charge_complete;
+        if (!hlc_allows_relays) {
+            if (gun_on || relay_mask != 0u) {
+                static std::map<int, std::chrono::steady_clock::time_point> last_log;
+                auto& last_ts = last_log[cmd.connector];
+                if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
+                    EVLOG_info << "Relay close blocked (HLC inactive)"
+                               << " connector=" << cmd.connector
+                               << " hlc_stage=" << static_cast<int>(st.hlc_stage)
+                               << " precharge=" << (st.hlc_precharge_active ? "1" : "0")
+                               << " charge_complete=" << (st.hlc_charge_complete ? "1" : "0")
+                               << " fresh=" << (hlc_fresh ? "1" : "0")
+                               << " ev_req=" << (ev_requesting ? "1" : "0")
+                               << " cp=" << st.cp_state_session
+                               << " targetI=" << st.ev_target_current_a
+                               << " targetV=" << st.ev_target_voltage_v
+                               << " relays_closed=" << (relays_closed ? "1" : "0");
+                    last_ts = now;
+                }
+            }
+            gun_on = false;
+            relay_mask = 0u;
+            force_off = true;
+        }
+    }
     const bool any_relays = gun_on || (cfg_.plc_module_relays_enabled && relay_mask != 0);
     st.output_enabled = gun_on;
     st.regulating = any_relays;
@@ -1792,7 +1867,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     if (!limits_equal(st.limits, limits)) {
         st.limits = limits;
     }
-    (void)set_relay_command(st, gun_on, relay_mask, false);
+    (void)set_relay_command(st, gun_on, relay_mask, force_off);
 }
 
 void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules) {
@@ -1800,9 +1875,80 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
+    const auto now = std::chrono::steady_clock::now();
     const int capped = std::max(0, std::min(modules, 2));
-    const uint8_t module_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
-    const bool want_power = capped > 0;
+    uint8_t module_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
+    bool want_power = capped > 0;
+    bool force_off = false;
+    if (cfg_.use_plc) {
+        const bool hlc_fresh =
+            st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool hlc_precharge_phase =
+            hlc_fresh &&
+            (st.hlc_precharge_active ||
+             (st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete));
+        const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
+        const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
+        if (hlc_active) {
+            st.last_hlc_active = now;
+        }
+        if (st.hlc_charge_complete || !st.plugged_in) {
+            st.last_hlc_active = std::chrono::steady_clock::time_point{};
+        }
+        const bool hlc_recent =
+            st.last_hlc_active.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_hlc_active) <=
+                std::chrono::milliseconds(kHlcTransitionGraceMs);
+        const bool ev_targets_fresh =
+            st.last_ev_targets_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_ev_targets_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_ready = (st.cp_state_session == 'C' || st.cp_state_session == 'D');
+        const bool ev_requesting =
+            ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+        if (ev_requesting) {
+            st.last_hlc_active = now;
+        }
+        bool relays_closed = false;
+        if (cfg_.plc_relay_feedback) {
+            const bool relay_fresh =
+                st.last_relay_rx.time_since_epoch().count() != 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_relay_rx).count() <=
+                    telemetry_timeout_ms_;
+            if (relay_fresh) {
+                relays_closed = st.last_relay.relay[0] || st.last_relay.relay[1] || st.last_relay.relay[2];
+            }
+        } else {
+            relays_closed = st.relay_cmd_mask != 0u;
+        }
+        const bool hlc_allows_relays =
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && !st.hlc_charge_complete;
+        if (!hlc_allows_relays) {
+            if (want_power) {
+                static std::map<int, std::chrono::steady_clock::time_point> last_log;
+                auto& last_ts = last_log[connector];
+                if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
+                    EVLOG_info << "Relay close blocked (HLC inactive)"
+                               << " connector=" << connector
+                               << " hlc_stage=" << static_cast<int>(st.hlc_stage)
+                               << " precharge=" << (st.hlc_precharge_active ? "1" : "0")
+                               << " charge_complete=" << (st.hlc_charge_complete ? "1" : "0")
+                               << " fresh=" << (hlc_fresh ? "1" : "0")
+                               << " ev_req=" << (ev_requesting ? "1" : "0")
+                               << " cp=" << st.cp_state_session
+                               << " targetI=" << st.ev_target_current_a
+                               << " targetV=" << st.ev_target_voltage_v
+                               << " relays_closed=" << (relays_closed ? "1" : "0");
+                    last_ts = now;
+                }
+            }
+            want_power = false;
+            module_mask = 0u;
+            force_off = true;
+        }
+    }
     st.output_enabled = want_power;
     st.regulating = want_power;
     if (!st.desired_sys_enable) {
@@ -1812,7 +1958,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
     if (want_power && st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    (void)set_relay_command(st, want_power, module_mask, false);
+    (void)set_relay_command(st, want_power, module_mask, force_off);
 }
 
 void PlcCanHardware::set_evse_limits(std::int32_t connector, const EvseLimits& limits) {

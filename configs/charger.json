@@ -15,7 +15,7 @@
     {
       "id": 1,
       "plcId": 1,
-      "maxCurrentA": 200,
+      "maxCurrentA": 80,
       "maxPowerW": 30000,
       "maxVoltageV": 1000,
       "minVoltageV": 200,
@@ -25,7 +25,7 @@
     {
       "id": 2,
       "plcId": 2,
-      "maxCurrentA": 200,
+      "maxCurrentA": 80,
       "maxPowerW": 30000,
       "maxVoltageV": 1000,
       "minVoltageV": 200,
@@ -43,7 +43,7 @@
   "ocppConfig": "ocpp/v16/config.json",
   "planner": {
     "allowCrossSlotIslands": true,
-    "maxModulesPerGun": 2,
+    "maxModulesPerGun": 1,
     "minModulesPerActiveGun": 1,
     "prechargeTimeoutMs": 15000,
     "prechargeVoltageToleranceV": 50,
@@ -51,7 +51,8 @@
     "switchMaxCurrentA": 2,
     "switchStableTimeMs": 200,
     "minMcHoldMs": 500,
-    "minGcHoldMs": 500
+    "minGcHoldMs": 500,
+    "rampStepA": 30
   },
   "plc": {
     "gunRelayOwnedByPlc": false,
@@ -86,6 +87,9 @@
           "id": "M1_0",
           "mn": "MN_1_0",
           "ratedPowerKW": 30,
+          "ratedCurrentA": 100,
+          "sendOutputCurrent": true,
+          "readbackLimits": true,
           "type": "maxwell-mxr",
           "pollMs": 1000,
           "cmdIntervalMs": 1000,
@@ -107,6 +111,9 @@
           "id": "M2_0",
           "mn": "MN_2_0",
           "ratedPowerKW": 30,
+          "ratedCurrentA": 100,
+          "sendOutputCurrent": true,
+          "readbackLimits": true,
           "type": "maxwell-mxr",
           "pollMs": 1000,
           "cmdIntervalMs": 1000,

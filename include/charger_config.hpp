@@ -113,6 +113,7 @@ struct ChargerConfig {
     int min_gc_hold_ms{500};
     double mc_open_current_a{1.0};
     double gc_open_current_a{1.0};
+    double ramp_step_a{10.0};
     double tie_close_max_delta_v{20.0};
     double switch_max_current_a{2.0};
     int switch_stable_time_ms{200};

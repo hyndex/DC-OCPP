@@ -358,10 +358,24 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
     const bool hlc_power_phase =
         status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
     if (!hlc_power_phase) {
-        return false;
+        const bool ev_current_req =
+            status.target_current_a && status.target_current_a.value() > 0.5;
+        const bool ev_voltage_req =
+            status.target_voltage_v && status.target_voltage_v.value() > 10.0;
+        return ev_current_req && ev_voltage_req;
     }
     // By this point the PLC has asserted HLC readiness (stage >= POWER_DELIVERY, cable check ok, precharge complete).
     return true;
+}
+
+bool is_hlc_precharge_phase(const GunStatus& status) {
+    if (status.hlc_precharge_active) {
+        return true;
+    }
+    if (status.hlc_charge_complete) {
+        return false;
+    }
+    return (status.hlc_stage > 0 && status.hlc_stage < HLC_MIN_POWER_STAGE);
 }
 
 int popcount(uint8_t mask) {
@@ -599,6 +613,7 @@ void OcppAdapter::initialize_slots() {
     pcfg.min_gc_hold_ms = std::max(0, cfg_.min_gc_hold_ms);
     pcfg.mc_open_current_a = cfg_.mc_open_current_a;
     pcfg.gc_open_current_a = cfg_.gc_open_current_a;
+    pcfg.ramp_step_a = cfg_.ramp_step_a;
     planner_cfg_ = pcfg;
     power_manager_ = PowerManager(planner_cfg_);
 
@@ -1900,7 +1915,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (status.estop) {
                     stop_reason = ocpp::v16::Reason::EmergencyStop;
                 } else if (status.comm_fault) {
-                    const bool power_path_active = status.relay_closed || status.hlc_precharge_active ||
+                    const bool power_path_active = status.relay_closed || is_hlc_precharge_phase(status) ||
                                                    status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE;
                     stop_reason = power_path_active ? ocpp::v16::Reason::PowerLoss : ocpp::v16::Reason::Other;
                 } else if (status.earth_fault) {
@@ -2033,15 +2048,14 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const uint8_t usable_modules =
                 static_cast<uint8_t>(module_healthy_mask & static_cast<uint8_t>(~module_fault_mask));
             // Only fault on missing modules when we actually need them (precharge/power delivery).
-            const bool have_ev_targets = status.target_voltage_v && status.target_voltage_v.value() > 0.0;
             const bool precharge_hint = status.plugged_in && !post_stop_plugged && !status.hlc_charge_complete &&
-                                        (status.hlc_precharge_active || have_ev_targets) &&
+                                        is_hlc_precharge_phase(status) &&
                                         !disabled && !paused && status.authorization_granted;
             const bool power_ready_hint = had_session && session.authorized &&
                 (status.relay_closed || power_delivery_requested(status, lock_required)) && !disabled;
             const bool module_commanded = modules_requested > 0;
             const bool module_capability_needed =
-                status.relay_closed || status.hlc_precharge_active || status.hlc_stage >= HLC_MIN_POWER_STAGE ||
+                status.relay_closed || is_hlc_precharge_phase(status) || status.hlc_stage >= HLC_MIN_POWER_STAGE ||
                 status.hlc_power_ready;
             const bool module_relevant = status.plugged_in || had_session;
             const bool need_modules = module_relevant && (power_ready_hint || precharge_hint) && module_commanded &&
@@ -2261,8 +2275,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 status.last_evse_limit_ack.time_since_epoch().count() != 0) {
                 const auto age = now - status.last_evse_limit_ack;
                 const auto ack_timeout = evse_limit_ack_timeout(cfg_);
-                const bool ack_relevant = status.relay_closed || status.hlc_power_ready || status.hlc_precharge_active ||
-                    status.hlc_stage >= HLC_MIN_POWER_STAGE;
+                const bool ack_relevant = status.relay_closed || status.hlc_power_ready ||
+                    is_hlc_precharge_phase(status) || status.hlc_stage >= HLC_MIN_POWER_STAGE;
                 if (ack_relevant && age > ack_timeout) {
                     EVLOG_error << "EVSE limit ACK stale on connector " << connector
                                 << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(age).count()
@@ -3478,11 +3492,10 @@ void OcppAdapter::apply_power_plan() {
         }
         const bool power_ready = session_ready &&
             (st.relay_closed || power_delivery_requested(st, lock_required));
-        const bool have_ev_targets = st.target_voltage_v && st.target_voltage_v.value() > 0.0;
         // Allow precharge/warmup decisions even before the OCPP transaction is authorized so ISO15118 can progress.
         // Energy delivery is still gated by `power_ready`/GC closure later in the state machine.
         const bool precharge_hint = st.plugged_in && !post_stop_plugged && !st.hlc_charge_complete &&
-                                    (st.hlc_precharge_active || have_ev_targets) &&
+                                    is_hlc_precharge_phase(st) &&
                                     !disabled_by_csms && !paused_by_csms;
         if (session_present) {
             g.reserved = false;
@@ -4333,8 +4346,8 @@ void OcppAdapter::apply_power_plan() {
         const auto g_it = gun_lookup.find(gid);
         const GunState gstate = (g_it != gun_lookup.end()) ? g_it->second : GunState{};
         const bool ev_requesting =
-            (gstate.ev_req_power_kw > 0.1) || info.status.hlc_power_ready || info.status.hlc_precharge_active ||
-            info.status.hlc_stage >= HLC_MIN_POWER_STAGE;
+            (gstate.ev_req_power_kw > 0.1) || info.status.hlc_power_ready ||
+            is_hlc_precharge_phase(info.status) || info.status.hlc_stage >= HLC_MIN_POWER_STAGE;
         if (info.modules_final == 0 && ev_requesting && !info.disabled_by_csms && !info.local_fault &&
             info.modules_healthy) {
             uint8_t mask = 0u;
@@ -4498,15 +4511,14 @@ void OcppAdapter::apply_power_plan() {
         const bool gc_close_requested = gc_closed_cmd;
         const bool hlc_power_phase =
             status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
-        const bool hlc_precharge_phase = status.hlc_precharge_active;
+        const bool hlc_precharge_phase = is_hlc_precharge_phase(status);
         const bool hlc_known = status.hlc_stage > 0 || hlc_precharge_phase || status.hlc_power_ready;
         const bool ev_requesting = status.cp_state == 'C' || status.cp_state == 'D';
         const bool ev_current_req = status.target_current_a && status.target_current_a.value() > 0.5;
-        const bool ev_power_phase_req = hlc_power_phase && ev_requesting &&
-                                        (ev_current_req || status.hlc_power_ready);
+        const bool ev_power_phase_req = ev_requesting && (hlc_power_phase || ev_current_req);
         bool gc_close_blocked = false;
         if (gc_closed_cmd && is_home && !status.relay_closed) {
-            if (hlc_known && !(hlc_power_phase || hlc_precharge_phase)) {
+            if (hlc_known && !(hlc_power_phase || hlc_precharge_phase) && !ev_current_req) {
                 static std::map<std::string, std::chrono::steady_clock::time_point> last_hlc_log;
                 auto& last_log = last_hlc_log[slot->gc_id];
                 const bool allow_log = (last_log.time_since_epoch().count() == 0) ||
@@ -4516,7 +4528,7 @@ void OcppAdapter::apply_power_plan() {
                                << " connector=" << c.id
                                << " gc=" << slot->gc_id
                                << " hlc_stage=" << static_cast<int>(status.hlc_stage)
-                               << " precharge=" << (status.hlc_precharge_active ? "1" : "0");
+                               << " precharge=" << (hlc_precharge_phase ? "1" : "0");
                     last_log = now;
                 }
                 gc_closed_cmd = false;
@@ -4567,7 +4579,7 @@ void OcppAdapter::apply_power_plan() {
                 const double close_i = meas_i;
                 bool close_v_from_module = false;
                 bool close_v_from_command = false;
-                if (!status.relay_closed && hlc_precharge_phase) {
+                if (!status.relay_closed && (hlc_precharge_phase || hlc_power_phase)) {
                     if (info.module_telem_valid && info.module_voltage_v > 0.0) {
                         close_v = info.module_voltage_v;
                         close_v_from_module = true;
@@ -4658,7 +4670,7 @@ void OcppAdapter::apply_power_plan() {
                     ts = now;
                 } else {
                     const auto timeout_ms =
-                        std::chrono::milliseconds(std::max(2000, cfg_.precharge_timeout_ms));
+                        std::chrono::milliseconds(std::max(2000, std::min(cfg_.precharge_timeout_ms, 5000)));
                     if ((now - ts) > timeout_ms) {
                         local_fault = true;
                         if (info.fault_reason.empty()) {
@@ -5012,6 +5024,26 @@ void OcppAdapter::apply_power_plan() {
                 post_stop_plugged = it != post_stop_plugged_.end() && it->second;
             }
 
+            const int warmup_owner_id = (info.selection.gun_id > 0) ? info.selection.gun_id : owner_id;
+            GunStatus warmup_status = info.status;
+            GunState warmup_state = info.gun_state;
+            if (warmup_owner_id != owner_id) {
+                const auto warm_snap_it = snapshots.find(warmup_owner_id);
+                if (warm_snap_it != snapshots.end()) {
+                    warmup_status = warm_snap_it->second.status;
+                }
+                const auto warm_state_it = gun_lookup.find(warmup_owner_id);
+                if (warm_state_it != gun_lookup.end()) {
+                    warmup_state = warm_state_it->second;
+                }
+            }
+            bool warmup_post_stop_plugged = post_stop_plugged;
+            if (warmup_owner_id != owner_id) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                const auto it = post_stop_plugged_.find(warmup_owner_id);
+                warmup_post_stop_plugged = it != post_stop_plugged_.end() && it->second;
+            }
+
             bool local_fault = info.local_fault;
             if (gun_id > 0 && island_fault.count(gun_id) && island_fault.at(gun_id)) {
                 local_fault = true;
@@ -5031,9 +5063,10 @@ void OcppAdapter::apply_power_plan() {
                 gun_id > 0 && gun_drive_modules.count(gun_id) ? gun_drive_modules.at(gun_id) : false;
             const bool drive_modules = slot_modules_allowed && drive_modules_for_gun;
 
-            const bool warmup_safe = info.status.plugged_in && !info.status.hlc_charge_complete && !post_stop_plugged &&
-                                     !info.disabled_by_csms && !info.status.cp_fault && info.gun_state.safety_ok &&
-                                     !info.status.gc_welded && !info.status.mc_welded;
+            const bool warmup_safe = warmup_status.plugged_in && !warmup_status.hlc_charge_complete &&
+                                     !warmup_post_stop_plugged && !info.disabled_by_csms && !warmup_status.cp_fault &&
+                                     warmup_state.safety_ok && !warmup_status.gc_welded &&
+                                     !warmup_status.mc_welded;
             const bool warmup = warmup_safe && !drive_modules;
             uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
             if (warmup && warmup_mask == 0u) {
@@ -5431,9 +5464,7 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
     const bool vehicle_present =
         status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
     const bool finishing_hint = post_stop_plugged || status.hlc_charge_complete;
-    const bool hlc_precharge_phase =
-        status.hlc_precharge_active ||
-        (status.hlc_stage > 0 && status.hlc_stage < HLC_MIN_POWER_STAGE && !status.hlc_power_ready);
+    const bool hlc_precharge_phase = is_hlc_precharge_phase(status);
     bool paused = false;
     bool constrained = false;
     {

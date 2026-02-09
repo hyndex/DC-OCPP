@@ -195,6 +195,7 @@ private:
         bool hlc_cable_checked{false};
         bool hlc_auth_granted{false};
         bool hlc_auth_pending{false};
+        std::chrono::steady_clock::time_point last_hlc_active{};
         bool lock_engaged{false};
         bool lock_engaged_valid{false};
         bool lock_command{true};

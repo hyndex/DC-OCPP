@@ -242,6 +242,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.min_gc_hold_ms = planner_value("minGcHoldMs", cfg.min_gc_hold_ms);
     cfg.mc_open_current_a = planner_value("mcOpenCurrentA", cfg.mc_open_current_a);
     cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
+    cfg.ramp_step_a = planner_value("rampStepA", cfg.ramp_step_a);
     cfg.tie_close_max_delta_v = planner_value("tieCloseMaxDeltaV", cfg.tie_close_max_delta_v);
     cfg.switch_max_current_a = planner_value("switchMaxCurrentA", cfg.switch_max_current_a);
     cfg.switch_stable_time_ms = planner_value("switchStableTimeMs", cfg.switch_stable_time_ms);
