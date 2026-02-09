@@ -4550,13 +4550,22 @@ void OcppAdapter::apply_power_plan() {
                         }
                     }
                 }
-                const double close_v = info.meas_voltage;
+                double close_v = info.meas_voltage;
                 const double close_i = meas_i;
+                bool close_v_from_module = false;
+                if (!status.relay_closed && hlc_precharge_phase) {
+                    if (info.module_telem_valid && info.module_voltage_v > 0.0) {
+                        close_v = info.module_voltage_v;
+                        close_v_from_module = true;
+                    }
+                }
                 const bool have_target = v_target > 0.0;
                 const bool have_close_v = close_v > 0.0;
                 const double dv_fallback = (have_target && have_close_v) ? std::fabs(close_v - v_target) : 0.0;
+                const bool fallback_allowed =
+                    hlc_power_phase || (hlc_precharge_phase && close_v_from_module);
                 const bool fallback_ready =
-                    !safe_close && hlc_power_phase && have_target && have_close_v &&
+                    !safe_close && fallback_allowed && have_target && have_close_v &&
                     dv_fallback <= gc_close_max_dv && std::fabs(close_i) < switch_i_thresh;
 
                 bool close_ready = safe_close || fallback_ready;
@@ -4607,6 +4616,7 @@ void OcppAdapter::apply_power_plan() {
                                    << " V_island=" << island_v
                                    << " I_island=" << island_i
                                    << " V_meas=" << close_v
+                                   << " V_meas_src=" << (close_v_from_module ? "module" : "present")
                                    << " V_target=" << v_target
                                    << " dv=" << dv
                                    << " dv_meas=" << dv_fallback
@@ -5006,7 +5016,34 @@ void OcppAdapter::apply_power_plan() {
                                      !info.disabled_by_csms && !info.status.cp_fault && info.gun_state.safety_ok &&
                                      !info.status.gc_welded && !info.status.mc_welded;
             const bool warmup = warmup_safe && !drive_modules;
-            const uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
+            uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
+            if (warmup && warmup_mask == 0u) {
+                const int fallback_count =
+                    dispatch.modules_assigned > 0 ? dispatch.modules_assigned : info.modules_final;
+                if (fallback_count > 0) {
+                    const int max_bits = std::numeric_limits<uint8_t>::digits;
+                    const int capped = std::max(0, std::min(fallback_count, max_bits));
+                    warmup_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
+                }
+                if (warmup_mask == 0u) {
+                    const auto last_it = last_module_mask_cmd_.find(c.id);
+                    if (last_it != last_module_mask_cmd_.end()) {
+                        warmup_mask = last_it->second;
+                    }
+                }
+                if (warmup_mask != 0u) {
+                    static std::map<int, std::chrono::steady_clock::time_point> last_log;
+                    auto& last_ts = last_log[c.id];
+                    const bool allow_log = last_ts.time_since_epoch().count() == 0 ||
+                                           (now - last_ts) > std::chrono::seconds(1);
+                    if (allow_log) {
+                        EVLOG_warning << "Connector " << c.id
+                                      << " warmup mask missing; using fallback mask 0x"
+                                      << std::hex << static_cast<int>(warmup_mask) << std::dec;
+                        last_ts = now;
+                    }
+                }
+            }
 
             ModuleCommandRequest mreq;
             mreq.slot_id = slot.id;
