@@ -40,6 +40,7 @@ install(
 
 list(APPEND CONFIGS
      config.json
+     config-mtls.json
      config-docker.json
      config-full.json
      config-docker-tls.json

@@ -14,6 +14,7 @@ It complements unit/simulation coverage by validating timing, contactor behavior
    - `chargePoint.centralSystemURI`: `wss://host:port/path` or scheme-less `host:port/path` (port 443 typical).
    - `security.csmsCaBundle`: CSMS CA bundle PEM.
    - `security.clientCertDir` / `security.clientKeyDir`: station TLS client cert/key directories.
+   - Ensure your base OCPP config uses `SecurityProfile=3` (e.g. set `ocppConfig` to `ocpp/v16/config-mtls.json`).
 2. Provision station client cert/key (naming is strict):
    - `${clientCertDir}/${charge_point_id}_cert.pem`
    - `${clientKeyDir}/${charge_point_id}_key.pem`
@@ -80,4 +81,3 @@ Run one full DC session end-to-end:
   - If commanded OPEN but voltage/current does not collapse, session faults safe and remains locked until service action.
 - Network loss:
   - CSMS reconnect logic does not deadlock; active sessions follow local safety policy.
-

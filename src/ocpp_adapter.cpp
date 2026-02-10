@@ -491,17 +491,17 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
         }
 
         // Advertise digital communication (SLAC/ISO15118/DIN) when appropriate.
-        // - If AutoCharge/PnC is enabled, keep digital comms on while plugged so the PLC can learn EVMAC early.
-        // - If AutoCharge/PnC is disabled, wait for explicit authorization (EIM/app) to avoid HLC auth timeouts.
+        // - If AutoCharge/PnC is enabled and not blocked, keep digital comms on while plugged so the PLC can learn
+        //   EV identity early (EVMAC/EVCCID/EMAID depending on the configured source).
+        // - Otherwise (AutoCharge disabled or blocked), wait for explicit authorization (EIM/app) to avoid HLC
+        //   authorization-pending timeouts in the PLC firmware.
         const bool cp_known = status.cp_state != 'U';
         const bool plugged_hint = status.plugged_in || (cp_known && status.cp_state != 'A');
-        if (autocharge_allowed) {
+        const bool allow_autocharge = autocharge_allowed && !flow.pnc_blocked;
+        if (allow_autocharge) {
             out.desired_digital = plugged_hint;
         } else {
-            out.desired_digital = plugged_hint && !post_stop_plugged;
-            if (flow.pnc_blocked && !session_authorized) {
-                out.desired_digital = false;
-            }
+            out.desired_digital = plugged_hint && session_authorized && !post_stop_plugged;
         }
         // Keep PnC available unless explicitly blocked; MAC-based AutoCharge should not force-disable HLC.
         out.desired_pnc_blocked = (!autocharge_allowed) || flow.pnc_blocked;
@@ -847,7 +847,9 @@ bool OcppAdapter::start() {
             const auto expected_key = (cfg_.security.client_key_dir / (cfg_.charge_point_id + "_key.pem")).string();
             EVLOG_error << "SecurityProfile=3 requires a charging station TLS client certificate+key. Expected "
                         << expected_cert << " and " << expected_key
-                        << " (or exactly-one *_cert.pem and *_key.pem in the configured dirs).";
+                        << " (or exactly-one *_cert.pem and *_key.pem in the configured dirs). "
+                        << "If your CSMS does not require mutual TLS, set SecurityProfile=2 instead. "
+                        << "For a dev self-generated cert/key run: ./scripts/provision_ocpp_client_cert.py --config <charger.json> --dev-ca";
             return false;
         }
     }
@@ -2421,6 +2423,8 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
     std::string session_id;
     std::optional<std::chrono::steady_clock::time_point> pending_started;
     std::optional<std::chrono::steady_clock::time_point> authorized_at;
+    double meter_start_wh = 0.0;
+    double last_energy_wh = 0.0;
     bool was_started = false;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -2431,13 +2435,35 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         session_id = it->second.session_id;
         pending_started = it->second.pending_started;
         authorized_at = it->second.authorized_at;
+        meter_start_wh = it->second.meter_start_wh;
         was_started = it->second.transaction_started;
+    }
+    {
+        std::lock_guard<std::mutex> lock(meter_mutex_);
+        last_energy_wh = last_energy_wh_[connector];
     }
 
     double energy_wh = 0.0;
     if (was_started && charge_point_) {
         const auto measurement = hardware_->sample_meter(connector);
         energy_wh = measurement.power_meter.energy_Wh_import.total;
+        if (!std::isfinite(energy_wh) || energy_wh < 0.0) {
+            energy_wh = 0.0;
+        }
+        // Ensure StopTransaction.meterStop is monotonic vs. StartTransaction.meterStart and previously sent MeterValues.
+        const double floor_wh = std::max({0.0, meter_start_wh, last_energy_wh});
+        if (energy_wh + 1e-3 < floor_wh) {
+            EVLOG_warning << "StopTransaction energy regression on connector " << connector << " (start=" << meter_start_wh
+                          << "Wh, last=" << last_energy_wh << "Wh, stop=" << energy_wh << "Wh); clamping to " << floor_wh
+                          << "Wh";
+            energy_wh = floor_wh;
+        } else {
+            // Keep the clamp base aligned with the final reading so a late meter tick cannot regress after stop.
+            std::lock_guard<std::mutex> lock(meter_mutex_);
+            if (energy_wh > last_energy_wh_[connector]) {
+                last_energy_wh_[connector] = energy_wh;
+            }
+        }
         charge_point_->on_transaction_stopped(connector, session_id, reason, ocpp::DateTime(),
                                               energy_wh, id_tag_end, std::nullopt);
     }
@@ -5114,18 +5140,18 @@ void OcppAdapter::apply_power_plan() {
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
         last_gc_state_[slot->gc_id] = cmd.gc_closed ? ContactorState::Closed : ContactorState::Open;
 
-        if (is_home && charge_point_) {
-            charge_point_->on_max_current_offered(c.id, static_cast<std::int32_t>(std::round(cmd.current_limit_a)));
-            charge_point_->on_max_power_offered(
-                c.id, static_cast<std::int32_t>(std::round(cmd.power_kw * 1000.0)));
+        if (is_home) {
+            if (charge_point_) {
+                charge_point_->on_max_current_offered(c.id, static_cast<std::int32_t>(std::round(cmd.current_limit_a)));
+                charge_point_->on_max_power_offered(
+                    c.id, static_cast<std::int32_t>(std::round(cmd.power_kw * 1000.0)));
+            }
 
             const bool constrained = g.ev_session_active && !local_fault && !info.disabled_by_csms &&
                                      (((dispatch.modules_assigned == 0 && dispatch.p_budget_kw > 0.0) ||
                                        (cmd.module_count == 0 && dispatch.modules_assigned > 0) ||
                                        (dispatch.p_set_kw + 1e-3 < dispatch.p_budget_kw)));
-            power_constrained_[c.id] = constrained;
-        } else {
-            power_constrained_[c.id] = false;
+            power_constrained_[c.id] = power_constrained_[c.id] || constrained;
         }
 
         auto local_fault_error_code = [&](const std::string& reason) {
@@ -5826,9 +5852,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
     case ConnectorState::Faulted:
         break;
     case ConnectorState::Preparing:
-        if (!has_session) {
-            charge_point_->on_usage_initiated(connector);
-        }
+        // libocpp v0.31.x transitions to Preparing on on_session_started(). Older forks exposed an
+        // explicit on_usage_initiated() helper; avoid hard dependency on that non-upstream API.
         break;
     case ConnectorState::SuspendedEV:
         charge_point_->on_suspend_charging_ev(connector);
@@ -5837,7 +5862,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
         charge_point_->on_suspend_charging_evse(connector);
         break;
     case ConnectorState::Finishing:
-        charge_point_->on_user_action_required(connector);
+        // libocpp transitions to Finishing when on_transaction_stopped() is called with a reason that
+        // requires user action (i.e. not EVDisconnected). Older forks exposed on_user_action_required().
         break;
     case ConnectorState::Charging:
         charge_point_->on_resume_charging(connector);

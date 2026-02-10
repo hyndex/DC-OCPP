@@ -16,6 +16,9 @@ Paths are configured under `security` in `configs/charger.json` and resolved rel
 
 - CSMS trust (CA bundle): `security.csmsCaBundle`
   - Default: `data/certs/ca/csms/CSMS_ROOT_CA.pem`
+  - If the configured file is missing or empty, `dc_ocpp` will fall back to the system CA bundle (e.g.
+    `/etc/ssl/certs/ca-certificates.crt` on Debian/Raspbian). This is sufficient when your CSMS uses a public
+    certificate chain (e.g. Let's Encrypt).
 - Firmware signing trust (CA bundle): `security.mfCaBundle`
   - Used to validate `SignedUpdateFirmware` signing certificates (MF CA)
 - Station TLS client certificate/key (SecurityProfile 3):
@@ -45,8 +48,8 @@ Enabling TLS
   - `wss://host:port/path`, or
   - scheme-less `host:port/path` (libocpp will use `wss://` for SecurityProfile 2/3).
 - Set `ocpp.Security.SecurityProfile` in your base OCPP config:
-  - `2`: TLS with server authentication (CA bundle required, no client cert)
-  - `3`: mutual TLS (CA bundle + station client cert/key required)
+  - `2`: TLS with server authentication (no client cert; CSMS server certificate must validate)
+  - `3`: mutual TLS (CSMS server certificate must validate + station client cert/key required)
 - The charger rejects `ws://...` endpoints when SecurityProfile is 2 or 3.
 - `DC_OCPP_STUB_SECURITY=1` is a dev-only bypass for SecurityProfile 0 and is **ignored** for TLS
   profiles (2/3).
@@ -62,3 +65,14 @@ ISO 15118 / HLC notes
 - HLC TLS handshake uses the SECC certificate/key pair and MO/V2G CA bundles above.
 - OCPP ISO 15118 contract-certificate management ("PnC") is intentionally disabled; do not enable
   the OCPP PnC feature profile unless the full contract-cert lifecycle is implemented and tested.
+
+Dev helper (autogenerate)
+-------------------------
+If you want a *development* mutual-TLS setup (self-generated CA + station client cert/key), you can generate
+material in the expected paths from your `configs/charger.json`:
+
+```bash
+./scripts/provision_ocpp_client_cert.py --config configs/charger.json --dev-ca
+```
+
+This is not production PKI: a real CSMS will only accept your client certificate if it trusts the issuing CA.

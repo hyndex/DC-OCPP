@@ -37,8 +37,9 @@ cmake --build build --target dc_ocpp -j
 Notes
 - `dc_ocpp` exits if `chargePoint.usePLC` is false.
 - The CAN interface must exist (e.g., `can0`) or the PLC backend will fail to start.
-- The shipped `configs/ocpp/v16/config.json` defaults to `SecurityProfile=3` (mTLS). For local dev without TLS,
-  use a base OCPP config with `SecurityProfile=0` or provision certs as described in `docs/security_pki.md`.
+- The shipped `configs/ocpp/v16/config.json` defaults to `SecurityProfile=2` (TLS with server authentication only).
+  If you need mTLS, use `configs/ocpp/v16/config-mtls.json` and provision the station client cert/key as described in
+  `docs/security_pki.md`.
 
 Build prerequisites
 - CMake >= 3.16 and a C++17 compiler

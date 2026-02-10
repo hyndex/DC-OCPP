@@ -42,7 +42,7 @@
         "MaxChargingProfilesInstalled": 42
     },
     "Security": {
-        "SecurityProfile": 2
+        "SecurityProfile": 3
     },
     "CostAndPrice": {
         "CustomDisplayCostAndPrice": false
