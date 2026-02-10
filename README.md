@@ -283,12 +283,14 @@ sequenceDiagram
     PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
     CTRL->>CSMS: Authorize(Autocharge idTag)
     CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
-    alt CSMS rejects Autocharge OR HLC auth timeout occurs
-        CSMS-->>CTRL: Authorize.conf (Denied) / no response in time
-        CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
-        PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
-        Note over CTRL: Autocharge blocked for TTL; requires EIM fallback
+    alt CSMS rejects Autocharge
+        CSMS-->>CTRL: Authorize.conf (Denied)
+    else Controller HLC auth timeout (hlcAuthorizationSeconds)
+        CTRL->>CTRL: HLC auth timeout reached
     end
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
+    PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
+    Note right of CTRL: Autocharge blocked for TTL; requires EIM fallback
 
     CSMS->>CTRL: RemoteStartTransaction(idTag, connectorId)
     CTRL->>CSMS: Authorize(RemoteStart idTag) (or prevalidated)
@@ -312,9 +314,14 @@ sequenceDiagram
     PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
     CTRL->>CSMS: Authorize(Autocharge idTag)
     CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
-    CSMS-->>CTRL: Authorize.conf (Denied) / timeout
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
-    PLC->>EV: CP duty 100% (preauth)
+    alt CSMS rejects Autocharge
+        CSMS-->>CTRL: Authorize.conf (Denied)
+    else Controller HLC auth timeout (hlcAuthorizationSeconds)
+        CTRL->>CTRL: HLC auth timeout reached
+    end
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
+    PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
+    Note right of CTRL: Autocharge blocked for TTL; requires EIM fallback
 
     EV->>PLC: User taps RFID
     PLC->>CTRL: RFID_EVENT segments (UID)
