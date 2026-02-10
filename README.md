@@ -56,6 +56,7 @@ Helper script
 
 Run helpers
 - `./scripts/dc_ocpp_run.sh` (uses `DC_OCPP_BIN` and `DC_OCPP_CONFIG` if set)
+  - Dev-only: set `DC_OCPP_AUTO_CERTS=1` to autogenerate a local client cert/key when `SecurityProfile=3`.
 - `./scripts/install_systemd_service.sh` (Linux systemd unit using `dc_ocpp_run.sh`)
 
 Config reference (charger.json)
