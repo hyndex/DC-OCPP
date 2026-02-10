@@ -1,0 +1,87 @@
+[
+  {
+    "name": "CableCheck_NoHV",
+    "ticks": 1,
+    "gun": {
+      "safety_ok": true,
+      "plugged_in": true,
+      "cp_state": "B",
+      "hlc_stage": 7,
+      "hlc_cable_check_ok": false,
+      "hlc_precharge_active": false,
+      "hlc_power_ready": false,
+      "hlc_charge_complete": false,
+      "authorization_granted": true,
+      "relay_closed": false,
+      "lock_engaged": true,
+      "module_healthy_mask": 3,
+      "module_fault_mask": 0
+    },
+    "expect": {
+      "gc_closed": false,
+      "module_count": 0,
+      "max_current_limit_a": 0.0,
+      "max_voltage_set_v": 1000.0
+    }
+  },
+  {
+    "name": "PreCharge_Clamp2A_DefaultModuleOnly",
+    "ticks": 3,
+    "gun": {
+      "safety_ok": true,
+      "plugged_in": true,
+      "cp_state": "C",
+      "hlc_stage": 8,
+      "hlc_cable_check_ok": true,
+      "hlc_precharge_active": true,
+      "hlc_power_ready": false,
+      "hlc_charge_complete": false,
+      "authorization_granted": true,
+      "relay_closed": false,
+      "lock_engaged": true,
+      "module_healthy_mask": 3,
+      "module_fault_mask": 0,
+      "present_voltage_v": 0.0,
+      "present_current_a": 0.0,
+      "target_voltage_v": 400.0,
+      "target_current_a": 10.0
+    },
+    "expect": {
+      "gc_closed": false,
+      "module_count": 1,
+      "max_current_limit_a": 2.0,
+      "min_voltage_set_v": 390.0,
+      "max_voltage_set_v": 410.0
+    }
+  },
+  {
+    "name": "PowerDelivery_AllocateBoostModule",
+    "ticks": 20,
+    "gun": {
+      "safety_ok": true,
+      "plugged_in": true,
+      "cp_state": "C",
+      "hlc_stage": 9,
+      "hlc_cable_check_ok": true,
+      "hlc_precharge_active": false,
+      "hlc_power_ready": true,
+      "hlc_charge_complete": false,
+      "authorization_granted": true,
+      "relay_closed": true,
+      "lock_engaged": true,
+      "module_healthy_mask": 3,
+      "module_fault_mask": 0,
+      "present_voltage_v": 400.0,
+      "present_current_a": 0.0,
+      "target_voltage_v": 400.0,
+      "target_current_a": 150.0
+    },
+    "expect": {
+      "gc_closed": true,
+      "module_count": 2,
+      "min_current_limit_a": 100.0,
+      "min_voltage_set_v": 390.0,
+      "max_voltage_set_v": 410.0
+    }
+  }
+]

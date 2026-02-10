@@ -71,8 +71,8 @@
 
 ## Stage 13 - Validation
 - [x] Build + run impacted unit tests (auth_flow, pending_token_persistence, power_manager)
-- [ ] Validate OCPP status sequence for charge complete -> Finishing -> Available
-- [ ] Verify connectorId=0 ChangeAvailability flows on multi-connector config
+- [x] Validate OCPP status sequence for charge complete -> Finishing -> Available (unit test)
+- [x] Verify connectorId=0 ChangeAvailability flows on multi-connector config (unit test)
 
 ## Stage 14 - CCS2 DC Control Recipe Alignment (EVSE-side)
 - [x] Align HLC phase detection: distinguish CableCheck vs PreCharge vs PowerDelivery (avoid treating all stage<9 as "precharge")
@@ -94,3 +94,14 @@
 ## Stage 16 - Validation
 - [x] Run full unit test suite (`ctest` or individual binaries) and fix regressions
 - [ ] Spot-check with representative logs/HIL: CableCheck -> PreCharge -> PowerDelivery -> CurrentDemand -> Stop -> Unlock
+
+## Stage 17 - Production Hardening (TLS + Autocharge + CSMS Maintenance + Docs/Test Alignment)
+- [x] Enable OCPP TLS SecurityProfile 2/3 (file-based EVSE security backend + strict config validation)
+- [x] Disable ISO15118 contract-PnC profile in default OCPP configs (keep MAC/EVCCID/EMAID Autocharge)
+- [x] Add CSMS maintenance manager: async GetDiagnostics/GetLog uploads + UpdateFirmware/SignedUpdateFirmware
+- [x] Persist firmware update progress to `fw_update_state.json` and clear on success
+- [x] Wire unit/sim tests into `ctest` and add `check` target for CI-friendly execution
+- [x] Update docs: TLS/PKI, split-charging behavior, CAN contract defaults, HIL/soak expectations, CCS gap analysis
+- [x] Add log/trace replay harness for field regression (ingest representative traces into TestHardware)
+- [x] Add HIL/Ops validation runbook for TLS + maintenance + CCS2 DC end-to-end checks
+- [ ] Execute HIL validation against real CSMS + PLC timing (site-specific)

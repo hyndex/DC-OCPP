@@ -4,7 +4,7 @@
     "freeMode": false
   },
   "chargePoint": {
-    "centralSystemURI": "ws://ocpp.joulepoint.com:80",
+    "centralSystemURI": "ocpp.joulepoint.com:443",
     "firmwareVersion": "0.0.1",
     "id": "jyotisman",
     "model": "Joulepoint-DC",
@@ -34,6 +34,14 @@
     }
   ],
   "databaseDir": "../data/db",
+  "firmwareUpdate": {
+    "enabled": true,
+    "allowUnsigned": false,
+    "stagingDir": "../data/fw",
+    "systemdServiceName": "dc_ocpp.service",
+    "targetBinaryPath": "/usr/local/bin/dc_ocpp",
+    "maxWaitSeconds": 900
+  },
   "gridLimitKW": 60,
   "loggingConfig": "logging_debug.ini",
   "messageLogPath": "../logs",

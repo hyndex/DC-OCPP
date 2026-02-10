@@ -4,7 +4,7 @@
     "freeMode": false
   },
   "chargePoint": {
-    "centralSystemURI": "ws://ocpp.joulepoint.com:80",
+    "centralSystemURI": "ocpp.joulepoint.com:443",
     "firmwareVersion": "0.0.1",
     "id": "jyotisman",
     "model": "Joulepoint-DC",

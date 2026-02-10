@@ -28,7 +28,7 @@
         "UnlockConnectorOnEVSideDisconnect": true
     },
     "FirmwareManagement": {
-        "SupportedFileTransferProtocols": "FTP"
+        "SupportedFileTransferProtocols": "FTP,FTPS,HTTP,HTTPS"
     },
     "LocalAuthListManagement": {
         "LocalAuthListEnabled": true,
@@ -42,12 +42,7 @@
         "MaxChargingProfilesInstalled": 42
     },
     "Security": {
-        "SecurityProfile": 0
-    },
-    "PnC": {
-        "ISO15118CertificateManagementEnabled": true,
-        "ISO15118PnCEnabled": true,
-        "ContractValidationOffline": true
+        "SecurityProfile": 3
     },
     "CostAndPrice": {
         "CustomDisplayCostAndPrice": false

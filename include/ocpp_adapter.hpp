@@ -26,6 +26,8 @@ namespace charger {
 
 enum class ConnectorState { Available, Preparing, Charging, SuspendedEV, SuspendedEVSE, Finishing, Unavailable, Faulted };
 
+class MaintenanceManager;
+
 class OcppAdapter {
 public:
     OcppAdapter(ChargerConfig cfg, std::shared_ptr<HardwareInterface> hardware);
@@ -183,6 +185,28 @@ public:
                                             pending_session_stop_id);
         }
 
+        static bool enable_evse(OcppAdapter& adapter, std::int32_t connector) {
+            return adapter.handle_enable_evse(connector);
+        }
+
+        static bool disable_evse(OcppAdapter& adapter, std::int32_t connector) {
+            return adapter.handle_disable_evse(connector);
+        }
+
+        static bool pause_charging(OcppAdapter& adapter, std::int32_t connector) {
+            return adapter.handle_pause_charging(connector);
+        }
+
+        static bool resume_charging(OcppAdapter& adapter, std::int32_t connector) {
+            return adapter.handle_resume_charging(connector);
+        }
+
+        static bool evse_disabled(OcppAdapter& adapter, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(adapter.plan_mutex_);
+            const auto it = adapter.evse_disabled_.find(connector);
+            return it != adapter.evse_disabled_.end() ? it->second : false;
+        }
+
         static std::mutex& session_mutex(OcppAdapter& adapter) { return adapter.session_mutex_; }
         static std::map<std::int32_t, ActiveSession>& sessions(OcppAdapter& adapter) { return adapter.sessions_; }
         static std::map<std::int32_t, bool>& plugged_in_state(OcppAdapter& adapter) { return adapter.plugged_in_state_; }
@@ -214,6 +238,7 @@ private:
     ChargerConfig cfg_;
     std::shared_ptr<HardwareInterface> hardware_;
     std::unique_ptr<ocpp::v16::ChargePoint> charge_point_;
+    std::unique_ptr<MaintenanceManager> maintenance_manager_;
     PlannerConfig planner_cfg_{};
     PowerManager power_manager_;
     std::vector<Slot> slots_;
@@ -330,6 +355,11 @@ private:
     std::map<int, int> connector_meter_intervals_;
 
     void register_callbacks();
+    bool handle_enable_evse(std::int32_t connector);
+    bool handle_disable_evse(std::int32_t connector);
+    bool handle_pause_charging(std::int32_t connector);
+    bool handle_resume_charging(std::int32_t connector);
+    bool handle_stop_transaction(std::int32_t connector, ocpp::v16::Reason reason);
     void start_metering_threads();
     void metering_loop(std::int32_t connector);
     std::string make_session_id() const;

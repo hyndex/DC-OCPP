@@ -2,6 +2,8 @@
 #include "ocpp_adapter.hpp"
 #include "tie_gating.hpp"
 #include "error_catalog.hpp"
+#include "evse_security_file.hpp"
+#include "maintenance_manager.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,7 +28,6 @@
 
 #include <everest/logging.hpp>
 #include <ocpp/common/types.hpp>
-#include <ocpp/common/evse_security_impl.hpp>
 #include <ocpp/v16/ocpp_enums.hpp>
 
 namespace charger {
@@ -177,158 +178,13 @@ GunStatus sanitize_status(const GunStatus& in, bool lab_bypass) {
     return st;
 }
 
-bool has_nonempty_file(const fs::path& path) {
-    if (path.empty()) {
-        return false;
-    }
-    std::error_code ec;
-    if (!fs::exists(path, ec) || ec) {
-        return false;
-    }
-    const auto size = fs::file_size(path, ec);
-    if (ec) {
-        return false;
-    }
-    return size > 0;
-}
-
-fs::path system_ca_bundle() {
-    static constexpr std::array<const char*, 4> kCandidates = {
-        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Raspbian
-        "/etc/ssl/certs/ca-bundle.crt",        // Alpine (often symlinked)
-        "/etc/pki/tls/certs/ca-bundle.crt",    // RHEL/CentOS/Fedora
-        "/etc/ssl/ca-bundle.pem",              // OpenSUSE
-    };
-    for (const auto* candidate : kCandidates) {
-        const fs::path p(candidate);
-        if (has_nonempty_file(p)) {
-            return p;
-        }
-    }
-    return {};
-}
-
-fs::path resolve_bundle_path(const fs::path& configured, const fs::path& fallback) {
-    if (has_nonempty_file(configured)) {
-        return configured;
-    }
-    if (has_nonempty_file(fallback)) {
-        return fallback;
-    }
-    if (!configured.empty()) {
-        EVLOG_warning << "CA bundle not found at " << configured << " and no valid fallback available";
-    }
-    return {};
-}
-
-bool should_use_stub_security(const ChargerConfig& cfg) {
+bool should_use_stub_security(const ChargerConfig&) {
     const char* env = std::getenv("DC_OCPP_STUB_SECURITY");
     if (!env) {
         return false;
     }
     return std::string(env) != "0";
 }
-
-class FileBasedEvseSecurity : public ocpp::EvseSecurity {
-public:
-    explicit FileBasedEvseSecurity(SecurityConfig cfg, bool permissive) :
-        cfg_(std::move(cfg)), permissive_(permissive), sys_ca_(system_ca_bundle()) {}
-
-    ocpp::InstallCertificateResult install_ca_certificate(const std::string&,
-                                                          const ocpp::CaCertificateType&) override {
-        return permissive_ ? ocpp::InstallCertificateResult::Accepted : ocpp::InstallCertificateResult::WriteError;
-    }
-
-    ocpp::DeleteCertificateResult delete_certificate(const ocpp::CertificateHashDataType&) override {
-        return permissive_ ? ocpp::DeleteCertificateResult::Accepted : ocpp::DeleteCertificateResult::Failed;
-    }
-
-    ocpp::InstallCertificateResult update_leaf_certificate(const std::string&,
-                                                           const ocpp::CertificateSigningUseEnum&) override {
-        return permissive_ ? ocpp::InstallCertificateResult::Accepted : ocpp::InstallCertificateResult::WriteError;
-    }
-
-    ocpp::CertificateValidationResult verify_certificate(const std::string&,
-                                                         const ocpp::LeafCertificateType&) override {
-        return permissive_ ? ocpp::CertificateValidationResult::Valid : ocpp::CertificateValidationResult::IssuerNotFound;
-    }
-
-    ocpp::CertificateValidationResult verify_certificate(
-        const std::string&, const std::vector<ocpp::LeafCertificateType>&) override {
-        return permissive_ ? ocpp::CertificateValidationResult::Valid : ocpp::CertificateValidationResult::IssuerNotFound;
-    }
-
-    std::vector<ocpp::CertificateHashDataChain>
-    get_installed_certificates(const std::vector<ocpp::CertificateType>&) override {
-        return {};
-    }
-
-    std::vector<ocpp::OCSPRequestData> get_v2g_ocsp_request_data() override {
-        return {};
-    }
-
-    std::vector<ocpp::OCSPRequestData> get_mo_ocsp_request_data(const std::string&) override {
-        return {};
-    }
-
-    void update_ocsp_cache(const ocpp::CertificateHashDataType&, const std::string&) override {}
-
-    bool is_ca_certificate_installed(const ocpp::CaCertificateType& certificate_type) override {
-        return has_nonempty_file(bundle_for_type(certificate_type));
-    }
-
-    ocpp::GetCertificateSignRequestResult generate_certificate_signing_request(
-        const ocpp::CertificateSigningUseEnum&, const std::string&, const std::string&, const std::string&,
-        bool) override {
-        return {ocpp::GetCertificateSignRequestStatus::GenerationError, std::nullopt};
-    }
-
-    ocpp::GetCertificateInfoResult get_leaf_certificate_info(const ocpp::CertificateSigningUseEnum&,
-                                                             bool) override {
-        return {ocpp::GetCertificateInfoStatus::NotFound, std::nullopt};
-    }
-
-    bool update_certificate_links(const ocpp::CertificateSigningUseEnum&) override {
-        return false;
-    }
-
-    std::string get_verify_file(const ocpp::CaCertificateType& certificate_type) override {
-        return bundle_for_type(certificate_type).string();
-    }
-
-    std::string get_verify_location(const ocpp::CaCertificateType& certificate_type) override {
-        const auto path = bundle_for_type(certificate_type);
-        if (path.empty()) {
-            return {};
-        }
-        return path.parent_path().string();
-    }
-
-    int get_leaf_expiry_days_count(const ocpp::CertificateSigningUseEnum&) override {
-        return -1;
-    }
-
-private:
-    fs::path bundle_for_type(const ocpp::CaCertificateType& certificate_type) const {
-        switch (certificate_type) {
-        case ocpp::CaCertificateType::CSMS:
-            return resolve_bundle_path(cfg_.csms_ca_bundle, sys_ca_);
-        case ocpp::CaCertificateType::MO:
-            return resolve_bundle_path(cfg_.mo_ca_bundle, sys_ca_);
-        case ocpp::CaCertificateType::V2G:
-            return resolve_bundle_path(cfg_.v2g_ca_bundle, sys_ca_);
-        case ocpp::CaCertificateType::MF:
-            return resolve_bundle_path(cfg_.mf_ca_bundle, sys_ca_);
-        case ocpp::CaCertificateType::OEM:
-            return {};
-        }
-        return {};
-    }
-
-    SecurityConfig cfg_;
-    bool permissive_{false};
-    fs::path sys_ca_;
-};
 
 std::chrono::milliseconds evse_limit_ack_timeout(const ChargerConfig& cfg) {
     return std::chrono::milliseconds(std::max(1, cfg.evse_limit_ack_timeout_ms));
@@ -882,10 +738,12 @@ bool OcppAdapter::start() {
 
     const auto config_str = load_and_patch_ocpp_config(cfg_);
 
+    nlohmann::json cfg_json;
+    std::string central_system_uri;
     int security_profile = 0;
     bool autocharge_enabled = true;
     try {
-        const auto cfg_json = nlohmann::json::parse(config_str);
+        cfg_json = nlohmann::json::parse(config_str);
         if (cfg_json.contains("Security") && cfg_json["Security"].is_object()) {
             const auto& sec = cfg_json["Security"];
             if (sec.contains("SecurityProfile")) {
@@ -900,6 +758,9 @@ bool OcppAdapter::start() {
                     }
                 }
             }
+        }
+        if (cfg_json.contains("Internal") && cfg_json["Internal"].is_object()) {
+            central_system_uri = cfg_json["Internal"].value("CentralSystemURI", "");
         }
         if (cfg_json.contains("Custom") && cfg_json["Custom"].is_object()) {
             const auto& custom = cfg_json["Custom"];
@@ -928,26 +789,100 @@ bool OcppAdapter::start() {
     if (security_profile < 0) {
         security_profile = 0;
     }
-
-    // This standalone binary does not use libocpp's internal EvseSecurityImpl backend because
-    // the upstream evse_security dependency is unstable in this deployment (observed SIGSEGV on init).
-    // Only SecurityProfile 0 is supported here.
-    if (security_profile != 0) {
-        EVLOG_error << "OCPP SecurityProfile=" << security_profile
-                    << " requested, but this build supports only SecurityProfile=0 (no certificate provisioning).";
+    if (security_profile > 3) {
+        EVLOG_error << "Unsupported OCPP SecurityProfile=" << security_profile
+                    << " (expected 0..3). Refusing to start.";
         return false;
+    }
+
+    if (security_profile >= 2) {
+        // libocpp will validate scheme/profile consistency, but fail-fast here with a clearer message.
+        if (central_system_uri.rfind("ws://", 0) == 0) {
+            EVLOG_error << "SecurityProfile=" << security_profile
+                        << " requires a secure websocket endpoint, but CentralSystemURI starts with ws:// ("
+                        << central_system_uri << "). Use wss://... or omit the scheme.";
+            return false;
+        }
+        if (central_system_uri.empty()) {
+            EVLOG_error << "SecurityProfile=" << security_profile
+                        << " requires Internal.CentralSystemURI to be configured";
+            return false;
+        }
+    }
+
+    // Use an explicit file-backed EVSE security backend for TLS and certificate verification/provisioning.
+    const bool stub_requested = should_use_stub_security(cfg_);
+    const bool permissive = stub_requested && security_profile < 2;
+    if (stub_requested && !permissive) {
+        EVLOG_warning << "DC_OCPP_STUB_SECURITY=1 ignored for SecurityProfile=" << security_profile
+                      << " (TLS profiles require real verification)";
+    }
+    if (permissive) {
+        EVLOG_warning << "Using permissive EVSE security backend (DC_OCPP_STUB_SECURITY=1). NOT production-safe.";
     }
 
     set_autocharge_enabled(autocharge_enabled, "config");
 
-    const bool permissive = should_use_stub_security(cfg_);
-    if (permissive) {
-        EVLOG_warning << "Using permissive EVSE security stub (DC_OCPP_STUB_SECURITY=1). This is NOT production-safe.";
+    const auto evse_security =
+        std::make_shared<FileEvseSecurity>(FileEvseSecurity::Paths{cfg_.charge_point_id, cfg_.security}, permissive);
+    const auto maintenance_security = permissive
+                                          ? std::make_shared<FileEvseSecurity>(
+                                                FileEvseSecurity::Paths{cfg_.charge_point_id, cfg_.security}, false)
+                                          : evse_security;
+
+    if (security_profile >= 2) {
+        const auto verify_loc = evse_security->get_verify_location(ocpp::CaCertificateType::CSMS);
+        if (verify_loc.empty()) {
+            EVLOG_error << "SecurityProfile=" << security_profile
+                        << " requires a CSMS CA bundle, but none is configured/available "
+                        << "(set security.csmsCaBundle or ensure system CA bundle exists)";
+            return false;
+        }
     }
-    const auto evse_security = std::make_shared<FileBasedEvseSecurity>(cfg_.security, permissive);
+    if (security_profile == 3) {
+        const auto info =
+            evse_security->get_leaf_certificate_info(ocpp::CertificateSigningUseEnum::ChargingStationCertificate, false);
+        if (info.status != ocpp::GetCertificateInfoStatus::Accepted || !info.info.has_value()) {
+            const auto expected_cert = (cfg_.security.client_cert_dir / (cfg_.charge_point_id + "_cert.pem")).string();
+            const auto expected_key = (cfg_.security.client_key_dir / (cfg_.charge_point_id + "_key.pem")).string();
+            EVLOG_error << "SecurityProfile=3 requires a charging station TLS client certificate+key. Expected "
+                        << expected_cert << " and " << expected_key
+                        << " (or exactly-one *_cert.pem and *_key.pem in the configured dirs).";
+            return false;
+        }
+    }
+    if (cfg_.security.mf_ca_bundle.empty()) {
+        EVLOG_warning << "security.mfCaBundle is not configured; SignedUpdateFirmware certificate verification will fail";
+    }
+
     charge_point_ = std::make_unique<ocpp::v16::ChargePoint>(config_str, cfg_.share_path, cfg_.user_config,
                                                              cfg_.database_dir, cfg_.sql_migrations,
                                                              cfg_.message_log_path, evse_security, std::nullopt);
+
+    {
+        MaintenanceManager::Callbacks cb{};
+        cb.on_log_status = [this](int request_id, const std::string& status) {
+            if (charge_point_) {
+                charge_point_->on_log_status_notification(request_id, status);
+            }
+        };
+        cb.on_firmware_status = [this](int request_id, ocpp::FirmwareStatusNotification status) {
+            if (charge_point_) {
+                charge_point_->on_firmware_update_status_notification(request_id, status);
+            }
+        };
+        cb.any_active_transaction = [this]() {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            for (const auto& kv : sessions_) {
+                if (kv.second.transaction_started) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        maintenance_manager_ =
+            std::make_unique<MaintenanceManager>(cfg_, maintenance_security, std::move(cb));
+    }
 
     register_callbacks();
     if (cfg_.lab_bypass) {
@@ -1064,120 +999,35 @@ void OcppAdapter::stop() {
         }
     }
     meter_threads_.clear();
+    if (maintenance_manager_) {
+        maintenance_manager_->shutdown();
+        maintenance_manager_.reset();
+    }
     if (charge_point_) {
         charge_point_->stop();
     }
 }
 
 void OcppAdapter::register_callbacks() {
-    auto enable_one = [this](std::int32_t connector) {
-        {
-            std::lock_guard<std::mutex> lock(plan_mutex_);
-            evse_disabled_[connector] = false;
-        }
-        const bool ok = hardware_->enable(connector);
-        if (!ok) {
-            std::lock_guard<std::mutex> lock(plan_mutex_);
-            evse_disabled_[connector] = true;
-        }
-        return ok;
-    };
-    auto disable_one = [this](std::int32_t connector) {
-        bool had_session = false;
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            had_session = sessions_.count(connector) > 0;
-        }
-        {
-            std::lock_guard<std::mutex> lock(plan_mutex_);
-            evse_disabled_[connector] = true;
-        }
-        if (had_session) {
-            finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
-        }
-        return hardware_->disable(connector);
-    };
-    auto pause_one = [this](std::int32_t connector) {
-        std::lock_guard<std::mutex> lock(plan_mutex_);
-        paused_evse_[connector] = true;
-        return true;
-    };
-    auto resume_one = [this](std::int32_t connector) {
-        std::lock_guard<std::mutex> lock(plan_mutex_);
-        paused_evse_[connector] = false;
-        return true;
-    };
-    auto stop_one = [this](std::int32_t connector, ocpp::v16::Reason reason) {
-        const bool ok = hardware_->stop_transaction(connector, reason);
-        if (ok) {
-            const auto status = sanitize_status(hardware_->get_status(connector), cfg_.lab_bypass);
-            const bool cp_known = status.cp_state != 'U';
-            const bool vehicle_present =
-                status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                post_stop_plugged_[connector] = vehicle_present;
-                post_stop_time_[connector] =
-                    vehicle_present ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            }
-            finish_transaction(connector, reason, std::nullopt, vehicle_present);
-        }
-        return ok;
-    };
-
-    charge_point_->register_enable_evse_callback([this, enable_one](std::int32_t connector) {
-        if (connector == 0) {
-            bool ok = true;
-            for (const auto& c : cfg_.connectors) {
-                ok = enable_one(c.id) && ok;
-            }
-            return ok;
-        }
-        return enable_one(connector);
+    charge_point_->register_enable_evse_callback([this](std::int32_t connector) {
+        return handle_enable_evse(connector);
     });
 
-    charge_point_->register_disable_evse_callback([this, disable_one](std::int32_t connector) {
-        if (connector == 0) {
-            bool ok = true;
-            for (const auto& c : cfg_.connectors) {
-                ok = disable_one(c.id) && ok;
-            }
-            return ok;
-        }
-        return disable_one(connector);
+    charge_point_->register_disable_evse_callback([this](std::int32_t connector) {
+        return handle_disable_evse(connector);
     });
 
-    charge_point_->register_pause_charging_callback([this, pause_one](std::int32_t connector) {
-        if (connector == 0) {
-            for (const auto& c : cfg_.connectors) {
-                pause_one(c.id);
-            }
-            return true;
-        }
-        return pause_one(connector);
+    charge_point_->register_pause_charging_callback([this](std::int32_t connector) {
+        return handle_pause_charging(connector);
     });
 
-    charge_point_->register_resume_charging_callback([this, resume_one](std::int32_t connector) {
-        if (connector == 0) {
-            for (const auto& c : cfg_.connectors) {
-                resume_one(c.id);
-            }
-            return true;
-        }
-        return resume_one(connector);
+    charge_point_->register_resume_charging_callback([this](std::int32_t connector) {
+        return handle_resume_charging(connector);
     });
 
-    charge_point_->register_stop_transaction_callback(
-        [this, stop_one](std::int32_t connector, ocpp::v16::Reason reason) {
-            if (connector == 0) {
-                bool ok = true;
-                for (const auto& c : cfg_.connectors) {
-                    ok = stop_one(c.id, reason) && ok;
-                }
-                return ok;
-            }
-            return stop_one(connector, reason);
-        });
+    charge_point_->register_stop_transaction_callback([this](std::int32_t connector, ocpp::v16::Reason reason) {
+        return handle_stop_transaction(connector, reason);
+    });
 
     charge_point_->register_provide_token_callback(
         [this](const std::string& id_token, std::vector<std::int32_t> referenced_connectors, bool prevalidated) {
@@ -1294,86 +1144,69 @@ void OcppAdapter::register_callbacks() {
 
     charge_point_->register_upload_diagnostics_callback(
         [this](const ocpp::v16::GetDiagnosticsRequest& request) {
-            charge_point_->on_log_status_notification(-1, "Uploading");
             try {
-                auto resp = hardware_->upload_diagnostics(request);
-                charge_point_->on_log_status_notification(-1, resp.status == ocpp::v16::LogStatusEnumType::Accepted
-                                                                    ? "Uploaded"
-                                                                    : "UploadFailed");
-                return resp;
+                if (!maintenance_manager_) {
+                    ocpp::v16::GetLogResponse resp;
+                    resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+                    return resp;
+                }
+                return maintenance_manager_->handle_get_diagnostics(request);
             } catch (const std::exception& e) {
                 EVLOG_error << "Diagnostics upload failed: " << e.what();
                 ocpp::v16::GetLogResponse resp;
                 resp.status = ocpp::v16::LogStatusEnumType::Rejected;
-                charge_point_->on_log_status_notification(-1, "UploadFailed");
                 return resp;
             }
         });
 
     charge_point_->register_upload_logs_callback(
         [this](const ocpp::v16::GetLogRequest& request) {
-            const int req_id = request.requestId;
-            charge_point_->on_log_status_notification(req_id, "Uploading");
             try {
-                auto resp = hardware_->upload_logs(request);
-                charge_point_->on_log_status_notification(req_id, resp.status == ocpp::v16::LogStatusEnumType::Accepted
-                                                                      ? "Uploaded"
-                                                                      : "UploadFailed");
-                return resp;
+                if (!maintenance_manager_) {
+                    ocpp::v16::GetLogResponse resp;
+                    resp.status = ocpp::v16::LogStatusEnumType::Rejected;
+                    return resp;
+                }
+                return maintenance_manager_->handle_get_log(request);
             } catch (const std::exception& e) {
                 EVLOG_error << "Log upload failed: " << e.what();
                 ocpp::v16::GetLogResponse resp;
                 resp.status = ocpp::v16::LogStatusEnumType::Rejected;
-                charge_point_->on_log_status_notification(req_id, "UploadFailed");
                 return resp;
             }
         });
 
     charge_point_->register_update_firmware_callback(
         [this](const ocpp::v16::UpdateFirmwareRequest msg) {
-            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
             try {
-                const bool downloaded = hardware_->update_firmware(msg);
-                if (downloaded) {
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::Downloaded);
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::Installing);
-                    // Installation is not yet supported in the PLC backend; report failure instead of pretending success.
+                if (maintenance_manager_) {
+                    maintenance_manager_->handle_update_firmware(msg);
+                } else if (charge_point_) {
                     charge_point_->on_firmware_update_status_notification(
                         -1, ocpp::FirmwareStatusNotification::InstallationFailed);
-                } else {
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::DownloadFailed);
                 }
             } catch (const std::exception& e) {
                 EVLOG_error << "Firmware update failed: " << e.what();
-                charge_point_->on_firmware_update_status_notification(
-                    -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                if (charge_point_) {
+                    charge_point_->on_firmware_update_status_notification(
+                        -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                }
             }
         });
 
     charge_point_->register_signed_update_firmware_callback(
         [this](const ocpp::v16::SignedUpdateFirmwareRequest msg) {
-            charge_point_->on_firmware_update_status_notification(-1, ocpp::FirmwareStatusNotification::Downloading);
             try {
-                const auto status = hardware_->update_firmware_signed(msg);
-                if (status == ocpp::v16::UpdateFirmwareStatusEnumType::Accepted) {
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::Downloaded);
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::Installing);
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::InstallationFailed);
-                } else {
-                    charge_point_->on_firmware_update_status_notification(
-                        -1, ocpp::FirmwareStatusNotification::DownloadFailed);
+                if (!maintenance_manager_) {
+                    return ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
                 }
-                return status;
+                return maintenance_manager_->handle_signed_update_firmware(msg);
             } catch (const std::exception& e) {
                 EVLOG_error << "Signed firmware update failed: " << e.what();
-                charge_point_->on_firmware_update_status_notification(
-                    -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                if (charge_point_) {
+                    charge_point_->on_firmware_update_status_notification(
+                        -1, ocpp::FirmwareStatusNotification::InstallationFailed);
+                }
                 return ocpp::v16::UpdateFirmwareStatusEnumType::Rejected;
             }
         });
@@ -1452,6 +1285,101 @@ void OcppAdapter::register_callbacks() {
         [](const std::string& type, const std::string& tech_info) {
             EVLOG_warning << "Security event: " << type << " details=" << tech_info;
         });
+}
+
+bool OcppAdapter::handle_enable_evse(std::int32_t connector) {
+    if (connector == 0) {
+        bool ok = true;
+        for (const auto& c : cfg_.connectors) {
+            ok = handle_enable_evse(c.id) && ok;
+        }
+        return ok;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        evse_disabled_[connector] = false;
+    }
+    const bool ok = hardware_->enable(connector);
+    if (!ok) {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        evse_disabled_[connector] = true;
+    }
+    return ok;
+}
+
+bool OcppAdapter::handle_disable_evse(std::int32_t connector) {
+    if (connector == 0) {
+        bool ok = true;
+        for (const auto& c : cfg_.connectors) {
+            ok = handle_disable_evse(c.id) && ok;
+        }
+        return ok;
+    }
+
+    bool had_session = false;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        had_session = sessions_.count(connector) > 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        evse_disabled_[connector] = true;
+    }
+    if (had_session) {
+        finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
+    }
+    return hardware_->disable(connector);
+}
+
+bool OcppAdapter::handle_pause_charging(std::int32_t connector) {
+    if (connector == 0) {
+        for (const auto& c : cfg_.connectors) {
+            (void)handle_pause_charging(c.id);
+        }
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    paused_evse_[connector] = true;
+    return true;
+}
+
+bool OcppAdapter::handle_resume_charging(std::int32_t connector) {
+    if (connector == 0) {
+        for (const auto& c : cfg_.connectors) {
+            (void)handle_resume_charging(c.id);
+        }
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    paused_evse_[connector] = false;
+    return true;
+}
+
+bool OcppAdapter::handle_stop_transaction(std::int32_t connector, ocpp::v16::Reason reason) {
+    if (connector == 0) {
+        bool ok = true;
+        for (const auto& c : cfg_.connectors) {
+            ok = handle_stop_transaction(c.id, reason) && ok;
+        }
+        return ok;
+    }
+
+    const bool ok = hardware_->stop_transaction(connector, reason);
+    if (ok) {
+        const auto status = sanitize_status(hardware_->get_status(connector), cfg_.lab_bypass);
+        const bool cp_known = status.cp_state != 'U';
+        const bool vehicle_present =
+            status.plugged_in || (cp_known && status.cp_state != 'A' && status.cp_state != 'U');
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            post_stop_plugged_[connector] = vehicle_present;
+            post_stop_time_[connector] =
+                vehicle_present ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        }
+        finish_transaction(connector, reason, std::nullopt, vehicle_present);
+    }
+    return ok;
 }
 
 void OcppAdapter::start_metering_threads() {

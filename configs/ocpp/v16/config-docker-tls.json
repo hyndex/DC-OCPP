@@ -30,7 +30,7 @@
         "UnlockConnectorOnEVSideDisconnect": true
     },
     "FirmwareManagement": {
-        "SupportedFileTransferProtocols": "FTP"
+        "SupportedFileTransferProtocols": "FTP,FTPS,HTTP,HTTPS"
     },
     "Security": {
         "AuthorizationKey": "AABBCCDDEEFFGGHH",
@@ -46,11 +46,6 @@
         "ChargingScheduleAllowedChargingRateUnit": "Current",
         "ChargingScheduleMaxPeriods": 42,
         "MaxChargingProfilesInstalled": 42
-    },
-    "PnC": {
-        "ISO15118CertificateManagementEnabled": true,
-        "ISO15118PnCEnabled": true,
-        "ContractValidationOffline": true
     },
     "Custom": {
         "ExampleConfigurationKey": "example"

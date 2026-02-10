@@ -34,7 +34,7 @@
         "WebSocketPingInterval": 10
     },
     "FirmwareManagement": {
-        "SupportedFileTransferProtocols": "FTP"
+        "SupportedFileTransferProtocols": "FTP,FTPS,HTTP,HTTPS"
     },
     "Security": {
         "CpoName": "Pionix",
@@ -51,11 +51,6 @@
         "ChargingScheduleAllowedChargingRateUnit": "Current,Power",
         "ChargingScheduleMaxPeriods": 42,
         "MaxChargingProfilesInstalled": 42
-    },
-    "PnC": {
-        "ISO15118CertificateManagementEnabled": true,
-        "ISO15118PnCEnabled": true,
-        "ContractValidationOffline": true
     },
     "CostAndPrice": {
         "CustomDisplayCostAndPrice": false

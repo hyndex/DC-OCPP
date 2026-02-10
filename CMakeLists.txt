@@ -398,6 +398,7 @@ if(TARGET everest_log OR TARGET everest-log)
 endif()
 
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # Keep libocpp lean for this build
 set(LIBOCPP_ENABLE_V16 ON CACHE BOOL "" FORCE)
@@ -431,6 +432,8 @@ endif()
 add_executable(dc_ocpp
   src/main.cpp
   src/charger_config.cpp
+  src/evse_security_file.cpp
+  src/maintenance_manager.cpp
   src/ocpp_adapter.cpp
   src/plc_can.cpp
   src/power_module_controller.cpp
@@ -492,6 +495,8 @@ set(_OCPP_APP_LIBS
   everest::ocpp
   date::date-tz
   CURL::libcurl
+  OpenSSL::SSL
+  OpenSSL::Crypto
   ${_JSON_SCHEMA_DEP}
   ${_EVEREST_SQLITE_DEP}
   sqlite3
@@ -504,6 +509,10 @@ set(_OCPP_APP_LIBS
 )
 
 target_link_libraries(dc_ocpp PRIVATE ${_OCPP_APP_LIBS})
+
+if(BUILD_TESTING)
+  enable_testing()
+endif()
 
 if(BUILD_APP_TESTS)
   add_executable(power_manager_tests
@@ -527,6 +536,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(auth_flow_tests PRIVATE include libocpp/include tests)
@@ -538,6 +549,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(deterministic_vectors_tests PRIVATE include libocpp/include tests)
@@ -549,6 +562,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(pending_token_persistence_tests PRIVATE include libocpp/include tests)
@@ -560,6 +575,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(derate_fault_tests PRIVATE include libocpp/include)
@@ -571,6 +588,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(limit_fallback_tests PRIVATE include libocpp/include tests)
@@ -582,17 +601,60 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(status_transition_tests PRIVATE include libocpp/include tests)
   target_link_libraries(status_transition_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(status_transition_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(charge_complete_finishing_available_tests
+    tests/charge_complete_finishing_available_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(charge_complete_finishing_available_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(charge_complete_finishing_available_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(charge_complete_finishing_available_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(connector_zero_availability_tests
+    tests/connector_zero_availability_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(connector_zero_availability_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(connector_zero_availability_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(connector_zero_availability_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(replay_trace_tests
+    tests/replay_trace_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(replay_trace_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(replay_trace_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(replay_trace_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(post_stop_release_tests
     tests/post_stop_release_tests.cpp
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(post_stop_release_tests PRIVATE include libocpp/include tests)
@@ -610,6 +672,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(gc_close_gating_tests PRIVATE include libocpp/include tests)
@@ -621,6 +685,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(gc_precharge_no_timeout_tests PRIVATE include libocpp/include tests)
@@ -632,6 +698,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(precharge_current_clamp_tests PRIVATE include libocpp/include tests)
@@ -643,6 +711,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(unlock_voltage_gate_tests PRIVATE include libocpp/include tests)
@@ -654,6 +724,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(cable_check_no_hv_tests PRIVATE include libocpp/include tests)
@@ -665,6 +737,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(post_precharge_hold_tests PRIVATE include libocpp/include tests)
@@ -676,6 +750,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(power_delivery_stall_tests PRIVATE include libocpp/include tests)
@@ -687,6 +763,8 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(hlc_fallback_tests PRIVATE include libocpp/include tests)
@@ -715,11 +793,28 @@ if(BUILD_APP_TESTS)
   target_link_libraries(charger_config_tests PRIVATE nlohmann_json::nlohmann_json)
   target_compile_definitions(charger_config_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(evse_security_file_tests
+    tests/evse_security_file_tests.cpp
+    src/evse_security_file.cpp
+  )
+  target_include_directories(evse_security_file_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(evse_security_file_tests PRIVATE ${_OCPP_APP_LIBS})
+
+  add_executable(maintenance_manager_tests
+    tests/maintenance_manager_tests.cpp
+    src/maintenance_manager.cpp
+    src/evse_security_file.cpp
+  )
+  target_include_directories(maintenance_manager_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(maintenance_manager_tests PRIVATE ${_OCPP_APP_LIBS})
+
   add_executable(two_car_split_charging_sim_tests
     tests/two_car_split_charging_sim_tests.cpp
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(two_car_split_charging_sim_tests PRIVATE include libocpp/include tests)
@@ -731,10 +826,74 @@ if(BUILD_APP_TESTS)
     src/ocpp_adapter.cpp
     src/power_manager.cpp
     src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
     src/power_module_controller.cpp
   )
   target_include_directories(precharge_default_module_policy_sim_tests PRIVATE include libocpp/include tests)
   target_link_libraries(precharge_default_module_policy_sim_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(precharge_default_module_policy_sim_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_test(NAME power_manager_tests COMMAND power_manager_tests)
+  add_test(NAME power_manager_invariants_tests COMMAND power_manager_invariants_tests)
+  add_test(NAME auth_flow_tests COMMAND auth_flow_tests)
+  add_test(NAME deterministic_vectors_tests COMMAND deterministic_vectors_tests)
+  add_test(NAME pending_token_persistence_tests COMMAND pending_token_persistence_tests)
+  add_test(NAME derate_fault_tests COMMAND derate_fault_tests)
+  add_test(NAME limit_fallback_tests COMMAND limit_fallback_tests)
+  add_test(NAME status_transition_tests COMMAND status_transition_tests)
+  add_test(NAME charge_complete_finishing_available_tests COMMAND charge_complete_finishing_available_tests)
+  add_test(NAME connector_zero_availability_tests COMMAND connector_zero_availability_tests)
+  add_test(NAME replay_trace_tests COMMAND replay_trace_tests)
+  add_test(NAME post_stop_release_tests COMMAND post_stop_release_tests)
+  add_test(NAME error_catalog_tests COMMAND error_catalog_tests)
+  add_test(NAME gc_close_gating_tests COMMAND gc_close_gating_tests)
+  add_test(NAME gc_precharge_no_timeout_tests COMMAND gc_precharge_no_timeout_tests)
+  add_test(NAME precharge_current_clamp_tests COMMAND precharge_current_clamp_tests)
+  add_test(NAME unlock_voltage_gate_tests COMMAND unlock_voltage_gate_tests)
+  add_test(NAME cable_check_no_hv_tests COMMAND cable_check_no_hv_tests)
+  add_test(NAME post_precharge_hold_tests COMMAND post_precharge_hold_tests)
+  add_test(NAME power_delivery_stall_tests COMMAND power_delivery_stall_tests)
+  add_test(NAME hlc_fallback_tests COMMAND hlc_fallback_tests)
+  add_test(NAME island_manager_tests COMMAND island_manager_tests)
+  add_test(NAME tie_gating_tests COMMAND tie_gating_tests)
+  add_test(NAME charger_config_tests COMMAND charger_config_tests)
+  add_test(NAME evse_security_file_tests COMMAND evse_security_file_tests)
+  add_test(NAME maintenance_manager_tests COMMAND maintenance_manager_tests)
+  add_test(NAME two_car_split_charging_sim_tests COMMAND two_car_split_charging_sim_tests)
+  add_test(NAME precharge_default_module_policy_sim_tests COMMAND precharge_default_module_policy_sim_tests)
+
+  add_custom_target(check
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS
+      power_manager_tests
+      power_manager_invariants_tests
+      auth_flow_tests
+      deterministic_vectors_tests
+      pending_token_persistence_tests
+      derate_fault_tests
+      limit_fallback_tests
+      status_transition_tests
+      charge_complete_finishing_available_tests
+      connector_zero_availability_tests
+      replay_trace_tests
+      post_stop_release_tests
+      error_catalog_tests
+      gc_close_gating_tests
+      gc_precharge_no_timeout_tests
+      precharge_current_clamp_tests
+      unlock_voltage_gate_tests
+      cable_check_no_hv_tests
+      post_precharge_hold_tests
+      power_delivery_stall_tests
+      hlc_fallback_tests
+      island_manager_tests
+      tie_gating_tests
+      charger_config_tests
+      evse_security_file_tests
+      maintenance_manager_tests
+      two_car_split_charging_sim_tests
+      precharge_default_module_policy_sim_tests
+  )
 
 endif()

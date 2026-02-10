@@ -36,7 +36,7 @@ This document captures the production contract between the PLC firmware (ISO/DIN
 
 ## Ownership rules
 
-- **Gun contactor (GC) ownership is PLC-only when `plc.gunRelayOwnedByPlc=true` (default).**
+- **Gun contactor (GC) ownership is PLC-only when `plc.gunRelayOwnedByPlc=true` (default: false).**
   - Controller will not set GC bits in EVSE_FAST_V2 when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
 - Auxiliary relays (RLY2/RLY3) are used as KM_A/KM_B bus sectionalizers when `plc.moduleRelaysEnabled=true`

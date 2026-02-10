@@ -78,6 +78,15 @@ struct SecurityConfig {
     fs::path secc_key_dir;
 };
 
+struct FirmwareUpdateConfig {
+    bool enabled{false};
+    bool allow_unsigned{false};
+    fs::path staging_dir;
+    std::string systemd_service_name;
+    fs::path target_binary_path;
+    int max_wait_seconds{900};
+};
+
 struct ChargerConfig {
     std::string charge_point_id;
     std::string vendor;
@@ -159,6 +168,7 @@ struct ChargerConfig {
     fs::path logging_config;
 
     SecurityConfig security;
+    FirmwareUpdateConfig firmware_update;
     int meter_sample_interval_s{30};
     std::vector<ConnectorConfig> connectors;
     std::vector<SlotMapping> slots; // optional explicit topology map for ring/modules

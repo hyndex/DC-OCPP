@@ -339,6 +339,19 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.message_log_path = make_absolute(base_dir, json.value("messageLogPath", "logs"));
     cfg.logging_config = make_absolute(base_dir, json.value("loggingConfig", "libocpp/config/logging.ini"));
 
+    const auto fw_update = json.value("firmwareUpdate", nlohmann::json::object());
+    cfg.firmware_update.enabled = fw_update.value("enabled", cfg.firmware_update.enabled);
+    cfg.firmware_update.allow_unsigned = fw_update.value("allowUnsigned", cfg.firmware_update.allow_unsigned);
+    cfg.firmware_update.staging_dir = make_absolute(base_dir, fw_update.value("stagingDir", "data/fw"));
+    cfg.firmware_update.systemd_service_name = fw_update.value("systemdServiceName", "");
+    const auto target_bin = fw_update.value("targetBinaryPath", "");
+    cfg.firmware_update.target_binary_path =
+        target_bin.empty() ? fs::path{} : make_absolute(base_dir, target_bin);
+    cfg.firmware_update.max_wait_seconds = fw_update.value("maxWaitSeconds", cfg.firmware_update.max_wait_seconds);
+    if (cfg.firmware_update.max_wait_seconds <= 0) {
+        cfg.firmware_update.max_wait_seconds = 900;
+    }
+
     cfg.meter_sample_interval_s = json.value("meterSampleIntervalSeconds", cfg.meter_sample_interval_s);
     cfg.meter_keepalive_s = json.value("meterKeepAliveSeconds", cfg.meter_keepalive_s);
     cfg.minimum_status_duration_s = json.value("minimumStatusDurationSeconds", cfg.minimum_status_duration_s);
@@ -640,6 +653,9 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     fs::create_directories(cfg.database_dir);
     fs::create_directories(cfg.message_log_path);
+    if (cfg.firmware_update.enabled && !cfg.firmware_update.staging_dir.empty()) {
+        fs::create_directories(cfg.firmware_update.staging_dir);
+    }
     fs::create_directories(cfg.security.client_cert_dir);
     fs::create_directories(cfg.security.client_key_dir);
     fs::create_directories(cfg.security.secc_cert_dir);

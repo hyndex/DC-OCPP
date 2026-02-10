@@ -845,14 +845,19 @@ Integration with OCPP:
 
 ### 12.1 Current limitations (by design choice)
 
-* At this stage, each gun uses **only its own slot’s modules** (1 or 2), not cross‑slot.
-* Each island is effectively a **single‑slot island** around the gun.
-* Dynamic mid‑session re‑partitioning across slots is not implemented (keeps EV current stable and logic simple).
+* **Max modules per gun** is capped by config (`maxModulesPerGun`, default 2) and by the physical topology (KM_A/KM_B
+  sectionalizers + module contactors). Larger islands are possible only if the hardware provides additional tie points.
+* **Cross-slot module sharing is implemented** (when enabled by config and topology). A gun may temporarily use
+  neighbor-slot modules by forming a single island via tie contactors.
+* **Dynamic mid-session re-partitioning is implemented**, but it is always performed through a switching gate:
+  the controller ramps current down to `<= switchMaxCurrentA` for `switchStableTimeMs` before opening/closing
+  island boundaries. This avoids opening contactors under load.
+* **Precharge policy:** during explicit CCS PreCharge (HLC stage 8 / `precharge_active=true`), only the gun's
+  home/default module is energized; boost modules are only added after PowerDelivery is granted.
 
 ### 12.2 Future extensions (same architecture)
 
 * Allow a gun to get **more than 2 modules** by extending its island to neighbor slots (using MCs and MNs).
-* Implement **dynamic re‑partitioning** of islands mid‑session (with controlled shut‑down, re‑segmentation, and restart).
 * Add **thermal‑aware allocation** (move modules between guns based on module temperatures).
 * Integrate with site EMS for **price‑based priority** or grid support.
 
@@ -867,7 +872,7 @@ I’ll assume the **latest design** we converged on:
 * 12 guns, 12 slots on a ring.
 * 2 modules per slot, each with its own MN contactor.
 * Min 0, max 2 modules per gun.
-* For now, each gun only uses **its own modules** (no cross‑slot sharing), but the ring (MC) remains available for isolation / future expansion.
+* Cross-slot islands are supported when enabled (tie contactors allow a gun to temporarily use modules from neighbor slots).
 
 ---
 

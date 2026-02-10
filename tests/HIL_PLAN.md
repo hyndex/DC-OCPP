@@ -2,7 +2,11 @@
 
 ## Preconditions
 - Dual-gun PLC with CAN interface configured per `Ref/Basic/docs/CAN_DBC.dbc`
-- Safety loop, lock feedback, contactor feedback wired
+- Safety loop and lock feedback wired
+- Contactor/relay feedback wiring is optional:
+  - If `plc.relayFeedbackAvailable=true`, HIL can validate "commanded OPEN but feedback CLOSED" weld scenarios.
+  - If `plc.relayFeedbackAvailable=false` (telemetry-only), HIL validates weld/backfeed using voltage/current
+    sanity checks (e.g., "commanded OPEN but V_out remains high / current does not collapse").
 - Ability to inject estop, earth fault, isolation fault, weld faults
 - ISO15118 EV simulator with SLAC
 
@@ -40,8 +44,12 @@
    - Expect: immediate stop, correct OCPP error mapping, no restart until clear
 
 8. **Weld detection**
-   - Simulate GC/MN weld (command open, feedback closed)
-   - Expect: session stop, Faulted, require manual clear
+   - With relay feedback available:
+     - Simulate GC/MN weld (command open, feedback closed)
+     - Expect: session stop, Faulted, require manual clear
+   - Telemetry-only mode:
+     - Force "stuck output" behavior (V_out does not decay after OPEN + discharge)
+     - Expect: session stop, keep locked, fault requires manual service action
 
 9. **Meter stale fallback**
    - Block meter frames; verify fallback energy calculation active, then restored on meter recovery

@@ -32,5 +32,10 @@ Monitoring
 
 Post-run validation
 -------------------
-- Run `configs/charger.json` diagnostics upload via CSMS and verify bundle reaches the target.
-- Inspect `logs/` bundle for any repeated timeouts or retries; investigate anomalies before release.
+- Trigger an OCPP `GetDiagnostics` (and optionally `GetLog`) via the CSMS and verify:
+  - Charger responds `Accepted` immediately (non-blocking handler).
+  - Status notifications progress `Uploading -> Uploaded` (or `UploadFailed` with a clear reason).
+  - The uploaded bundle excludes secrets (no `*.pem`, `*.key`, or cert directories).
+- Optional (maintenance validation): trigger `SignedUpdateFirmware` using a test artifact and verify
+  notifications progress `Downloading -> Downloaded -> Installing -> Installed`, followed by a clean restart.
+- Inspect the uploaded bundle for repeated timeouts/retries; investigate anomalies before release.

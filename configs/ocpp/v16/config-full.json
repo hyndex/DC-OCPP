@@ -112,7 +112,7 @@
         "MaxChargingProfilesInstalled": 1000
     },
     "FirmwareManagement": {
-        "SupportedFileTransferProtocols": "FTP"
+        "SupportedFileTransferProtocols": "FTP,FTPS,HTTP,HTTPS"
     },
     "Reservation": {
         "ReserveConnectorZeroSupported": false
@@ -125,14 +125,6 @@
         "CpoName": "Pionix",
         "SecurityProfile": 1,
         "DisableSecurityEventNotifications": false
-    },
-    "PnC": {
-        "ISO15118CertificateManagementEnabled": true,
-        "ISO15118PnCEnabled": true,
-        "CentralContractValidationAllowed": true,
-        "CertSigningWaitMinimum": 30,
-        "CertSigningRepeatTimes": 2,
-        "ContractValidationOffline": true
     },
     "CostAndPrice": {
         "CustomDisplayCostAndPrice": true,
