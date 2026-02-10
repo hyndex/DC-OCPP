@@ -14,7 +14,6 @@
       "toolchainFile": "${sourceDir}/cmake/toolchains/raspberrypi.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "BUILD_CONFIG_WEB_UI": "OFF",
         "LIBOCPP_ENABLE_V2": "OFF",
         "LIBOCPP_ENABLE_V16": "ON",
         "LIBOCPP_BUILD_TESTING": "OFF",

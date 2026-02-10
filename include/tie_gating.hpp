@@ -33,9 +33,20 @@ inline ContactorState gate_tie_switch(const std::string& id,
     }
 
     const bool have_telem = side_a.complete && side_b.complete;
-    const bool current_ok = have_telem &&
-        (std::fabs(side_a.current_a) < switch_i_thresh) &&
-        (std::fabs(side_b.current_a) < switch_i_thresh);
+    bool current_ok = false;
+    if (have_telem) {
+        const bool ia_ok = std::fabs(side_a.current_a) < switch_i_thresh;
+        const bool ib_ok = std::fabs(side_b.current_a) < switch_i_thresh;
+        if (desired == ContactorState::Closed && prev == ContactorState::Open) {
+            // Closing a tie into an already-loaded island can be safe as long as the voltages match
+            // and at least one side is "quiet" (e.g., the island being merged has no load yet).
+            // This allows module boosting without forcing the active gun to ramp to ~0A first.
+            current_ok = ia_ok || ib_ok;
+        } else {
+            // Opening (or other transitions) remains conservative: require both sides to be quiet.
+            current_ok = ia_ok && ib_ok;
+        }
+    }
     bool dv_ok = true;
     if (desired == ContactorState::Closed && prev == ContactorState::Open) {
         dv_ok = have_telem && (std::fabs(side_a.voltage_v - side_b.voltage_v) <= max_dv_v);

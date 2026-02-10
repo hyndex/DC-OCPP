@@ -85,7 +85,8 @@ inline ErrorDescriptor global_fault_descriptor(const std::string& reason) {
 inline ocpp::v16::ChargePointErrorCode local_fault_error_code(const std::string& reason) {
     if (reason == "GCWelded" || reason == "MCWelded" ||
         reason == "GCOpenTimeout" || reason == "GCCloseTimeout" ||
-        reason == "MCOpenTimeout" || reason == "PowerDeliveryStalled") {
+        reason == "MCOpenTimeout" || reason == "PowerDeliveryStalled" ||
+        reason == "StuckVoltage" || reason == "StuckCurrent") {
         return ocpp::v16::ChargePointErrorCode::PowerSwitchFailure;
     }
     if (reason == "Isolation") {

@@ -31,12 +31,17 @@
 - [x] Gate single-gun full-island to only when all modules are needed and no reserved slots
 - [x] Fix priority weighting/downgrade ordering to favor lower numeric priority
 - [x] Apply hysteresis only on module drops when previous modules remain available
+- [x] Fix tie-gating for telemetry-less pass-through islands (mirror telemetry from either side) so ties can close/open
+- [x] Relax tie-close current gating to allow boosting into a loaded island when the other side is quiet (precharge/warmup island)
+- [x] Allow planner to open pass-through MC boundaries (do not force pass-through slots Closed) so multi-gun splits can form
 
 ## Stage 7 - Coverage and documentation
 - [x] Refresh power_manager tests for new single-gun behavior and hysteresis
 - [x] Add tests for ceil allocation, reserved-slot blocking, priority-driven allocation
 - [x] Update split-charging design doc to match priority weighting and ceil sizing
-- [ ] Add integration/soak coverage for multi-gun contention rebalancing (if required)
+- [x] Add end-to-end simulation coverage for 2-gun contention rebalancing (single EV gets 2 modules -> split 1+1 on second EV)
+- [x] Add end-to-end simulation coverage for default-module precharge policy (precharge uses home module only; boost module added only in power phase)
+- [ ] Add integration/soak coverage for multi-gun contention rebalancing (HIL/soak, real PLC timing)
 
 ## Stage 8 - Validation
 - [x] Run `tests/power_manager_tests` (and other affected unit tests)
@@ -68,3 +73,24 @@
 - [x] Build + run impacted unit tests (auth_flow, pending_token_persistence, power_manager)
 - [ ] Validate OCPP status sequence for charge complete -> Finishing -> Available
 - [ ] Verify connectorId=0 ChangeAvailability flows on multi-connector config
+
+## Stage 14 - CCS2 DC Control Recipe Alignment (EVSE-side)
+- [x] Align HLC phase detection: distinguish CableCheck vs PreCharge vs PowerDelivery (avoid treating all stage<9 as "precharge")
+- [x] Enforce PreCharge limits: clamp output current to <= 2 A during precharge; track EV requested V/I
+- [x] Clamp precharge planning budget to <= 2 A so extra modules are not allocated/energized during precharge
+- [x] Harden stop sequencing: prevent “held-closed” GC states from continuing to allow current (force 0A via planner gating + PLC open-guard)
+- [x] Enforce unlock safety: block UnlockConnector unless V_out < 60 V (fail-safe on missing telemetry)
+- [x] Implement telemetry sanity checks for stuck/weld/backfeed using available V/I measurements (no aux feedback)
+- [x] Implement CP-lost / hot-unplug emergency shutdown targets (<5 A in 30 ms, <60 V in 100 ms) where feasible
+- [x] Update configs/docs to reflect CCS thresholds (20 V precharge tolerance, 2 A precharge current, 1 A stop, 60 V unlock)
+- [x] Remove unsafe “lab bypass” behavior from default control path; keep behind `controller.labBypass`
+- [x] Respect `connectors[].meterSource` when choosing present V/I vs module telemetry for planning and switching gates
+
+## Stage 15 - Tests
+- [x] Add unit test: precharge current clamp applies even if EV requests >2 A
+- [x] Add unit test: unlock blocked when voltage >= 60 V
+- [x] Add regression test(s): CableCheck stage must not energize modules/raise HV setpoints
+
+## Stage 16 - Validation
+- [x] Run full unit test suite (`ctest` or individual binaries) and fix regressions
+- [ ] Spot-check with representative logs/HIL: CableCheck -> PreCharge -> PowerDelivery -> CurrentDemand -> Stop -> Unlock

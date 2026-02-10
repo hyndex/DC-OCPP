@@ -1448,6 +1448,8 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
 	    gs.safety_ok = !safety_trip;
 	    gs.estop = estop_trip;
 	    gs.earth_fault = earth_trip;
+        // Map earth/IMD faults into the higher-level isolation fault used by the controller/PLC contract.
+        gs.isolation_fault = earth_trip;
     if (relay_feedback) {
         gs.relay_closed = st.last_relay.relay[0];
     } else if (cfg_.plc_owns_gun_relay) {
@@ -1586,14 +1588,15 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.module_healthy_mask = 0x03;
     gs.module_fault_mask = 0x00;
     gs.hlc_stage = hlc_fresh ? st.hlc_stage : 0;
-    gs.hlc_cable_check_ok = true;
+    // `cable_checked` comes from the PLC HLC state machine. Treat it as "ok" when completed.
+    gs.hlc_cable_check_ok = chargeinfo_fresh ? st.hlc_cable_checked : false;
     const bool precharge_from_stage =
-        chargeinfo_fresh && st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete;
+        chargeinfo_fresh && st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) && !st.hlc_charge_complete;
     gs.hlc_precharge_active =
         chargeinfo_fresh ? (st.hlc_precharge_active || precharge_from_stage) : false;
     gs.hlc_charge_complete = chargeinfo_fresh ? st.hlc_charge_complete : false;
-    const bool hlc_ready = hlc_fresh && st.hlc_stage >= 9 &&
-                           !gs.hlc_precharge_active && !gs.hlc_charge_complete;
+    // Treat stage >= POWER_DELIVERY as power-ready even if `precharge_active` is stuck high.
+    const bool hlc_ready = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !gs.hlc_charge_complete;
     gs.hlc_power_ready = hlc_ready;
     if (relay_feedback && st.last_relay_rx.time_since_epoch().count() != 0 &&
         st.last_safety_rx.time_since_epoch().count() != 0) {
@@ -1704,6 +1707,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.comm_fault = false;
         gs.safety_ok = true;
         gs.earth_fault = false;
+        gs.isolation_fault = false;
         gs.cp_fault = false;
     }
     gs.plc_state_seq = st.last_plc_state_seq;
@@ -1786,10 +1790,13 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
             st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
                 telemetry_timeout_ms_;
-        const bool hlc_precharge_phase =
+        // Treat only the explicit PRECHARGE stage (kHlcMinPowerStage-1) as "precharge".
+        // CableCheck and earlier stages must not energize DC relays/contactors.
+        const bool precharge_from_stage =
             hlc_fresh &&
-            (st.hlc_precharge_active ||
-             (st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete));
+            st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
+            !st.hlc_charge_complete;
+        const bool hlc_precharge_phase = hlc_fresh && (st.hlc_precharge_active || precharge_from_stage);
         const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
         const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
         if (hlc_active) {
@@ -1885,10 +1892,13 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
             st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
                 telemetry_timeout_ms_;
-        const bool hlc_precharge_phase =
+        // Treat only the explicit PRECHARGE stage (kHlcMinPowerStage-1) as "precharge".
+        // CableCheck and earlier stages must not energize DC relays/contactors.
+        const bool precharge_from_stage =
             hlc_fresh &&
-            (st.hlc_precharge_active ||
-             (st.hlc_stage > 0 && st.hlc_stage < kHlcMinPowerStage && !st.hlc_charge_complete));
+            st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
+            !st.hlc_charge_complete;
+        const bool hlc_precharge_phase = hlc_fresh && (st.hlc_precharge_active || precharge_from_stage);
         const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
         const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
         if (hlc_active) {

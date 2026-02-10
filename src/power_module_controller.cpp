@@ -270,6 +270,57 @@ protected:
     ModuleTelemetryState telemetry_{};
 };
 
+// Simulation driver: provides "fresh" telemetry without CAN I/O.
+//
+// This is used by unit tests and dev builds where SocketCAN/real modules are not present.
+// It intentionally models a healthy module with telemetry derived from the last setpoint.
+class SimulatedModuleDriver : public ModuleDriver {
+public:
+    explicit SimulatedModuleDriver(const ModuleSpec& spec) : ModuleDriver(spec) {
+        const auto now = std::chrono::steady_clock::now();
+        const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                : 0x00;
+        telemetry_.healthy = true;
+        telemetry_.fault = false;
+        telemetry_.temperature_c = 25.0;
+        telemetry_.voltage_v = 0.0;
+        telemetry_.current_a = 0.0;
+        telemetry_.current_limit_point = 0.0;
+        telemetry_.alarms = 0;
+        telemetry_.healthy_mask = bit;
+        telemetry_.fault_mask = 0;
+        telemetry_.last_update = now;
+        telemetry_.reported_group = static_cast<uint16_t>(std::max(0, spec_.group));
+        telemetry_.reported_address = static_cast<uint16_t>(std::max(0, spec_.address));
+        telemetry_.input_mode = static_cast<uint32_t>(std::max(0, spec_.input_mode));
+    }
+
+    void apply(const ModuleSetpoint& sp) override {
+        desired_ = sp;
+        const auto now = std::chrono::steady_clock::now();
+        const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                : 0x00;
+        telemetry_.healthy = true;
+        telemetry_.fault = false;
+        telemetry_.healthy_mask = bit;
+        telemetry_.fault_mask = 0;
+        telemetry_.voltage_v = sp.enable ? std::max(0.0, sp.voltage_v) : 0.0;
+        telemetry_.current_a = sp.enable ? std::max(0.0, sp.current_a) : 0.0;
+        telemetry_.current_limit_point = telemetry_.current_a;
+        telemetry_.last_update = now;
+    }
+
+    void poll() override {
+        // Keep telemetry fresh even if setpoints are not changing.
+        telemetry_.last_update = std::chrono::steady_clock::now();
+    }
+
+private:
+    ModuleSetpoint desired_{};
+};
+
 class MaxwellModuleDriver : public ModuleDriver {
 public:
     MaxwellModuleDriver(const ModuleSpec& spec, std::shared_ptr<CanChannel> channel) :
@@ -1166,7 +1217,14 @@ public:
             if (spec.type.empty()) {
                 continue;
             }
-            if (spec.address < 0) {
+
+            std::string type_lower = spec.type;
+            std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            spec.type = type_lower;
+
+            const bool address_required = !(spec.type == "sim" || spec.type == "simulated");
+            if (address_required && spec.address < 0) {
                 EVLOG_warning << "Skipping module " << spec.id << " (slot " << spec.slot_id
                               << ") because no address was provided";
                 continue;
@@ -1176,13 +1234,13 @@ public:
                               << ") because slot_index is invalid (" << spec.slot_index << ")";
                 continue;
             }
-            std::string type_lower = spec.type;
-            std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            spec.type = type_lower;
+
             // Use a dedicated SocketCAN channel per module to avoid receive-drain races between drivers.
             // (Each socket will still see the bus, but they don't steal frames from each other.)
-            auto chan = std::make_shared<CanChannel>(spec.can_interface, filter_for_type(spec));
+            std::shared_ptr<CanChannel> chan;
+            if (!(spec.type == "sim" || spec.type == "simulated")) {
+                chan = std::make_shared<CanChannel>(spec.can_interface, filter_for_type(spec));
+            }
             ModuleRuntime rt;
             rt.spec = spec;
             rt.driver = make_driver(spec, chan);
@@ -1325,6 +1383,9 @@ private:
 
     static std::unique_ptr<ModuleDriver> make_driver(const ModuleSpec& spec,
                                                      const std::shared_ptr<CanChannel>& channel) {
+        if (spec.type == "sim" || spec.type == "simulated") {
+            return std::make_unique<SimulatedModuleDriver>(spec);
+        }
         if (spec.type == "maxwell-mxr" || spec.type == "maxwell" || spec.type == "maxwell-max") {
             return std::make_unique<MaxwellModuleDriver>(spec, channel);
         }

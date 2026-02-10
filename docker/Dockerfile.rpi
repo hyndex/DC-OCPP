@@ -2,7 +2,6 @@
 ARG DEBIAN_FRONTEND=noninteractive
 
 FROM --platform=$TARGETPLATFORM debian:12-slim AS base
-ARG BUILD_CONFIG_WEB_UI=OFF
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -26,13 +25,7 @@ RUN apt-get update && \
       libboost-filesystem-dev \
       libboost-date-time-dev \
       libboost-program-options-dev \
-      libwebsockets-dev && \
-    if [ "${BUILD_CONFIG_WEB_UI}" = "ON" ]; then \
-      apt-get install -y --no-install-recommends \
-        libgtk-3-dev \
-        libwebkit2gtk-4.0-dev \
-        libavahi-compat-libdnssd-dev; \
-    fi && \
+    libwebsockets-dev && \
     rm -rf /var/lib/apt/lists/*
 
 FROM base AS builder
@@ -40,12 +33,10 @@ WORKDIR /src
 COPY . .
 
 ARG BUILD_TYPE=Release
-ARG BUILD_CONFIG_WEB_UI=OFF
 ARG EXTRA_CMAKE_FLAGS=""
 
 RUN cmake -S . -B /opt/build \
       -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
-      -DBUILD_CONFIG_WEB_UI=${BUILD_CONFIG_WEB_UI} \
       -DBUILD_APP_TESTS=OFF \
       -DLIBOCPP_ENABLE_V2=OFF \
       -DLIBOCPP_ENABLE_V16=ON \
@@ -57,11 +48,9 @@ RUN cmake --build /opt/build -j"$(nproc)"
 FROM builder AS artifacts
 RUN mkdir -p /artifacts/bin && \
     if [ -f /opt/build/dc_ocpp ]; then cp /opt/build/dc_ocpp /artifacts/bin/; fi && \
-    if [ -f /opt/build/config_webui ]; then cp /opt/build/config_webui /artifacts/bin/; fi && \
     mkdir -p /artifacts/share && \
     cp -r /src/configs /artifacts/share/configs && \
-    cp -r /src/data /artifacts/share/data && \
-    cp -r /src/webui /artifacts/share/webui
+    cp -r /src/data /artifacts/share/data
 
 FROM scratch AS export
 COPY --from=artifacts /artifacts /artifacts

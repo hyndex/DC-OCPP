@@ -262,6 +262,18 @@ if(TARGET everest_log)
   target_compile_options(everest_log PUBLIC -pthread)
   target_link_libraries(everest_log PUBLIC Threads::Threads)
   target_link_libraries(everest_log PUBLIC Boost::log_setup)
+  # liblog's CMake adds `rt dl` when FindBoost is used (Boost_DIR unset). On macOS
+  # there is no librt, and libdl is part of libSystem. Strip these to keep linking portable.
+  if(APPLE)
+    foreach(_prop INTERFACE_LINK_LIBRARIES LINK_LIBRARIES)
+      get_target_property(_libs everest_log ${_prop})
+      if(_libs AND NOT _libs STREQUAL "${_prop}-NOTFOUND")
+        list(REMOVE_ITEM _libs rt)
+        list(REMOVE_ITEM _libs dl)
+        set_target_properties(everest_log PROPERTIES ${_prop} "${_libs}")
+      endif()
+    endforeach()
+  endif()
   if(DEFINED Boost_INCLUDE_DIRS)
     target_include_directories(everest_log PUBLIC ${Boost_INCLUDE_DIRS})
   endif()
@@ -493,91 +505,6 @@ set(_OCPP_APP_LIBS
 
 target_link_libraries(dc_ocpp PRIVATE ${_OCPP_APP_LIBS})
 
-option(BUILD_CONFIG_WEB_UI "Build the webview-powered config editor" OFF)
-
-if(BUILD_CONFIG_WEB_UI)
-  set(_CAN_BUILD_WEBUI TRUE)
-  set(_WEBKIT_LIBS "")
-  set(_WEBKIT_INCLUDES "")
-  set(_USE_OBJCXX FALSE)
-  set(WEBKIT_FOUND FALSE)
-  set(GTK3_FOUND FALSE)
-  set(DNSSD_FOUND FALSE)
-
-  if(APPLE)
-    find_library(COCOA_FRAMEWORK Cocoa)
-    find_library(FOUNDATION_FRAMEWORK Foundation)
-    find_library(WEBKIT_FRAMEWORK WebKit)
-    if(COCOA_FRAMEWORK AND FOUNDATION_FRAMEWORK AND WEBKIT_FRAMEWORK)
-      list(APPEND _WEBKIT_LIBS ${COCOA_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${WEBKIT_FRAMEWORK})
-      set(_USE_OBJCXX TRUE)
-    else()
-      set(_CAN_BUILD_WEBUI FALSE)
-      message(WARNING "Config web UI disabled: WebKit/Cocoa frameworks not found")
-    endif()
-  elseif(UNIX)
-    find_package(PkgConfig)
-    if(PKG_CONFIG_FOUND)
-      set(_WEBKIT_PKGS webkit2gtk-4.1 webkit2gtk-4.0)
-      foreach(_pkg ${_WEBKIT_PKGS})
-        pkg_check_modules(WEBKIT QUIET ${_pkg})
-        if(WEBKIT_FOUND)
-          break()
-        endif()
-      endforeach()
-      pkg_check_modules(GTK3 QUIET gtk+-3.0)
-      if(WEBKIT_FOUND AND GTK3_FOUND)
-        list(APPEND _WEBKIT_INCLUDES ${WEBKIT_INCLUDE_DIRS} ${GTK3_INCLUDE_DIRS})
-        list(APPEND _WEBKIT_LIBS ${WEBKIT_LIBRARIES} ${GTK3_LIBRARIES})
-      else()
-        set(_CAN_BUILD_WEBUI FALSE)
-        message(WARNING "Config web UI disabled: webkit2gtk or gtk3 dev packages not found")
-      endif()
-    else()
-      set(_CAN_BUILD_WEBUI FALSE)
-      message(WARNING "Config web UI disabled: pkg-config not available")
-    endif()
-  elseif(WIN32)
-    list(APPEND _WEBKIT_LIBS ole32 version shlwapi)
-  endif()
-
-  find_path(DNSSD_INCLUDE_DIR dns_sd.h)
-  find_library(DNSSD_LIBRARY dns_sd)
-  if(DNSSD_INCLUDE_DIR AND DNSSD_LIBRARY)
-    set(DNSSD_FOUND TRUE)
-  endif()
-
-  if(_CAN_BUILD_WEBUI)
-    if(APPLE AND _USE_OBJCXX)
-      enable_language(OBJCXX)
-    endif()
-    add_executable(config_webui
-      src/config_webui.cpp
-      src/charger_config.cpp
-    )
-    target_include_directories(config_webui PRIVATE include third_party/webview/include third_party third_party/webview ${_WEBKIT_INCLUDES} ${DNSSD_INCLUDE_DIR})
-    target_link_libraries(config_webui PRIVATE Threads::Threads ${_WEBKIT_LIBS} nlohmann_json::nlohmann_json)
-    if(DNSSD_FOUND)
-      target_link_libraries(config_webui PRIVATE ${DNSSD_LIBRARY})
-      target_compile_definitions(config_webui PRIVATE HAVE_DNSSD)
-    else()
-      message(WARNING "mDNS (dns_sd.h) not found; --mdns disabled")
-    endif()
-    if(WIN32)
-      target_link_libraries(config_webui PRIVATE ws2_32)
-    endif()
-    target_compile_definitions(config_webui PRIVATE
-      CONFIG_WEBUI_ASSET_DIR="${CMAKE_SOURCE_DIR}/webui"
-      CONFIG_WEBUI_DEFAULT_CONFIG="${CMAKE_SOURCE_DIR}/configs/charger.json"
-    )
-    if(APPLE AND _USE_OBJCXX)
-      set_source_files_properties(src/config_webui.cpp PROPERTIES LANGUAGE OBJCXX)
-    endif()
-  else()
-    set(BUILD_CONFIG_WEB_UI OFF CACHE BOOL "Build the webview-powered config editor" FORCE)
-  endif()
-endif()
-
 if(BUILD_APP_TESTS)
   add_executable(power_manager_tests
     tests/power_manager_tests.cpp
@@ -689,6 +616,61 @@ if(BUILD_APP_TESTS)
   target_link_libraries(gc_close_gating_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(gc_close_gating_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(gc_precharge_no_timeout_tests
+    tests/gc_precharge_no_timeout_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(gc_precharge_no_timeout_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(gc_precharge_no_timeout_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(gc_precharge_no_timeout_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(precharge_current_clamp_tests
+    tests/precharge_current_clamp_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(precharge_current_clamp_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(precharge_current_clamp_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(precharge_current_clamp_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(unlock_voltage_gate_tests
+    tests/unlock_voltage_gate_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(unlock_voltage_gate_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(unlock_voltage_gate_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(unlock_voltage_gate_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(cable_check_no_hv_tests
+    tests/cable_check_no_hv_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(cable_check_no_hv_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(cable_check_no_hv_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(cable_check_no_hv_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(post_precharge_hold_tests
+    tests/post_precharge_hold_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(post_precharge_hold_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(post_precharge_hold_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(post_precharge_hold_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(power_delivery_stall_tests
     tests/power_delivery_stall_tests.cpp
     src/ocpp_adapter.cpp
@@ -732,5 +714,27 @@ if(BUILD_APP_TESTS)
   target_include_directories(charger_config_tests PRIVATE include)
   target_link_libraries(charger_config_tests PRIVATE nlohmann_json::nlohmann_json)
   target_compile_definitions(charger_config_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(two_car_split_charging_sim_tests
+    tests/two_car_split_charging_sim_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(two_car_split_charging_sim_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(two_car_split_charging_sim_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(two_car_split_charging_sim_tests PRIVATE CHARGER_UNIT_TESTS)
+
+  add_executable(precharge_default_module_policy_sim_tests
+    tests/precharge_default_module_policy_sim_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(precharge_default_module_policy_sim_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(precharge_default_module_policy_sim_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(precharge_default_module_policy_sim_tests PRIVATE CHARGER_UNIT_TESTS)
 
 endif()

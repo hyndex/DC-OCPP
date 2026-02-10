@@ -134,6 +134,10 @@ public:
             adapter.set_auth_state(connector, state);
         }
 
+        static ocpp::v16::UnlockStatus unlock_connector(OcppAdapter& adapter, std::int32_t connector) {
+            return adapter.unlock_connector(connector);
+        }
+
         static void apply_power_plan(OcppAdapter& adapter) { adapter.apply_power_plan(); }
 
         static HlcControlOutcome
@@ -192,6 +196,15 @@ public:
         }
         static std::map<std::int32_t, bool>& connector_faulted(OcppAdapter& adapter) {
             return adapter.connector_faulted_;
+        }
+
+        static std::optional<ModuleCommandRequest> last_module_command_for_slot(OcppAdapter& adapter, int slot_id) {
+            std::lock_guard<std::mutex> lock(adapter.plan_mutex_);
+            const auto it = adapter.last_module_command_by_slot_.find(slot_id);
+            if (it == adapter.last_module_command_by_slot_.end()) {
+                return std::nullopt;
+            }
+            return it->second;
         }
     };
 
@@ -293,6 +306,8 @@ private:
     std::string global_fault_reason_;
     std::chrono::steady_clock::time_point global_fault_clear_since_{};
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
+    std::map<int, std::chrono::steady_clock::time_point> stuck_output_voltage_since_;
+    std::map<int, std::chrono::steady_clock::time_point> stuck_output_current_since_;
     std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
     std::map<int, std::string> last_local_fault_reason_;
     std::map<int, AuthorizationState> auth_state_cache_;
@@ -335,8 +350,10 @@ private:
     void maybe_refresh_status_notifications(const std::chrono::steady_clock::time_point& now);
     void enter_global_fault(const std::string& reason, ocpp::v16::Reason stop_reason);
     void mark_local_hw_disable(std::int32_t connector, const std::string& reason);
-    void maybe_reenable_local_hw(std::int32_t connector, bool fault, bool disabled, bool paused);
+    void maybe_reenable_local_hw(std::int32_t connector, const GunStatus& status, bool block_reenable,
+                                 bool disabled_by_csms, bool paused);
     void apply_zero_power_plan();
+    ocpp::v16::UnlockStatus unlock_connector(std::int32_t connector);
     bool safety_trip_needed(const GunStatus& status) const;
     void record_presence_state(std::int32_t connector, bool plugged_in,
                                const std::chrono::steady_clock::time_point& now);
@@ -394,6 +411,9 @@ private:
     bool token_matches_reservation(std::int32_t connector, const std::string& token,
                                    const std::optional<std::string>& parent_token);
     int meter_interval_seconds_for_connector(std::int32_t connector);
+
+    // Debug/test visibility: last module command sent per slot (updated in planner thread).
+    std::map<int, ModuleCommandRequest> last_module_command_by_slot_;
 };
 
 } // namespace charger

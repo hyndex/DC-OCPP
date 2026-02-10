@@ -246,8 +246,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.tie_close_max_delta_v = planner_value("tieCloseMaxDeltaV", cfg.tie_close_max_delta_v);
     cfg.switch_max_current_a = planner_value("switchMaxCurrentA", cfg.switch_max_current_a);
     cfg.switch_stable_time_ms = planner_value("switchStableTimeMs", cfg.switch_stable_time_ms);
+    cfg.precharge_max_current_a = planner_value("prechargeMaxCurrentA", cfg.precharge_max_current_a);
     cfg.precharge_voltage_tolerance_v = planner_value("prechargeVoltageToleranceV", cfg.precharge_voltage_tolerance_v);
     cfg.precharge_timeout_ms = planner_value("prechargeTimeoutMs", cfg.precharge_timeout_ms);
+    cfg.unlock_voltage_threshold_v = planner_value("unlockVoltageThresholdV", cfg.unlock_voltage_threshold_v);
+    cfg.require_auth_for_precharge = planner_value("requireAuthForPrecharge", cfg.require_auth_for_precharge);
+    // Alias for legacy / clearer naming.
+    cfg.require_auth_for_precharge = planner_value("blockPrechargeUntilAuthorized", cfg.require_auth_for_precharge);
     if (cfg.module_power_kw <= 0.0) {
         cfg.module_power_kw = 30.0;
     }
@@ -298,6 +303,12 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.switch_stable_time_ms < 0) {
         cfg.switch_stable_time_ms = 0;
     }
+    if (cfg.precharge_max_current_a <= 0.0) {
+        cfg.precharge_max_current_a = 2.0;
+    }
+    if (cfg.unlock_voltage_threshold_v <= 0.0) {
+        cfg.unlock_voltage_threshold_v = 60.0;
+    }
     if (!cfg.plc_module_relays_enabled) {
         throw std::runtime_error(
             "Split charging requires plc.moduleRelaysEnabled=true (relay bits 1..2 drive tie contactors)");
@@ -336,6 +347,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     const auto controller = json.value("controller", nlohmann::json::object());
     cfg.free_mode = controller.value("freeMode", json.value("FreeMode", cfg.free_mode));
     cfg.default_tag = controller.value("defaultTag", json.value("DefaultTag", cfg.default_tag));
+    cfg.lab_bypass = controller.value("labBypass", json.value("LabBypass", cfg.lab_bypass));
 
     const auto security = json.value("security", nlohmann::json::object());
     cfg.security.csms_ca_bundle = make_absolute(base_dir, security.value("csmsCaBundle", "data/certs/ca/csms/CSMS_ROOT_CA.pem"));
@@ -394,8 +406,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
             sm.gun_id = conn.id;
             sm.gc_id = "GC_" + std::to_string(conn.id);
             sm.mc_id = "MC_" + std::to_string(conn.id);
-            sm.cw_id = cfg.connectors[(i + 1) % cfg.connectors.size()].id;
-            sm.ccw_id = cfg.connectors[(i + cfg.connectors.size() - 1) % cfg.connectors.size()].id;
+            if (cfg.connectors.size() <= 1) {
+                sm.cw_id = 0;
+                sm.ccw_id = 0;
+            } else {
+                sm.cw_id = cfg.connectors[(i + 1) % cfg.connectors.size()].id;
+                sm.ccw_id = cfg.connectors[(i + cfg.connectors.size() - 1) % cfg.connectors.size()].id;
+            }
             ModuleConfig m0{"M" + std::to_string(conn.id) + "_0", "MN_" + std::to_string(conn.id) + "_0"};
             ModuleConfig m1{"M" + std::to_string(conn.id) + "_1", "MN_" + std::to_string(conn.id) + "_1"};
             sm.modules = {m0, m1};

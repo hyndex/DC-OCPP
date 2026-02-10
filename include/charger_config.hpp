@@ -117,12 +117,20 @@ struct ChargerConfig {
     double tie_close_max_delta_v{20.0};
     double switch_max_current_a{2.0};
     int switch_stable_time_ms{200};
+    // When true, do not energize DC output (precharge/warmup) until OCPP authorization is granted.
+    // This may delay or prevent ISO15118 (HLC) progression on some vehicles.
+    bool require_auth_for_precharge{false};
     std::size_t upload_max_bytes{100 * 1024 * 1024}; // 100 MB safety cap
     int upload_connect_timeout_s{10};
     int upload_transfer_timeout_s{60};
     bool upload_allow_file_targets{true};
-    double precharge_voltage_tolerance_v{50.0};
+    // CCS/DC: during precharge, EVSE must limit current to <= 2 A (IEC 61851-23 / CharIN guidance).
+    double precharge_max_current_a{2.0};
+    // CCS/DC: EV closes its internal disconnecting device when ΔV < 20 V; use this as the default close tolerance.
+    double precharge_voltage_tolerance_v{20.0};
     int precharge_timeout_ms{2000};
+    // CCS/DC: unlock only when HV is discharged below 60 V (or stored energy <= 0.2 J; voltage check used here).
+    double unlock_voltage_threshold_v{60.0};
     int module_health_grace_ms{2000};
     int auth_wait_timeout_s{1800};
     int auth_denied_hold_s{5};
@@ -137,6 +145,8 @@ struct ChargerConfig {
     int minimum_status_duration_s{0};
     int meter_keepalive_s{300};
     bool free_mode{false};
+    // Lab-only: bypass certain safety checks/faults. Must be false in production.
+    bool lab_bypass{false};
     std::string default_tag;
     std::string ocpp_config_inline; // Preferred inline OCPP base config JSON (single source)
 

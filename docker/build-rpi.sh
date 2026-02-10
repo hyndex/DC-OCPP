@@ -7,11 +7,10 @@ set -euo pipefail
 
 PLATFORM=${PLATFORM:-linux/arm64}
 BUILD_TYPE=${BUILD_TYPE:-Release}
-BUILD_CONFIG_WEB_UI=${BUILD_CONFIG_WEB_UI:-OFF}
 EXTRA_CMAKE_FLAGS=${EXTRA_CMAKE_FLAGS:-}
 OUT_DIR=${OUT_DIR:-build-rpi}
 
-echo "Building dc_ocpp for ${PLATFORM} (type=${BUILD_TYPE}, webui=${BUILD_CONFIG_WEB_UI})"
+echo "Building dc_ocpp for ${PLATFORM} (type=${BUILD_TYPE})"
 
 mkdir -p "${OUT_DIR}"
 docker buildx build \
@@ -20,6 +19,5 @@ docker buildx build \
   --target export \
   --output "type=local,dest=${OUT_DIR}" \
   --build-arg BUILD_TYPE="${BUILD_TYPE}" \
-  --build-arg BUILD_CONFIG_WEB_UI="${BUILD_CONFIG_WEB_UI}" \
   --build-arg EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS}" \
   .

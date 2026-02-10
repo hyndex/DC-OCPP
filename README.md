@@ -41,7 +41,6 @@ Build prerequisites
 - Boost: log, log_setup, filesystem, thread, regex, date_time
 - OpenSSL, libcurl, SQLite3
 - libwebsockets
-- `pkg-config` + `webkit2gtk` + `gtk3` (only when building `config_webui`)
 
 CMake fetches several deps automatically (everest-cmake, everest-log, everest-timer, everest-evse_security, everest-sqlite, nlohmann-json, json-schema-validator, date) when not available locally.
 
@@ -66,6 +65,7 @@ Top-level sections
 - `controller`
   - `freeMode` (auto-authorize on plug-in)
   - `defaultTag` (token used when `freeMode` is true)
+  - `labBypass` (DANGEROUS: bypass certain safety faults; must be false in production)
 - `connectors[]`
   - `id` (1..N, unique), `plcId` (0..15, unique; default `id-1`)
   - `label`, `canInterface` (optional override), `maxCurrentA`, `maxPowerW`, `maxVoltageV`, `minVoltageV`
@@ -85,7 +85,10 @@ Top-level sections
   - `allowCrossSlotIslands`, `maxModulesPerGun`, `minModulesPerActiveGun`, `maxIslandRadius`
   - `minModuleHoldMs`, `minMcHoldMs`, `minGcHoldMs`
   - `mcOpenCurrentA`, `gcOpenCurrentA`, `tieCloseMaxDeltaV`, `switchMaxCurrentA`, `switchStableTimeMs`
-  - `prechargeTimeoutMs`, `prechargeVoltageToleranceV`
+  - `requireAuthForPrecharge` (alias: `blockPrechargeUntilAuthorized`)
+  - `prechargeMaxCurrentA` (CCS precharge clamp; default 2 A)
+  - `prechargeTimeoutMs`, `prechargeVoltageToleranceV` (default 20 V)
+  - `unlockVoltageThresholdV` (default 60 V)
 - `timeouts`
   - `authorizationSeconds`, `hlcAuthorizationSeconds` (clamped to 150s), `pncBlockSeconds`
   - `powerRequestSeconds`, `evseLimitAckMs`, `telemetryTimeoutMs`
@@ -119,28 +122,12 @@ PLC/CAN contract
 - Authoritative details: `docs/CAN_CONTRACT.md` and `Ref/Basic/docs/CAN_DBC.dbc`.
 - Bus: 29-bit extended IDs, 125 kbps, CRC8 on required frames.
 - Handshake: controller expects `PROTO_VERSION` (param 91) and treats mismatches as comm faults.
-- For Waveshare USB-CAN-B, use `docs/waveshare_usb_can_b.md` and `scripts/waveshare_usbcan_setup.sh`.
-
-Config editor web UI (`config_webui`)
-Build (desktop):
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_CONFIG_WEB_UI=ON
-cmake --build build --target config_webui -j
-```
-Run:
-```bash
-./build/config_webui --config configs/charger.json --assets webui --port 8844 --host 0.0.0.0
-```
-Flags: `--headless`, `--host/--bind`, `--port`, `--assets`, `--config`, `--no-mdns`, `--mdns-name`, `--mdns-host`.
-Backups are stored under `configs/backups/` (relative to the config path).
 
 Raspberry Pi / Docker builds
 ```bash
 ./docker/build-rpi.sh
 # 32-bit Raspberry Pi OS
 PLATFORM=linux/arm/v7 ./docker/build-rpi.sh
-# Include config web UI
-BUILD_CONFIG_WEB_UI=ON ./docker/build-rpi.sh
 ```
 Artifacts land in `build-rpi/artifacts/bin` and `build-rpi/artifacts/share/`.
 
