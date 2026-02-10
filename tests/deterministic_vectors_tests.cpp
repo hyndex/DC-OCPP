@@ -107,6 +107,7 @@ int main() {
     g1.gun_current_limit_a = 200.0;
     g1.safety_ok = true;
     g1.ev_session_active = true;
+    g1.fsm_state = GunFsmState::Ready;
     g1.ev_req_power_kw = 60.0;
     g1.ev_req_voltage_v = 800.0;
     guns.push_back(g1);

@@ -18,9 +18,11 @@ public:
         status.safety_ok = true;
         status.plugged_in = true;
         status.lock_engaged = true;
+        status.cp_state = 'C';
         status.module_healthy_mask = 0x03;
         status.present_voltage_v = 800.0;
         status.target_current_a = 100.0;
+        status.target_voltage_v = 800.0;
         meas.power_meter.energy_Wh_import.total = 0.0;
         meas.power_meter.voltage_V.emplace();
         meas.power_meter.voltage_V->DC = 800.0f;

@@ -75,7 +75,8 @@ int main() {
     }
 
     // Case 1: stale EVSE limit ACK should constrain power.
-    GunStatus stale = make_ready_status(now, true, std::chrono::milliseconds(2000));
+    // Default evse_limit_ack_timeout_ms=5000 -> warn threshold is 2500ms (timeout/2).
+    GunStatus stale = make_ready_status(now, true, std::chrono::milliseconds(3000));
     hw->set_status_override(1, stale);
     OcppAdapter::TestHook::apply_power_plan(adapter);
     assert(OcppAdapter::TestHook::power_constrained(adapter)[1] == true);

@@ -125,12 +125,278 @@ Constraints and defaults
 - `plc.relayMode` must be `ties`, `plc.moduleRelaysEnabled` must be true, and `plc.gunRelayOwnedByPlc` must be false.
 - `allowCrossSlotIslands` requires hardware support (`PlcCanHardware` supports this).
 - `databaseDir` also stores pending auth tokens at `pending_tokens.json`.
-- Autocharge can be toggled at runtime via OCPP ChangeConfiguration key `Custom.AutochargeEnabled`.
+- Autocharge can be toggled at runtime via OCPP ChangeConfiguration key `AutochargeEnabled` (stored under
+  `Custom.AutochargeEnabled` in the libocpp JSON config).
 
 PLC/CAN contract
 - Authoritative details: `docs/CAN_CONTRACT.md` and `Ref/Basic/docs/CAN_DBC.dbc`.
 - Bus: 29-bit extended IDs, 125 kbps, CRC8 on required frames.
 - Handshake: controller expects `PROTO_VERSION` (param 91) and treats mismatches as comm faults.
+
+End-to-end CCS2 DC charging flows (PLC + controller + OCPP + modules)
+
+This section documents the production behavior of the repo as implemented today, cross-referenced to the controller
+code (`src/*`) and the reference PLC firmware (`Ref/Basic/*`). If you ship a different PLC stack, validate that its
+HLC gate + auth-pending semantics match before relying on these flows.
+
+Actors and ownership
+- EV: CP state machine + SLAC + ISO 15118-2 / DIN 70121 behavior.
+- PLC (`Ref/Basic/*`): owns CP duty (100% vs 5%), SLAC readiness, ISO/DIN state machine, and HLC stage truth.
+- Controller (`src/ocpp_adapter.cpp`): owns OCPP 1.6 state, token ingestion, session/transaction lifecycle, and power planning.
+- Modules (`src/power_module_controller.cpp` + drivers): provide power telemetry and accept setpoints.
+
+Key loops and cadence (practically important for "jitter" and false positives)
+- Controller metering/auth loop: 50 ms per connector (`OcppAdapter::metering_loop` in `src/ocpp_adapter.cpp`).
+- Controller planner loop: 50 ms (`OcppAdapter::apply_power_plan` in `src/ocpp_adapter.cpp`).
+- CAN to PLC:
+  - EVSE_FAST_V2 (present V/I/P + relay cmd + faults): nominal 100 ms.
+  - EVSE_SLOW_V2 (limits + auth/pending + HLC gate + PnC block): nominal 1 s.
+  - See `docs/CAN_CONTRACT.md` for stale thresholds and ACK requirements.
+- PLC HLC authorization-pending timeout: default 150 s (`HLC_MAX_AUTH_PENDING_MS` in `Ref/Basic/src/defs.h`,
+  enforced in `Ref/Basic/src/tcp.cpp`).
+
+OCPP message triggers (what sends what, and when)
+- StatusNotification:
+  - Driven by libocpp’s connector state machine, based on adapter events like `on_enabled()`, `on_disabled()`,
+    `on_suspend_charging_ev(se)()`, and `on_resume_charging()` emitted from `update_connector_state()`
+    (`src/ocpp_adapter.cpp`).
+  - On CSMS connect / boot accepted, the adapter requests a refresh via `trigger_status_notifications()` if the
+    libocpp build supports it (see `maybe_refresh_status_notifications()` in `src/ocpp_adapter.cpp`).
+- Authorize:
+  - Fired when a non-prevalidated token is consumed for a connector (`authorize_id_token()` in `src/ocpp_adapter.cpp`).
+- StartTransaction:
+  - Fired as soon as `session.authorized && EV connected && !transaction_started` (`src/ocpp_adapter.cpp`).
+  - `meterStart` is captured at that moment from `sample_meter()`.
+- MeterValues:
+  - The controller periodically calls `charge_point_->on_meter_values()` when any of:
+    - the transaction is active, or
+    - total imported energy changed by >0.1 Wh, or
+    - keepalive elapsed (`meterKeepAliveSeconds`).
+  - Energy is clamped monotonic to prevent regressions (see `push_meter_values()` in `src/ocpp_adapter.cpp`).
+- StopTransaction:
+  - Fired when the controller finishes an active transaction (`finish_transaction()` in `src/ocpp_adapter.cpp`).
+  - `meterStop` is clamped to be monotonic vs. `meterStart` and previously sent MeterValues (prevents CSMS rejects).
+- TriggerMessage:
+  - Handled inside libocpp (RemoteTrigger profile). The adapter does not implement a custom TriggerMessage handler;
+    it supports status refresh through libocpp’s `trigger_status_notifications()` when available.
+
+Token sources and connector selection
+- RFID:
+  - PLC emits RFID segments over CAN (`RFID_EVENT`); controller assembles and emits an `AuthTokenSource::RFID`
+    token with `connector_hint` set (see `src/plc_can.cpp`).
+  - Second tap behavior: if a transaction is already started on that connector and the same token is tapped again,
+    it triggers a Local stop, but only after power delivery has begun (relay closed or HLC power-ready) to avoid
+    immediate stop-on-double-read noise (`RFID_TAP_LATCH_WINDOW` in `src/ocpp_adapter.cpp`).
+- Remote start (app/CSMS):
+  - CSMS sends `RemoteStartTransaction`; libocpp invokes `register_provide_token_callback()` which the adapter
+    converts to an `AuthTokenSource::RemoteStart` token (`src/ocpp_adapter.cpp`).
+  - If CSMS does not specify a `connectorId`, the controller routes the token to the *most recently plugged* connector
+    (`select_connector_for_token()` in `src/ocpp_adapter.cpp`). In multi-gun sites this is ambiguous: production
+    integrations should include `connectorId`.
+- Autocharge (PnC-lite via MAC/EVCCID/EMAID):
+  - PLC publishes EV identity over CAN (EVMAC / EVCCID / EMAID segments). The controller emits an
+    `AuthTokenSource::Autocharge` token based on `plc.autochargeIdSource` (`src/plc_can.cpp`).
+  - Note: OCPP 1.6 idTag is limited to 20 chars. EVMAC (12 hex) and EVCCID (<=16 hex in `Ref/Basic`) are safe.
+    If you enable EMAID, confirm the emitted idTag fits 20 chars in your PLC build; otherwise you need a stable
+    hashing/mapping scheme agreed with the CSMS.
+
+HLC / digital communication gate (the critical rule)
+
+The controller controls whether the PLC advertises digital comms (5% CP duty) via EVSE_SLOW_V2 `hlc_enable`.
+In the reference PLC firmware:
+- HLC gate: `hlc_gate_active() = g_hlc_enable && !g_force_preauth` (`Ref/Basic/src/main.cpp`).
+- CP duty: when `hlc_gate_active()` and CP is connected, PLC advertises digital comms (5%) and runs SLAC/ISO/DIN;
+  otherwise it holds CP at 100% and remains in "preauth" (`apply_cp_output()` in `Ref/Basic/src/main.cpp`).
+- If `auth_pending` stays true too long while HLC is active, PLC latches an auth-timeout and forces preauth
+  (`auth_pending_timeout_reached()` in `Ref/Basic/src/tcp.cpp`).
+
+Production behavior implemented in this repo (`OcppAdapter::apply_hlc_control()` in `src/ocpp_adapter.cpp`):
+- If Autocharge is enabled and not blocked: enable HLC/digital comms as soon as the EV is present (plugged/CP-B),
+  so the PLC can learn identity early and begin HLC while CSMS authorization is in-flight.
+- If Autocharge is disabled, or Autocharge is blocked (reject/timeout): keep HLC/digital comms OFF until explicit
+  EIM authorization has succeeded (RFID Accepted or RemoteStart Accepted). This avoids PLC HLC auth-pending timeouts
+  and enables a "plug, then wait comfortably in the app" UX.
+
+Common post-auth charging loop (applies to all scenarios once authorized)
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller (OCPP + Planner)
+    participant PM as PowerManager
+    participant MOD as Modules
+    participant CSMS
+
+    Note over CTRL,PLC: Controller publishes EVSE_SLOW_V2 (~1s) and EVSE_FAST_V2 (~100ms)
+
+    loop Every ~50ms (planner)
+        PLC->>CTRL: PLC_STATE/STATUS + EVDC_TARGETS (EV target V/I + present V/I)
+        CTRL->>PM: compute_plan(active guns, requests, health, site limits)
+        PM-->>CTRL: Plan (module allocation + setpoints + tie/GC intents)
+        CTRL->>MOD: apply module setpoints + contactor sequencing (MN/MC gating)
+        CTRL->>PLC: EVSE_FAST_V2 (present V/I/P + relay cmd + fault bits)
+        CTRL->>PLC: EVSE_SLOW_V2 (max limits + auth bits + hlc_enable + pnc_blocked)
+        PLC-->>CTRL: CONFIG_ACK (EVSE_LIMIT_ACK) periodic
+    end
+
+    par OCPP telemetry
+        CTRL->>CSMS: MeterValues (when tx active / changed / keepalive)
+        CTRL->>CSMS: StatusNotification (state transitions)
+    end
+```
+
+Scenarios (Autocharge/MAC vs RemoteStart vs RFID)
+
+1) P&C via MAC (Autocharge) ENABLED and succeeds
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller
+    participant CSMS
+
+    EV->>PLC: Plug in (CP B)
+    PLC->>CTRL: PLC_STATE/STATUS (plugged_in=1)
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    PLC->>EV: CP duty 5% (digital comm advertised)
+    PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
+    CTRL->>CSMS: Authorize(Autocharge idTag)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1 while waiting)
+    PLC->>EV: ContractAuthRes (EVSEProcessing=Ongoing)
+    CSMS-->>CTRL: Authorize.conf (Accepted)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, auth_pending=0)
+    CTRL->>CSMS: StartTransaction (meterStart captured)
+    PLC->>EV: ContractAuthRes (Finished) + proceed to CPD/CableCheck/PreCharge/PowerDelivery
+    Note over PLC,CTRL: Continue in "Common post-auth charging loop"
+```
+
+2) Autocharge ENABLED, fails (reject/timeout), then user tries RemoteStart
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller
+    participant CSMS
+
+    EV->>PLC: Plug in (CP B)
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
+    CTRL->>CSMS: Authorize(Autocharge idTag)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
+    alt CSMS rejects Autocharge OR HLC auth timeout occurs
+        CSMS-->>CTRL: Authorize.conf (Denied) / no response in time
+        CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
+        PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
+        Note over CTRL: Autocharge blocked for TTL; requires EIM fallback
+    end
+
+    CSMS->>CTRL: RemoteStartTransaction(idTag, connectorId)
+    CTRL->>CSMS: Authorize(RemoteStart idTag) (or prevalidated)
+    CSMS-->>CTRL: Authorize.conf (Accepted)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1, pnc_blocked=1)
+    CTRL->>CSMS: StartTransaction
+    PLC->>EV: CP duty 5% (digital comm advertised)
+    Note over PLC,CTRL: Continue in "Common post-auth charging loop"
+```
+
+3) Autocharge ENABLED, fails (reject/timeout), then user taps RFID
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller
+    participant CSMS
+
+    EV->>PLC: Plug in (CP B)
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
+    CTRL->>CSMS: Authorize(Autocharge idTag)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
+    CSMS-->>CTRL: Authorize.conf (Denied) / timeout
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
+    PLC->>EV: CP duty 100% (preauth)
+
+    EV->>PLC: User taps RFID
+    PLC->>CTRL: RFID_EVENT segments (UID)
+    CTRL->>CSMS: Authorize(RFID idTag)
+    CSMS-->>CTRL: Authorize.conf (Accepted)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1, pnc_blocked=1)
+    CTRL->>CSMS: StartTransaction
+    PLC->>EV: CP duty 5% (digital comm advertised)
+    Note over PLC,CTRL: Continue in "Common post-auth charging loop"
+```
+
+4) Autocharge DISABLED, user uses RemoteStart (app)
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller
+    participant CSMS
+
+    EV->>PLC: Plug in (CP B)
+    PLC->>CTRL: PLC_STATE/STATUS (plugged_in=1)
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
+    PLC->>EV: CP duty 100% (digital comm suppressed, waiting)
+
+    CSMS->>CTRL: RemoteStartTransaction(idTag, connectorId)
+    CTRL->>CSMS: Authorize(RemoteStart idTag) (or prevalidated)
+    CSMS-->>CTRL: Authorize.conf (Accepted)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1)
+    CTRL->>CSMS: StartTransaction
+    PLC->>EV: CP duty 5% (digital comm advertised)
+    Note over PLC,CTRL: Continue in "Common post-auth charging loop"
+```
+
+5) Autocharge DISABLED, user taps RFID
+```mermaid
+sequenceDiagram
+    participant EV
+    participant PLC as PLC (SLAC/V2G)
+    participant CTRL as Controller
+    participant CSMS
+
+    EV->>PLC: Plug in (CP B)
+    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
+    PLC->>EV: CP duty 100% (digital comm suppressed, waiting)
+
+    EV->>PLC: User taps RFID
+    PLC->>CTRL: RFID_EVENT segments (UID)
+    CTRL->>CSMS: Authorize(RFID idTag)
+    CSMS-->>CTRL: Authorize.conf (Accepted)
+    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1)
+    CTRL->>CSMS: StartTransaction
+    PLC->>EV: CP duty 5% (digital comm advertised)
+    Note over PLC,CTRL: Continue in "Common post-auth charging loop"
+```
+
+Edge cases and "proper handling" checklist (production readiness)
+- RemoteStartTransaction without `connectorId` is ambiguous on multi-connector sites (controller routes to "most recently plugged").
+  Recommendation: enforce `connectorId` from CSMS for DC sites or extend routing policy to reject ambiguous remote starts.
+- Reservations:
+  - ReserveNow is supported; tokens must match the reservation tag/parent tag for that connector.
+  - If a connector is reserved and no matching token is present, the controller will not start a session (it will remain pending).
+- Autocharge failures:
+  - On explicit CSMS rejection or controller-side HLC auth timeout, the controller sets `pnc_blocked` for a TTL and requires EIM.
+  - Some EVs may not seamlessly restart SLAC/HLC after a failed contract-auth attempt; if you see interop issues, the site UX may
+    need to prompt unplug/replug after Autocharge failure.
+- Waiting UX when Autocharge is disabled:
+  - Keeping HLC OFF until authorization prevents PLC auth-pending timeouts and avoids "contract auth pending" loops.
+  - Make sure `timeouts.authorizationSeconds` (auth wait) is long enough for app-based sessions; otherwise the controller will
+    time out the pending session and locally disable the connector.
+- Meter values and jitter:
+  - If no physical energy meter is present, PLC backend integrates energy from power telemetry; this can drift if telemetry is
+    noisy or stale (`sample_meter()` in `src/plc_can.cpp`).
+  - Configure a consistent `connectors[].meterSource` (plc/module/shunt) to avoid mismatched V/I/P paths tripping the controller’s
+    telemetry sanity checks (`src/ocpp_adapter.cpp`).
+- Multiple tokens / dedup:
+  - The controller dedups repeated tokens within a short window; RemoteStart bypasses dedup to avoid losing operator retries.
+  - RFID double-tap stop is debounced and only becomes actionable after power delivery starts.
+
+Further reading
+- PLC/controller runtime contract: `docs/CAN_CONTRACT.md`
+- CCS2 DC gap analysis and validation notes: `docs/ccs2_dc_gap_analysis.md`
+- Split-charging + module/tie design: `docs/modules/SplitCharging.md`
 
 Raspberry Pi / Docker builds
 ```bash

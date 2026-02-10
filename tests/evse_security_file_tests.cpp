@@ -170,9 +170,9 @@ int main() {
     assert(info.status == ocpp::GetCertificateInfoStatus::Accepted);
     assert(info.info.has_value());
     assert(info.info->certificate_path.has_value());
-    assert(info.info->key_path.has_value());
     assert(info.info->certificate_path.value() == station_cert);
-    assert(info.info->key_path.value() == station_key);
+    assert(!info.info->key_path.empty());
+    assert(info.info->key_path == station_key);
 
     const int days = evse.get_leaf_expiry_days_count(ocpp::CertificateSigningUseEnum::ChargingStationCertificate);
     assert(days >= 0);

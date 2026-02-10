@@ -543,9 +543,6 @@ Plan PowerManager::compute_plan() {
             healthy_modules++;
         }
     }
-    if (healthy_modules <= 0) {
-        return blank_plan();
-    }
 
     std::map<int, double> req_limited;
     for (auto gid : active) {
@@ -556,7 +553,16 @@ Plan PowerManager::compute_plan() {
         req_limited[gid] = req;
     }
 
-    const auto budgets = compute_power_budgets(active, req_limited, healthy_modules);
+    std::map<int, double> budgets;
+    if (healthy_modules <= 0) {
+        // No healthy modules available: still return a deterministic plan for the active guns with
+        // 0 modules/power assigned so upstream logic can reflect the constraint.
+        for (auto gid : active) {
+            budgets[gid] = 0.0;
+        }
+    } else {
+        budgets = compute_power_budgets(active, req_limited, healthy_modules);
+    }
     if (budgets.empty()) {
         return blank_plan();
     }
@@ -569,7 +575,7 @@ Plan PowerManager::compute_plan() {
 
     auto modules_per_gun = compute_module_allocation(active, budgets, ideal_modules, healthy_modules);
     std::set<int> full_island_guns;
-    if (active.size() == 1 && cfg_.allow_cross_slot_islands) {
+    if (healthy_modules > 0 && active.size() == 1 && cfg_.allow_cross_slot_islands) {
         const int gid = active.front();
         const auto g_it = guns_.find(gid);
         const int home_slot = g_it != guns_.end() ? g_it->second.slot_id : 0;

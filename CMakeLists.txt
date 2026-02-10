@@ -834,6 +834,48 @@ if(BUILD_APP_TESTS)
   target_link_libraries(precharge_default_module_policy_sim_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(precharge_default_module_policy_sim_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  # Many unit tests use assert(...). CMake defines NDEBUG in Release builds which disables those checks.
+  # Keep assertions enabled for test executables regardless of build type so ctest failures are meaningful.
+  set(_charger_app_test_targets
+    power_manager_tests
+    power_manager_invariants_tests
+    auth_flow_tests
+    deterministic_vectors_tests
+    pending_token_persistence_tests
+    derate_fault_tests
+    limit_fallback_tests
+    status_transition_tests
+    charge_complete_finishing_available_tests
+    connector_zero_availability_tests
+    replay_trace_tests
+    post_stop_release_tests
+    error_catalog_tests
+    gc_close_gating_tests
+    gc_precharge_no_timeout_tests
+    precharge_current_clamp_tests
+    unlock_voltage_gate_tests
+    cable_check_no_hv_tests
+    post_precharge_hold_tests
+    power_delivery_stall_tests
+    hlc_fallback_tests
+    island_manager_tests
+    tie_gating_tests
+    charger_config_tests
+    evse_security_file_tests
+    maintenance_manager_tests
+    two_car_split_charging_sim_tests
+    precharge_default_module_policy_sim_tests
+  )
+  foreach(_t IN LISTS _charger_app_test_targets)
+    if (TARGET ${_t})
+      if (MSVC)
+        target_compile_options(${_t} PRIVATE /UNDEBUG)
+      else()
+        target_compile_options(${_t} PRIVATE -UNDEBUG)
+      endif()
+    endif()
+  endforeach()
+
   add_test(NAME power_manager_tests COMMAND power_manager_tests)
   add_test(NAME power_manager_invariants_tests COMMAND power_manager_invariants_tests)
   add_test(NAME auth_flow_tests COMMAND auth_flow_tests)
