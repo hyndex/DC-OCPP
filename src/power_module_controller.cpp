@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -211,6 +212,13 @@ public:
             sock_ = -1;
             return;
         }
+        // Increase buffers to reduce drops/ENOBUFS when multiple sockets share a busy bus.
+        {
+            const int rcvbuf = 256 * 1024;
+            ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+            const int sndbuf = 256 * 1024;
+            ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        }
         const int flags = ::fcntl(sock_, F_GETFL, 0);
         ::fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
 #endif
@@ -226,13 +234,29 @@ public:
 
     bool valid() const { return sock_ >= 0; }
 
-    bool send(const can_frame& frame) {
+    bool send(const can_frame& frame, bool critical) {
 #ifdef __linux__
         if (sock_ < 0) return false;
-        const auto n = ::write(sock_, &frame, sizeof(frame));
-        return n == sizeof(frame);
+        const int attempts = critical ? 3 : 1;
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+            const auto n = ::write(sock_, &frame, sizeof(frame));
+            if (n == sizeof(frame)) {
+                return true;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
+                if (!critical) {
+                    return false; // drop low-priority reads instead of queueing
+                }
+                const int sleep_ms = (errno == ENOBUFS) ? 5 : 2;
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                continue;
+            }
+            return false;
+        }
+        return false;
 #else
         (void)frame;
+        (void)critical;
         return false;
 #endif
     }
@@ -326,6 +350,18 @@ public:
     MaxwellModuleDriver(const ModuleSpec& spec, std::shared_ptr<CanChannel> channel) :
         ModuleDriver(spec), channel_(std::move(channel)) {
         last_sent_.voltage_v = 0.0;
+        // Phase-offset poll timestamps so modules don't all transmit in the same tick window.
+        const auto now = std::chrono::steady_clock::now();
+        const int base_ms = std::max(100, spec_.poll_interval_ms);
+        const int key = (spec_.address >= 0) ? spec_.address : spec_.slot_index;
+        const int phase_ms = (key * 73) % base_ms;
+        const auto offset = std::chrono::milliseconds(std::max(0, base_ms - phase_ms));
+        last_poll_status_ = now - offset;
+        last_poll_voltage_ = now - offset;
+        last_poll_current_ = now - offset;
+        last_poll_temp_ = now;
+        last_poll_limit_point_ = now;
+        last_poll_input_mode_ = now;
     }
 
     void apply(const ModuleSetpoint& sp) override {
@@ -449,23 +485,45 @@ public:
         }
         const auto now = std::chrono::steady_clock::now();
         const auto poll_interval = std::chrono::milliseconds(std::max(100, spec_.poll_interval_ms));
+        const auto slow_interval = std::chrono::milliseconds(std::max<int64_t>(1000, poll_interval.count() * 4));
         const bool direct = !spec_.broadcast || resolved_addr_.has_value();
-        if (direct && (now - last_poll_) >= poll_interval) {
-            send_read(0x0001); // voltage
-            send_read(0x0002); // current
-            send_read(0x0004); // DC board temperature
-            send_read(0x0040); // alarm/status
-            if (spec_.readback_limits) {
+
+        auto due = [&](const std::chrono::steady_clock::time_point& last,
+                       const std::chrono::milliseconds interval) -> bool {
+            return last.time_since_epoch().count() == 0 || (now - last) >= interval;
+        };
+
+        // Rolling poll schedule: send at most one read per tick to reduce bursts on a shared bus.
+        if (direct) {
+            if (due(last_poll_status_, poll_interval)) {
+                send_read(0x0040); // alarm/status
+                last_poll_status_ = now;
+            } else if (due(last_poll_voltage_, poll_interval)) {
+                send_read(0x0001); // voltage
+                last_poll_voltage_ = now;
+            } else if (due(last_poll_current_, poll_interval)) {
+                send_read(0x0002); // current
+                last_poll_current_ = now;
+            } else if (due(last_poll_temp_, slow_interval)) {
+                send_read(0x0004); // DC board temperature
+                last_poll_temp_ = now;
+            } else if (spec_.readback_limits && due(last_poll_limit_point_, slow_interval)) {
                 send_read(0x0003); // current limit point
+                last_poll_limit_point_ = now;
+            } else if (spec_.probe_on_startup && !addr_reported_) {
+                const auto probe_interval = std::chrono::milliseconds(1000);
+                if ((now - last_probe_tx_) >= probe_interval) {
+                    send_read(0x0043); // group/address
+                    last_probe_tx_ = now;
+                }
+            } else if (spec_.input_mode >= 0 && !input_mode_reported_) {
+                const auto input_interval = std::chrono::milliseconds(1000);
+                if (due(last_poll_input_mode_, input_interval)) {
+                    send_read(0x004B); // input mode
+                    last_poll_input_mode_ = now;
+                }
             }
-            if (spec_.probe_on_startup && !addr_reported_) {
-                send_read(0x0043); // group/address
-            }
-            if (spec_.input_mode >= 0) {
-                send_read(0x004B); // input mode
-            }
-            last_poll_ = now;
-        } else if (!direct && spec_.probe_on_startup) {
+        } else if (spec_.probe_on_startup) {
             const auto probe_interval = std::chrono::milliseconds(1000);
             if ((now - last_probe_tx_) >= probe_interval) {
                 send_read(0x0043);
@@ -526,7 +584,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((raw >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((raw >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(raw & 0xFF);
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/true);
     }
 
     void send_set_int(uint16_t reg, uint32_t value) {
@@ -541,7 +599,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((value >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((value >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(value & 0xFF);
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/true);
     }
 
     void send_read(uint16_t reg) {
@@ -556,7 +614,7 @@ private:
         frame.data[5] = 0x00;
         frame.data[6] = 0x00;
         frame.data[7] = 0x00;
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/false);
     }
 
     void handle_frame(const can_frame& frame) {
@@ -706,7 +764,12 @@ private:
     std::chrono::steady_clock::time_point enable_requested_at_{};
     std::chrono::steady_clock::time_point last_status_update_{};
     std::chrono::steady_clock::time_point last_tx_{};
-    std::chrono::steady_clock::time_point last_poll_{};
+    std::chrono::steady_clock::time_point last_poll_voltage_{};
+    std::chrono::steady_clock::time_point last_poll_current_{};
+    std::chrono::steady_clock::time_point last_poll_temp_{};
+    std::chrono::steady_clock::time_point last_poll_status_{};
+    std::chrono::steady_clock::time_point last_poll_limit_point_{};
+    std::chrono::steady_clock::time_point last_poll_input_mode_{};
     std::chrono::steady_clock::time_point last_input_mode_tx_{};
     std::shared_ptr<CanChannel> channel_;
     bool addr_reported_{false};
@@ -723,6 +786,19 @@ public:
     RectifierModuleDriver(const ModuleSpec& spec, std::shared_ptr<CanChannel> channel) :
         ModuleDriver(spec), channel_(std::move(channel)) {
         last_sent_.voltage_v = 0.0;
+        // Phase-offset poll timestamps so modules don't all transmit in the same tick window.
+        const auto now = std::chrono::steady_clock::now();
+        const int base_ms = std::max(100, spec_.poll_interval_ms);
+        const int key = (spec_.address >= 0) ? spec_.address : spec_.slot_index;
+        const int phase_ms = (key * 71) % base_ms;
+        const auto offset = std::chrono::milliseconds(std::max(0, base_ms - phase_ms));
+        last_poll_status_ = now - offset;
+        last_poll_voltage_ = now - offset;
+        last_poll_current_ = now - offset;
+        last_poll_temp_ = now;
+        last_poll_mode_ = now;
+        last_poll_silent_ = now;
+        last_poll_group_ = now;
     }
 
     void apply(const ModuleSetpoint& sp) override {
@@ -807,21 +883,47 @@ public:
         }
         const auto now = std::chrono::steady_clock::now();
         const auto poll_interval = std::chrono::milliseconds(std::max(100, spec_.poll_interval_ms));
-        if ((now - last_poll_) >= poll_interval) {
-            send_read(0);   // output voltage
-            send_read(1);   // output current
-            send_read(8);   // status
-            send_read(30);  // inlet temperature
-            if (spec_.hi_lo_mode >= 0) {
+        const auto slow_interval = std::chrono::milliseconds(std::max<int64_t>(1000, poll_interval.count() * 4));
+        const bool direct = !spec_.broadcast || resolved_addr_.has_value();
+
+        auto due = [&](const std::chrono::steady_clock::time_point& last,
+                       const std::chrono::milliseconds interval) -> bool {
+            return last.time_since_epoch().count() == 0 || (now - last) >= interval;
+        };
+
+        if (direct) {
+            if (due(last_poll_status_, poll_interval)) {
+                send_read(8); // status
+                last_poll_status_ = now;
+            } else if (due(last_poll_voltage_, poll_interval)) {
+                send_read(0); // output voltage
+                last_poll_voltage_ = now;
+            } else if (due(last_poll_current_, poll_interval)) {
+                send_read(1); // output current
+                last_poll_current_ = now;
+            } else if (due(last_poll_temp_, slow_interval)) {
+                send_read(30); // inlet temperature
+                last_poll_temp_ = now;
+            } else if (spec_.hi_lo_mode >= 0 && !mode_known_ && due(last_poll_mode_, slow_interval)) {
                 send_read(101); // actual hi/lo mode
-            }
-            if (spec_.silent_mode >= 0) {
+                last_poll_mode_ = now;
+            } else if (spec_.silent_mode >= 0 && !silent_known_ && due(last_poll_silent_, slow_interval)) {
                 send_read(62); // silent mode
+                last_poll_silent_ = now;
+            } else if (spec_.probe_on_startup && !group_known_) {
+                const auto probe_interval = std::chrono::milliseconds(1000);
+                if (due(last_poll_group_, probe_interval)) {
+                    send_read(89); // group address (best-effort)
+                    last_poll_group_ = now;
+                }
             }
-            if (spec_.probe_on_startup) {
-                send_read(89); // group address (best-effort)
+        } else if (spec_.probe_on_startup) {
+            // Avoid flooding the bus with broadcast polls; probe slowly until an address is resolved.
+            const auto probe_interval = std::chrono::milliseconds(1000);
+            if (due(last_poll_group_, probe_interval)) {
+                send_read(89);
+                last_poll_group_ = now;
             }
-            last_poll_ = now;
         }
         can_frame frame{};
         while (channel_->recv(frame)) {
@@ -858,7 +960,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((data >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((data >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(data & 0xFF);
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/msg_type == RECTIFIER_MSG_SET);
     }
 
     void send_set(uint8_t cmd, uint32_t data) { send_frame(RECTIFIER_MSG_SET, cmd, data); }
@@ -985,7 +1087,13 @@ private:
     std::chrono::steady_clock::time_point enable_requested_at_{};
     std::chrono::steady_clock::time_point last_status_update_{};
     std::chrono::steady_clock::time_point last_tx_{};
-    std::chrono::steady_clock::time_point last_poll_{};
+    std::chrono::steady_clock::time_point last_poll_voltage_{};
+    std::chrono::steady_clock::time_point last_poll_current_{};
+    std::chrono::steady_clock::time_point last_poll_status_{};
+    std::chrono::steady_clock::time_point last_poll_temp_{};
+    std::chrono::steady_clock::time_point last_poll_mode_{};
+    std::chrono::steady_clock::time_point last_poll_silent_{};
+    std::chrono::steady_clock::time_point last_poll_group_{};
     std::shared_ptr<CanChannel> channel_;
     std::optional<uint8_t> resolved_addr_{};
     uint32_t last_status_bits_{0};
@@ -1086,7 +1194,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((i >> 8) & 0xFF);
         frame.data[6] = 0x00;
         frame.data[7] = 0x00;
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/true);
         confirm_pending_ = true;
         confirm_received_ = false;
         confirm_deadline_ = now + std::chrono::milliseconds(1000);
@@ -1112,7 +1220,7 @@ private:
         for (int i = 1; i < 8; ++i) {
             frame.data[i] = 0x00;
         }
-        channel_->send(frame);
+        channel_->send(frame, /*critical=*/false);
         input_mode_sent_ = true;
         last_input_mode_ = desired_mode;
         last_input_mode_tx_ = now;

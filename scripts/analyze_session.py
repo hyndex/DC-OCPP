@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import re
-import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -17,10 +15,6 @@ CANDUMP_RE = re.compile(
 
 def parse_u32_le(bs: List[int], offset: int) -> int:
     return bs[offset] | (bs[offset + 1] << 8) | (bs[offset + 2] << 16) | (bs[offset + 3] << 24)
-
-
-def parse_u16_le(bs: List[int], offset: int) -> int:
-    return bs[offset] | (bs[offset + 1] << 8)
 
 
 @dataclasses.dataclass
@@ -38,9 +32,8 @@ class RfidAssembly:
     received: Dict[int, bytes] = dataclasses.field(default_factory=dict)
 
     def add(self, seg_idx: int, payload: bytes) -> None:
-        if seg_idx in self.received:
-            return
-        self.received[seg_idx] = payload
+        if seg_idx not in self.received:
+            self.received[seg_idx] = payload
 
     def complete(self) -> bool:
         return self.uid_len > 0 and self.seg_cnt > 0 and len(self.received) >= self.seg_cnt
@@ -50,6 +43,65 @@ class RfidAssembly:
         for idx in range(self.seg_cnt):
             out.extend(self.received.get(idx, b""))
         return bytes(out[: self.uid_len])
+
+
+@dataclasses.dataclass
+class PlcTlmV3:
+    cp_state: str
+    hlc_stage: int
+    fault_reason_l4: int
+    relay_state_mask: int
+    relay_fault_mask: int
+    safety_ok: bool
+    estop: bool
+    earth_fault: bool
+    comm_fault: bool
+    lock_engaged: bool
+    cable_checked: bool
+    precharge_active: bool
+    charge_complete: bool
+    limits_rx_count_lsb: int
+    ev_target_v: float
+    ev_target_i: float
+
+
+def decode_plc_tlm_v3(data: List[int]) -> PlcTlmV3:
+    packed = 0
+    for i in range(7):
+        packed |= int(data[i]) << (8 * i)
+
+    cp_enum = (packed >> 0) & 0x07
+    cp_state = {
+        0: "U",
+        1: "A",
+        2: "B",
+        3: "C",
+        4: "D",
+        5: "E",
+        6: "F",
+    }.get(cp_enum, "U")
+
+    ev_target_v_1v = (packed >> 35) & 0x03FF
+    ev_target_i_0p5a = (packed >> 45) & 0x03FF
+
+    return PlcTlmV3(
+        cp_state=cp_state,
+        hlc_stage=(packed >> 3) & 0x3F,
+        fault_reason_l4=(packed >> 9) & 0x0F,
+        relay_state_mask=(packed >> 13) & 0x07,
+        relay_fault_mask=(packed >> 16) & 0x07,
+        safety_ok=((packed >> 19) & 0x01) != 0,
+        estop=((packed >> 20) & 0x01) != 0,
+        earth_fault=((packed >> 21) & 0x01) != 0,
+        comm_fault=((packed >> 22) & 0x01) != 0,
+        lock_engaged=((packed >> 23) & 0x01) != 0,
+        cable_checked=((packed >> 24) & 0x01) != 0,
+        precharge_active=((packed >> 25) & 0x01) != 0,
+        charge_complete=((packed >> 26) & 0x01) != 0,
+        limits_rx_count_lsb=(packed >> 27) & 0xFF,
+        ev_target_v=float(ev_target_v_1v),
+        ev_target_i=float(ev_target_i_0p5a) * 0.5,
+    )
 
 
 def parse_candump(path: Path) -> List[Frame]:
@@ -79,94 +131,82 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
         return 2
 
     t0, t1 = frames[0].t, frames[-1].t
-    print(f"CAN capture: {len(frames)} frames, t={t0:.3f}s..{t1:.3f}s (Δ={(t1 - t0):.3f}s)")
+    dt = max(t1 - t0, 1e-6)
+    print(f"CAN capture: {len(frames)} frames, t={t0:.3f}s..{t1:.3f}s (Δ={t1 - t0:.3f}s)")
 
-    # IDs (PLC_ID=0 assumed; adjust if you use other PLC IDs)
-    ID_CHARGEINFO = 0x0100
+    # IDs (PLC_ID=0 assumed; adjust if needed)
+    ID_EVSE_FAST = 0x0320
+    ID_EVSE_SLOW = 0x0330
+    ID_PLC_TLM_V3 = 0x0460
     ID_RFID = 0x0180
-    ID_CONFIG_ACK = 0x01A0
-    ID_EVDC_TARGETS = 0x0210
-    ID_CHARGING_SESSION = 0x0410
-
-    ID_EVSE_MAX = 0x0300
-    ID_EVSE_REG = 0x0310
-    ID_RELAY_CTRL = 0x0340
     ID_CONFIG_CMD = 0x0380
+    ID_CONFIG_ACK = 0x01A0
 
-    # Track last-known key state
-    last_cp: Optional[Tuple[str, int]] = None
+    per_id: Dict[int, int] = {}
+    for f in frames:
+        per_id[f.can_id] = per_id.get(f.can_id, 0) + 1
+
+    print("\nKey frame rates:")
+    for can_id, name in (
+        (ID_EVSE_FAST, "EVSE_FAST"),
+        (ID_EVSE_SLOW, "EVSE_SLOW"),
+        (ID_PLC_TLM_V3, "PLC_TLM_V3"),
+        (ID_CONFIG_CMD, "ConfigCmd"),
+        (ID_CONFIG_ACK, "ConfigAck"),
+        (ID_RFID, "RFIDEvent"),
+    ):
+        count = per_id.get(can_id, 0)
+        print(f"  {name:11s} id=0x{can_id:03X} count={count:5d} fps={count / dt:7.2f}")
+
+    last_tlm: Optional[PlcTlmV3] = None
+    first_nonzero_target: Optional[Tuple[float, float, float]] = None
+    max_target_v = 0.0
+    max_target_i = 0.0
+    hlc_stage_changes: List[Tuple[float, int, int]] = []
+    cp_changes: List[Tuple[float, str, str]] = []
+
     last_hlc_stage: Optional[int] = None
-    last_auth_pending: Optional[bool] = None
+    last_cp_state: Optional[str] = None
 
-    # ChargeInfo: stage + flags
-    stages_seen = set()
-    stage_changes: List[Tuple[float, int, int]] = []
-    auth_flag_changes: List[Tuple[float, bool, bool]] = []
+    limits_auth_samples: List[Tuple[float, int, bool, bool, bool, bool]] = []
 
-    # EVDC targets: detect first/last non-zero
-    first_targets = None
-    last_targets = None
-    max_tgt_v = 0
-    max_tgt_i = 0
-
-    # RFID events: reconstruct UIDs
     rfid_by_event: Dict[int, RfidAssembly] = {}
     rfid_uids: List[Tuple[float, int, str]] = []
-
-    # ConfigCmd/Ack: auth state / pending / lock
-    config_cmds: List[Tuple[float, int, int, int]] = []
-    config_acks: List[Tuple[float, int, int, int]] = []
-
-    # EVSE present/limits telemetry
-    evse_present_samples: List[Tuple[float, float, bool, bool, int]] = []
 
     for f in frames:
         bs = f.data
 
-        if f.direction == "RX" and f.can_id == ID_CHARGING_SESSION:
-            cp_state = chr(bs[4]) if 32 <= bs[4] <= 126 else "?"
-            duty = bs[5]
-            hlc_stage = bs[6]
-            auth_pending = (bs[7] != 0)
-            if last_cp != (cp_state, duty):
-                print(f"CP: t={f.t:.3f}s state={cp_state} duty={duty}%")
-                last_cp = (cp_state, duty)
-            if last_hlc_stage != hlc_stage:
-                print(f"HLC: t={f.t:.3f}s stage={hlc_stage}")
-                last_hlc_stage = hlc_stage
-            if last_auth_pending is None or last_auth_pending != auth_pending:
-                print(f"HLC: t={f.t:.3f}s auth_pending={auth_pending}")
-                last_auth_pending = auth_pending
+        if f.direction == "RX" and f.can_id == ID_PLC_TLM_V3:
+            tlm = decode_plc_tlm_v3(bs)
+            last_tlm = tlm
 
-        if f.direction == "RX" and f.can_id == ID_CHARGEINFO:
-            stage = bs[0]
-            flags = bs[1]
-            auth_granted = (flags & 0x08) != 0
-            auth_pending = (flags & 0x10) != 0
-            stages_seen.add(stage)
             if last_hlc_stage is None:
-                last_hlc_stage = stage
-            elif stage != last_hlc_stage:
-                stage_changes.append((f.t, last_hlc_stage, stage))
-                last_hlc_stage = stage
-            if last_auth_pending is None:
-                last_auth_pending = auth_pending
-            else:
-                # only track ChargeInfo auth transitions if ChargingSession isn't present
-                pass
-            auth_flag_changes.append((f.t, auth_granted, auth_pending))
+                last_hlc_stage = tlm.hlc_stage
+            elif tlm.hlc_stage != last_hlc_stage:
+                hlc_stage_changes.append((f.t, last_hlc_stage, tlm.hlc_stage))
+                last_hlc_stage = tlm.hlc_stage
 
-        if f.direction == "RX" and f.can_id == ID_EVDC_TARGETS:
-            tgt_v = parse_u16_le(bs, 0)
-            tgt_i = parse_u16_le(bs, 2)
-            pres_v = parse_u16_le(bs, 4)
-            pres_i = parse_u16_le(bs, 6)
-            if tgt_v or tgt_i:
-                if first_targets is None:
-                    first_targets = (f.t, tgt_v / 10.0, tgt_i / 10.0, pres_v / 10.0, pres_i / 10.0)
-                last_targets = (f.t, tgt_v / 10.0, tgt_i / 10.0, pres_v / 10.0, pres_i / 10.0)
-                max_tgt_v = max(max_tgt_v, tgt_v)
-                max_tgt_i = max(max_tgt_i, tgt_i)
+            if last_cp_state is None:
+                last_cp_state = tlm.cp_state
+            elif tlm.cp_state != last_cp_state:
+                cp_changes.append((f.t, last_cp_state, tlm.cp_state))
+                last_cp_state = tlm.cp_state
+
+            if tlm.ev_target_v > 0 or tlm.ev_target_i > 0:
+                if first_nonzero_target is None:
+                    first_nonzero_target = (f.t, tlm.ev_target_v, tlm.ev_target_i)
+                max_target_v = max(max_target_v, tlm.ev_target_v)
+                max_target_i = max(max_target_i, tlm.ev_target_i)
+
+        if f.direction == "TX" and f.can_id == ID_EVSE_SLOW:
+            packed = 0
+            for i in range(7):
+                packed |= int(bs[i]) << (8 * i)
+            auth_granted = ((packed >> 31) & 0x01) != 0
+            auth_pending = ((packed >> 32) & 0x01) != 0
+            hlc_enable = ((packed >> 33) & 0x01) != 0
+            pnc_blocked = ((packed >> 34) & 0x01) != 0
+            limits_auth_samples.append((f.t, (packed >> 36) & 0x0F, auth_granted, auth_pending, hlc_enable, pnc_blocked))
 
         if f.direction == "RX" and f.can_id == ID_RFID:
             uid_len = bs[0] & 0x0F
@@ -183,78 +223,58 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
                 rfid_by_event[event_id] = asm
             asm.add(seg_idx=seg_idx, payload=payload)
             if asm.complete():
-                uid_hex = asm.uid().hex().upper()
-                rfid_uids.append((f.t, event_id, uid_hex))
-                # prevent duplicate emission
+                rfid_uids.append((f.t, event_id, asm.uid().hex().upper()))
                 del rfid_by_event[event_id]
 
-        if f.direction == "TX" and f.can_id == ID_CONFIG_CMD:
-            param = bs[0]
-            op = bs[1]
-            val = parse_u32_le(bs, 2)
-            config_cmds.append((f.t, param, op, val))
+    if cp_changes:
+        print("\nCP transitions:")
+        for t, a, b in cp_changes[-10:]:
+            print(f"  t={t:.3f}s {a} -> {b}")
 
-        if f.direction == "RX" and f.can_id == ID_CONFIG_ACK:
-            param = bs[0]
-            status = bs[1]
-            val = parse_u32_le(bs, 2)
-            config_acks.append((f.t, param, status, val))
+    if hlc_stage_changes:
+        print("\nHLC stage transitions:")
+        for t, a, b in hlc_stage_changes[-12:]:
+            print(f"  t={t:.3f}s {a} -> {b}")
 
-        if f.direction == "TX" and f.can_id == ID_EVSE_REG:
-            v = parse_u16_le(bs, 0) / 10.0
-            flags = bs[6]
-            output_enabled = (flags & 0x01) != 0
-            regulating = (flags & 0x02) != 0
-            fault_bits = (flags >> 2) & 0x3F
-            evse_present_samples.append((f.t, v, output_enabled, regulating, fault_bits))
+    if limits_auth_samples:
+        print("\nEVSE_SLOW samples (last 8):")
+        for t, proto_tag, ag, ap, he, pb in limits_auth_samples[-8:]:
+            print(
+                f"  t={t:.3f}s proto_tag={proto_tag} auth_granted={ag} auth_pending={ap} "
+                f"hlc_enable={he} pnc_blocked={pb}"
+            )
 
-    print()
-    if rfid_uids:
-        print("RFID:")
-        for t, eid, uid in rfid_uids[-5:]:
-            print(f"  t={t:.3f}s event={eid} uid={uid}")
-    else:
-        print("RFID: no UID frames seen")
-
-    # Auth config summary
-    auth_cmds = [c for c in config_cmds if c[1] in (20, 21)]
-    if auth_cmds:
-        print("\nConfigCmd (auth):")
-        for t, param, _op, val in auth_cmds[-10:]:
-            name = "AUTH_STATE" if param == 20 else "AUTH_PENDING"
-            print(f"  t={t:.3f}s {name}={val}")
-    else:
-        print("\nConfigCmd (auth): none")
-
-    auth_acks = [a for a in config_acks if a[1] in (20, 21)]
-    if auth_acks:
-        print("\nConfigAck (auth):")
-        for t, param, status, val in auth_acks[-10:]:
-            name = "AUTH_STATE" if param == 20 else "AUTH_PENDING"
-            print(f"  t={t:.3f}s {name} status={status} value={val}")
-
-    if first_targets:
-        print("\nEVDC_Targets (non-zero):")
-        print(f"  first: t={first_targets[0]:.3f}s tgt=({first_targets[1]}V,{first_targets[2]}A) pres=({first_targets[3]}V,{first_targets[4]}A)")
-        if last_targets and last_targets != first_targets:
-            print(f"  last : t={last_targets[0]:.3f}s tgt=({last_targets[1]}V,{last_targets[2]}A) pres=({last_targets[3]}V,{last_targets[4]}A)")
-        print(f"  max  : {max_tgt_v/10.0}V {max_tgt_i/10.0}A")
-    else:
-        print("\nEVDC_Targets: no non-zero targets seen")
-
-    if evse_present_samples:
-        last_pres = evse_present_samples[-1]
-        reg_true = sum(1 for _t, _v, _oe, reg, _fb in evse_present_samples if reg)
-        oe_true = sum(1 for _t, _v, oe, _reg, _fb in evse_present_samples if oe)
-        fault_nonzero = sum(1 for _t, _v, _oe, _reg, fb in evse_present_samples if fb != 0)
-        print("\nEVSE_DC_Reg_Limits (TX):")
+    if last_tlm:
+        print("\nLast PLC_TLM_V3:")
         print(
-            f"  last : t={last_pres[0]:.3f}s V={last_pres[1]} output_enabled={last_pres[2]} regulating={last_pres[3]} fault_bits=0x{last_pres[4]:02X}"
+            f"  cp={last_tlm.cp_state} hlc_stage={last_tlm.hlc_stage} safety_ok={last_tlm.safety_ok} "
+            f"estop={last_tlm.estop} earth_fault={last_tlm.earth_fault} comm_fault={last_tlm.comm_fault}"
         )
-        print(f"  stats: output_enabled_true={oe_true} regulating_true={reg_true} fault_nonzero={fault_nonzero}")
+        print(
+            f"  relays=0b{last_tlm.relay_state_mask:03b} relay_faults=0b{last_tlm.relay_fault_mask:03b} "
+            f"fault_l4={last_tlm.fault_reason_l4} limits_lsb={last_tlm.limits_rx_count_lsb}"
+        )
+        print(
+            f"  targets: {last_tlm.ev_target_v:.1f}V / {last_tlm.ev_target_i:.1f}A "
+            f"precharge={last_tlm.precharge_active} charge_complete={last_tlm.charge_complete}"
+        )
+
+    if first_nonzero_target:
+        print("\nPLC_TLM_V3 target activity:")
+        print(
+            f"  first non-zero: t={first_nonzero_target[0]:.3f}s "
+            f"V={first_nonzero_target[1]:.1f} I={first_nonzero_target[2]:.1f}"
+        )
+        print(f"  max seen: V={max_target_v:.1f} I={max_target_i:.1f}")
+    else:
+        print("\nPLC_TLM_V3 target activity: no non-zero EV targets seen")
+
+    if rfid_uids:
+        print("\nRFID events:")
+        for t, eid, uid in rfid_uids[-8:]:
+            print(f"  t={t:.3f}s event={eid} uid={uid}")
 
     if dc_lines:
-        # Pull the most relevant application-level markers from dc_ocpp tail
         keys = ("Auth state connector", "Session ", "transaction", "RFID", "plugged_in", "Fault", "Modules", "Module")
         interesting = [ln for ln in dc_lines if any(k in ln for k in keys)]
         if interesting:
@@ -263,23 +283,22 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
                 print(f"  {ln}")
 
     print("\nHeuristics:")
-    auth_granted_cmd = any(param == 20 and val == 1 for _t, param, _op, val in config_cmds)
-    if not rfid_uids:
-        print("  - No RFID seen on CAN: card tap may not be reaching PLC, or captured the wrong bus/interface.")
-    if rfid_uids and not auth_granted_cmd:
-        print("  - RFID seen but no AUTH_STATE=1 ConfigCmd sent: controller authorization flow is not propagating to PLC.")
-    if auth_granted_cmd and not first_targets:
-        print("  - AUTH_STATE=1 sent but EVDC_Targets stayed at 0: ISO15118 session did not reach precharge/current-demand (check HLC stage, SLAC/TCP).")
-    if not auth_granted_cmd and not first_targets:
-        print("  - No EV targets: EV will not charge until ISO15118 progresses; start by verifying AUTH flow + HLC stage progression.")
+    if per_id.get(ID_PLC_TLM_V3, 0) == 0:
+        print("  - No PLC_TLM_V3 received: PLC TX path or CAN routing likely broken.")
+    if per_id.get(ID_EVSE_FAST, 0) == 0 or per_id.get(ID_EVSE_SLOW, 0) == 0:
+        print("  - Missing EVSE_FAST/EVSE_SLOW frames: controller TX path or CAN filtering may be wrong.")
+    if per_id.get(ID_RFID, 0) == 0:
+        print("  - No RFID events seen in this capture.")
+    if first_nonzero_target is None:
+        print("  - EV targets stayed zero: HLC may not have reached current-demand/precharge state.")
 
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Summarize a dc-ocpp CAN session capture (candump -tz -x).")
-    ap.add_argument("--candump", required=True, type=Path, help="Path to candump log (from capture_session.sh)")
-    ap.add_argument("--dc-tail", type=Path, default=None, help="Optional dc_ocpp tail log (from capture_session.sh)")
+    ap = argparse.ArgumentParser(description="Summarize a v3 PLC/controller CAN session capture (candump -tz -x).")
+    ap.add_argument("--candump", required=True, type=Path, help="Path to candump log")
+    ap.add_argument("--dc-tail", type=Path, default=None, help="Optional dc_ocpp tail log")
     args = ap.parse_args()
 
     frames = parse_candump(args.candump)
@@ -291,4 +310,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

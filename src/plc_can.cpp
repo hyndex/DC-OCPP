@@ -27,7 +27,9 @@ namespace charger {
 namespace {
 
 constexpr int kPollMs = 200;
-constexpr int kDefaultTxPresentMs = 100;
+constexpr int kTxPresentActiveMs = 300;
+constexpr int kTxPresentIdleMs = 500;
+constexpr int kTxLimitsMs = 1500;
 constexpr int kMinTxLimitsMs = 200;
 constexpr int kMinTxPresentMs = 50;
 // Keep relay commands at 1 Hz to avoid extra CAN load while staying below the 3 s PLC watchdog.
@@ -54,9 +56,10 @@ constexpr uint8_t kRelayModule1Mask = 0x04u;
 constexpr std::chrono::milliseconds kBackpressureHoldMs(1500);
 constexpr int kBackpressureMaxLevel = 3;
 constexpr int kBackpressureLogIntervalMs = 1000;
-constexpr auto kProtocolRefreshInterval = std::chrono::seconds(30);
 constexpr int kPresentMaxIntervalMs = 500;
 constexpr int kLimitsMaxIntervalMs = 1500;
+constexpr auto kCanStatsLogInterval = std::chrono::seconds(30);
+constexpr int kCanStatsBitsPerFrameEst = 150; // extended ID, 8-byte payload; excludes bit-stuff worst-case
 
 bool is_printable_ascii(const std::vector<uint8_t>& bytes) {
     if (bytes.empty()) return false;
@@ -150,6 +153,104 @@ void PlcCanHardware::note_tx_backpressure(bool severe) {
     }
 }
 
+void PlcCanHardware::collect_can_stats_lines(std::chrono::steady_clock::time_point now, std::vector<std::string>& out) {
+    // Caller must hold state_mutex_.
+    struct Totals {
+        int plcs{0};
+        uint64_t tx_fast{0};
+        uint64_t tx_slow{0};
+        uint64_t rx_tlm_v3{0};
+        uint64_t tx_errno_enobufs{0};
+        uint64_t tx_errno_eagain{0};
+        uint64_t tx_errno_other{0};
+        std::array<uint64_t, 4> tx_backpressure_level_hits{};
+    };
+
+    std::map<std::string, Totals> totals_by_iface;
+    for (const auto& kv : connectors_) {
+        const auto& st = kv.second;
+        auto& t = totals_by_iface[st.iface];
+        t.plcs++;
+        t.tx_fast += st.tx_fast_ok + st.tx_fast_fail;
+        t.tx_slow += st.tx_slow_ok + st.tx_slow_fail;
+        t.rx_tlm_v3 += st.rx_tlm_v3;
+        t.tx_errno_enobufs += st.tx_errno_enobufs;
+        t.tx_errno_eagain += st.tx_errno_eagain;
+        t.tx_errno_other += st.tx_errno_other;
+        for (std::size_t i = 0; i < t.tx_backpressure_level_hits.size(); ++i) {
+            t.tx_backpressure_level_hits[i] += st.tx_backpressure_level_hits[i];
+        }
+    }
+
+    // Prevent unbounded growth if interfaces are removed at runtime.
+    for (auto it = iface_stats_.begin(); it != iface_stats_.end();) {
+        if (!totals_by_iface.count(it->first)) {
+            it = iface_stats_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (const auto& kv : totals_by_iface) {
+        const std::string& iface = kv.first;
+        const Totals& cur = kv.second;
+        auto& snap = iface_stats_[iface];
+        if (snap.last_log.time_since_epoch().count() == 0) {
+            snap.last_log = now;
+            snap.tx_fast = cur.tx_fast;
+            snap.tx_slow = cur.tx_slow;
+            snap.rx_tlm_v3 = cur.rx_tlm_v3;
+            snap.tx_errno_enobufs = cur.tx_errno_enobufs;
+            snap.tx_errno_eagain = cur.tx_errno_eagain;
+            snap.tx_errno_other = cur.tx_errno_other;
+            snap.tx_backpressure_level_hits = cur.tx_backpressure_level_hits;
+            continue;
+        }
+        const auto elapsed = now - snap.last_log;
+        if (elapsed < kCanStatsLogInterval) continue;
+        const double dt_s =
+            std::max(1e-3, std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count());
+
+        const uint64_t d_tx_fast = cur.tx_fast - snap.tx_fast;
+        const uint64_t d_tx_slow = cur.tx_slow - snap.tx_slow;
+        const uint64_t d_rx_tlm_v3 = cur.rx_tlm_v3 - snap.rx_tlm_v3;
+        const uint64_t d_enobufs = cur.tx_errno_enobufs - snap.tx_errno_enobufs;
+        const uint64_t d_eagain = cur.tx_errno_eagain - snap.tx_errno_eagain;
+        const uint64_t d_other = cur.tx_errno_other - snap.tx_errno_other;
+        std::array<uint64_t, 4> d_bp{};
+        for (std::size_t i = 0; i < d_bp.size(); ++i) {
+            d_bp[i] = cur.tx_backpressure_level_hits[i] - snap.tx_backpressure_level_hits[i];
+        }
+
+        const uint64_t total_frames =
+            d_tx_fast + d_tx_slow + d_rx_tlm_v3;
+        const double est_kbps = (static_cast<double>(total_frames) * kCanStatsBitsPerFrameEst) / dt_s / 1000.0;
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1);
+        oss << "PLC CAN stats"
+            << " iface=" << iface
+            << " plcs=" << cur.plcs
+            << " est_kbps=" << est_kbps
+            << " tx_fast_fps=" << (static_cast<double>(d_tx_fast) / dt_s)
+            << " tx_slow_fps=" << (static_cast<double>(d_tx_slow) / dt_s)
+            << " rx_tlm_fps=" << (static_cast<double>(d_rx_tlm_v3) / dt_s)
+            << " tx_err{enobufs=" << d_enobufs << ",eagain=" << d_eagain << ",other=" << d_other << "}"
+            << " bp_hits{l1=" << d_bp[1] << ",l2=" << d_bp[2] << ",l3=" << d_bp[3] << "}"
+            << " bp_lvl=" << backpressure_level_.load(std::memory_order_relaxed);
+        out.push_back(oss.str());
+
+        snap.last_log = now;
+        snap.tx_fast = cur.tx_fast;
+        snap.tx_slow = cur.tx_slow;
+        snap.rx_tlm_v3 = cur.rx_tlm_v3;
+        snap.tx_errno_enobufs = cur.tx_errno_enobufs;
+        snap.tx_errno_eagain = cur.tx_errno_eagain;
+        snap.tx_errno_other = cur.tx_errno_other;
+        snap.tx_backpressure_level_hits = cur.tx_backpressure_level_hits;
+    }
+}
+
 PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     started_at_ = std::chrono::steady_clock::now();
     if (!cfg_.plc_use_crc8) {
@@ -160,14 +261,9 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     auto clamp_ms = [](int value, int min_ms, int max_ms) {
         return std::min(max_ms, std::max(min_ms, value));
     };
-    const int warn_present_ms = cfg_.plc_present_warn_ms > 0 ? cfg_.plc_present_warn_ms : 1000;
-    const int warn_limits_ms = cfg_.plc_limits_warn_ms > 0 ? cfg_.plc_limits_warn_ms : 1500;
-    const int present_target_ms = std::max(1, warn_present_ms / 3);
-    const int limits_target_ms = std::max(1, warn_limits_ms / 2);
-    tx_present_base_ms_ = clamp_ms(std::min(kDefaultTxPresentMs, present_target_ms),
-                                   kMinTxPresentMs, kDefaultTxPresentMs);
-    tx_limits_base_ms_ = clamp_ms(std::min(1000, limits_target_ms),
-                                  kMinTxLimitsMs, 1000);
+    tx_present_base_ms_ = clamp_ms(kTxPresentActiveMs, kMinTxPresentMs, kPresentMaxIntervalMs);
+    tx_present_idle_ms_ = clamp_ms(kTxPresentIdleMs, kMinTxPresentMs, kPresentMaxIntervalMs);
+    tx_limits_base_ms_ = clamp_ms(kTxLimitsMs, kMinTxLimitsMs, kLimitsMaxIntervalMs);
     if (cfg_.autocharge_id_source == "evccid") {
         autocharge_source_ = AutochargeIdSource::Evccid;
     } else if (cfg_.autocharge_id_source == "emaid") {
@@ -175,6 +271,28 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
     } else {
         autocharge_source_ = AutochargeIdSource::Evmac;
     }
+    // Phase-offset initial TX timestamps so multiple PLCs don't align their EVSE_FAST/EVSE_SLOW bursts.
+    // Use the number of PLCs on a given interface to spread timestamps over the full cadence window.
+    std::map<int, std::pair<int, int>> phase_info; // connector_id -> (phase_idx, phase_cnt)
+    {
+        std::map<std::string, std::vector<std::pair<int, int>>> iface_order; // iface -> (plc_id, connector_id)
+        for (const auto& c : cfg_.connectors) {
+            const std::string iface = c.can_interface.empty() ? cfg_.can_interface : c.can_interface;
+            iface_order[iface].push_back(std::make_pair(c.plc_id, c.id));
+        }
+        for (auto& kv : iface_order) {
+            auto& v = kv.second;
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+                if (a.first != b.first) return a.first < b.first;
+                return a.second < b.second;
+            });
+            const int count = std::max(1, static_cast<int>(v.size()));
+            for (int idx = 0; idx < count; ++idx) {
+                phase_info[v[static_cast<std::size_t>(idx)].second] = std::make_pair(idx, count);
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
     for (const auto& c : cfg_.connectors) {
         auto& st = connectors_[c.id]; // default construct in-place (std::atomic is not copyable)
         st.cfg = c;
@@ -207,6 +325,16 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         st.relay_force_off = false;
         st.relay_state_dirty = true;
         st.relay_tx_urgent = true;
+        int phase_idx = 0;
+        int phase_cnt = 1;
+        if (const auto it = phase_info.find(c.id); it != phase_info.end()) {
+            phase_idx = it->second.first;
+            phase_cnt = std::max(1, it->second.second);
+        }
+        const int present_phase_ms = (tx_present_idle_ms_ * phase_idx) / phase_cnt;
+        const int limits_phase_ms = (tx_limits_base_ms_ * phase_idx) / phase_cnt;
+        st.last_present_tx = now - std::chrono::milliseconds(std::max(0, tx_present_idle_ms_ - present_phase_ms));
+        st.last_limits_tx = now - std::chrono::milliseconds(std::max(0, tx_limits_base_ms_ - limits_phase_ms));
         (void)open_socket_for_iface(st.iface);
     }
 
@@ -215,9 +343,10 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         rx_thread_ = std::thread(&PlcCanHardware::rx_loop, this);
         tx_thread_ = std::thread(&PlcCanHardware::tx_loop, this);
         init_ok_ = true;
-        EVLOG_info << "PLC CAN TX cadence: present=" << tx_present_base_ms_
+        EVLOG_info << "PLC CAN TX cadence: present_active=" << tx_present_base_ms_
+                   << "ms present_idle=" << tx_present_idle_ms_
                    << "ms limits=" << tx_limits_base_ms_ << "ms relay=" << kTxRelayMs << "ms";
-        EVLOG_info << "PLC CAN compact v2 enabled";
+        EVLOG_info << "PLC CAN compact protocol enabled";
     } else {
         EVLOG_warning << "PLC CAN backend disabled: no CAN sockets opened";
     }
@@ -265,7 +394,7 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
         return false;
     }
 
-    // Filter out high-traffic power-module frames (e.g. Maxwell 0x060xxxxx) so PLC telemetry like EVDC_TARGETS
+    // Filter out high-traffic power-module frames (e.g. Maxwell 0x060xxxxx) so PLC telemetry like PLC_TLM_V3
     // is less likely to be dropped under load. PLC contract frames use protocol field 0x0, plus boot config (0x9).
     {
         struct can_filter filters[2] {};
@@ -315,13 +444,20 @@ bool PlcCanHardware::open_socket_for_iface(const std::string& iface) {
     return true;
 }
 
-bool PlcCanHardware::send_frame(PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data,
-                                TxPriority pri) {
+bool PlcCanHardware::send_frame_raw(const std::string& iface,
+                                    int plc_id,
+                                    uint32_t can_id,
+                                    const std::array<uint8_t, 8>& data,
+                                    TxPriority pri,
+                                    int* out_errno) {
     int fd = -1;
     {
         std::lock_guard<std::mutex> lock(sockets_mutex_);
-        const auto it = sockets_.find(st.iface);
-        if (it == sockets_.end()) return false;
+        const auto it = sockets_.find(iface);
+        if (it == sockets_.end()) {
+            if (out_errno) *out_errno = ENODEV;
+            return false;
+        }
         fd = it->second;
     }
     struct can_frame frame {};
@@ -333,16 +469,16 @@ bool PlcCanHardware::send_frame(PlcState& st, uint32_t can_id, const std::array<
     static int enobufs_count = 0;
     const auto now_tp = std::chrono::steady_clock::now();
     bool noted_backpressure = false;
+    int last_errno = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
         const ssize_t n = write(fd, &frame, sizeof(frame));
         if (n == static_cast<ssize_t>(sizeof(frame))) {
             enobufs_count = 0;
-            st.tx_failure_streak = 0;
-            st.tx_quiet_until = std::chrono::steady_clock::time_point{};
-            st.last_tx_ok = now_tp;
+            if (out_errno) *out_errno = 0;
             return true;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            last_errno = errno;
             note_tx_backpressure(false);
             noted_backpressure = true;
             if (pri <= TxPriority::Control) {
@@ -352,6 +488,7 @@ bool PlcCanHardware::send_frame(PlcState& st, uint32_t can_id, const std::array<
             break; // drop lower-priority frames instead of piling up
         }
         if (n < 0 && errno == ENOBUFS) {
+            last_errno = errno;
             enobufs_count++;
             note_tx_backpressure(true);
             noted_backpressure = true;
@@ -365,16 +502,16 @@ bool PlcCanHardware::send_frame(PlcState& st, uint32_t can_id, const std::array<
                         last_reopen = now_tp;
                         {
                             std::lock_guard<std::mutex> lock(sockets_mutex_);
-                            const auto it = sockets_.find(st.iface);
+                            const auto it = sockets_.find(iface);
                             if (it != sockets_.end()) {
                                 if (it->second >= 0) close(it->second);
                                 sockets_.erase(it);
                             }
                         }
-                        open_socket_for_iface(st.iface);
+                        open_socket_for_iface(iface);
                         {
                             std::lock_guard<std::mutex> lock(sockets_mutex_);
-                            const auto it = sockets_.find(st.iface);
+                            const auto it = sockets_.find(iface);
                             fd = (it == sockets_.end()) ? -1 : it->second;
                         }
                     }
@@ -387,20 +524,20 @@ bool PlcCanHardware::send_frame(PlcState& st, uint32_t can_id, const std::array<
             }
         }
         if (n < 0 && !noted_backpressure) {
+            last_errno = errno;
             note_tx_backpressure(false);
             noted_backpressure = true;
         }
         const auto now = std::chrono::steady_clock::now();
         const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_err_log).count();
         if (since > 500) {
-            EVLOG_warning << "CAN write failed iface=" << st.iface << " plc=" << st.plc_id << " id=0x" << std::hex
+            EVLOG_warning << "CAN write failed iface=" << iface << " plc=" << plc_id << " id=0x" << std::hex
                           << can_id << std::dec << " errno=" << errno << " (" << std::strerror(errno) << ")";
             last_err_log = now;
         }
-        st.tx_failures++;
-        st.tx_errors_recent++;
         break;
     }
+    if (out_errno) *out_errno = (last_errno != 0) ? last_errno : errno;
     return false;
 }
 
@@ -447,39 +584,28 @@ void PlcCanHardware::tx_loop() {
         const uint64_t backpressure_until = backpressure_until_ms_.load(std::memory_order_relaxed);
         const bool severe_backpressure =
             backpressure_level >= kBackpressureMaxLevel && backpressure_until > now_ms;
+        std::vector<std::string> stats_lines;
         {
-            std::lock_guard<std::mutex> lock(state_mutex_);
+            std::unique_lock<std::mutex> lock(state_mutex_);
             for (auto& kv : connectors_) {
                 auto& st = kv.second;
-                int eff_backoff = backoff;
-                if (st.hlc_stage > 0 && st.hlc_stage < 9) {
-                    eff_backoff = std::max(eff_backoff, 2);
-                }
+                const int eff_backoff = backoff;
                 const bool allow_fast = !severe_backpressure || st.relay_tx_urgent || st.relay_state_dirty;
                 if (allow_fast) {
-                    update_fast_v2_tx(st, now, eff_backoff);
+                    update_fast_tx(st, now, eff_backoff, lock);
                 }
                 if (!severe_backpressure) {
-                    update_slow_v2_tx(st, now, eff_backoff);
-                }
-                const bool proto_needed = (!st.protocol_verified || !st.protocol_ok);
-                const bool have_ack = st.last_protocol_ack.time_since_epoch().count() != 0;
-                const bool proto_refresh =
-                    have_ack && (now - st.last_protocol_ack) >= kProtocolRefreshInterval;
-                const auto proto_interval = proto_needed ? std::chrono::milliseconds(1000)
-                                                        : std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                              kProtocolRefreshInterval);
-                const bool proto_due = (st.last_protocol_tx.time_since_epoch().count() == 0) ||
-                                       ((now - st.last_protocol_tx) >= proto_interval);
-                if ((proto_needed || proto_refresh) && proto_due && (!severe_backpressure || proto_needed)) {
-                    const auto payload =
-                        can_contract::build_config_cmd(can_contract::PARAM_PROTO_VERSION, 1, 0, use_crc_);
-                    (void)send_frame(st, can_contract::config_cmd_id(static_cast<uint8_t>(st.plc_id)), payload,
-                                     TxPriority::Heartbeat);
-                    st.protocol_sent = true;
-                    st.last_protocol_tx = now;
+                    update_slow_tx(st, now, eff_backoff, lock);
                 }
             }
+            if (last_can_stats_check_.time_since_epoch().count() == 0 ||
+                (now - last_can_stats_check_) >= std::chrono::seconds(1)) {
+                collect_can_stats_lines(now, stats_lines);
+                last_can_stats_check_ = now;
+            }
+        }
+        for (const auto& line : stats_lines) {
+            EVLOG_info << line;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -510,91 +636,74 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
     if (!st) return;
 
     const auto now = std::chrono::steady_clock::now();
-    if (can_id == can_contract::plc_state_v2_id(plc_id)) {
-        const auto info = can_contract::decode_plc_state_v2(data, use_crc_);
-        if (use_crc_ && !info.crc_ok) {
-            st->relay_status_crc_fail_count++;
-            if (st->last_relay_crc_warn.time_since_epoch().count() == 0 ||
-                (now - st->last_relay_crc_warn) > std::chrono::seconds(2)) {
-                EVLOG_warning << "PLC_STATE_V2 CRC fail from PLC " << static_cast<int>(plc_id)
-                              << " count=" << st->relay_status_crc_fail_count;
-                st->last_relay_crc_warn = now;
+    if (can_id == can_contract::plc_tlm_v3_id(plc_id)) {
+        st->rx_tlm_v3++;
+        const auto tlm = can_contract::decode_plc_tlm_v3(data, use_crc_);
+        if (use_crc_ && !tlm.crc_ok) {
+            st->tlm_v3_crc_fail_count++;
+            if (st->last_tlm_crc_warn.time_since_epoch().count() == 0 ||
+                (now - st->last_tlm_crc_warn) > std::chrono::seconds(2)) {
+                EVLOG_warning << "PLC_TLM_V3 CRC fail from PLC " << static_cast<int>(plc_id)
+                              << " count=" << st->tlm_v3_crc_fail_count;
+                st->last_tlm_crc_warn = now;
             }
             return;
         }
-        const uint32_t seq_mask = 0xFFFFFFu;
-        const uint32_t seq_half = 0x800000u;
-        const uint32_t seq = info.state_seq & seq_mask;
-        if (!st->plc_state_seq_valid) {
-            st->plc_state_seq_valid = true;
-            st->last_plc_state_seq = seq;
-        } else {
-            const uint32_t last = st->last_plc_state_seq & seq_mask;
-            const uint32_t delta = (seq - last) & seq_mask;
-            if (delta != 0) {
-                if (delta > seq_half) {
-                    if (st->last_plc_state_seq_warn.time_since_epoch().count() == 0 ||
-                        (now - st->last_plc_state_seq_warn) > std::chrono::seconds(2)) {
-                        EVLOG_warning << "PLC state seq reset/backwards on plc=" << static_cast<int>(plc_id)
-                                      << " connector=" << st->connector_id << " last=" << last
-                                      << " now=" << seq;
-                        st->last_plc_state_seq_warn = now;
-                    }
-                    st->last_plc_state_seq = seq;
-                } else {
-                    if (delta > 1) {
-                        st->plc_state_seq_missed += static_cast<uint64_t>(delta - 1);
-                        if (st->last_plc_state_seq_warn.time_since_epoch().count() == 0 ||
-                            (now - st->last_plc_state_seq_warn) > std::chrono::seconds(2)) {
-                            EVLOG_warning << "PLC state seq jump on plc=" << static_cast<int>(plc_id)
-                                          << " connector=" << st->connector_id << " last=" << last
-                                          << " now=" << seq << " missed=" << (delta - 1)
-                                          << " total_missed=" << st->plc_state_seq_missed;
-                            st->last_plc_state_seq_warn = now;
-                        }
-                    }
-                    st->last_plc_state_seq = seq;
-                }
-            }
-        }
-        st->cp_state_raw = info.cp_state;
-        st->cp_duty_raw = info.duty_pct;
-        st->cp_state_session = info.cp_state;
-        st->cp_duty_session = info.duty_pct;
-        st->hlc_stage = info.hlc_stage;
-        st->hlc_charge_complete = info.charge_complete;
-        st->hlc_precharge_active = info.precharge_active;
-        st->hlc_cable_checked = info.cable_checked;
-        st->hlc_auth_granted = info.auth_granted;
-        st->hlc_auth_pending = info.auth_pending;
-        st->lock_engaged = info.lock_engaged;
+        st->cp_state_raw = tlm.cp_state;
+        st->cp_state_session = tlm.cp_state;
+        st->cp_duty_raw = 0;
+        st->cp_duty_session = 0;
+        st->hlc_stage = tlm.hlc_stage;
+        st->hlc_charge_complete = tlm.charge_complete;
+        st->hlc_precharge_active = tlm.precharge_active;
+        st->hlc_cable_checked = tlm.cable_checked;
+        st->lock_engaged = tlm.lock_engaged;
         st->lock_engaged_valid = true;
-        st->authorized = info.auth_granted;
-        st->auth_pending = info.auth_pending;
         st->last_cp_rx = now;
         st->last_session_rx = now;
         st->last_chargeinfo_rx = now;
         st->last_status_rx = now;
-    } else if (can_id == can_contract::plc_status_v2_id(plc_id)) {
-        const auto decoded = can_contract::decode_plc_status_v2(data, use_crc_);
-        if (use_crc_ && !decoded.crc_ok) {
-            st->relay_status_crc_fail_count++;
-            if (st->last_relay_crc_warn.time_since_epoch().count() == 0 ||
-                (now - st->last_relay_crc_warn) > std::chrono::seconds(2)) {
-                EVLOG_warning << "PLC_STATUS_V2 CRC fail from PLC " << static_cast<int>(plc_id)
-                              << " count=" << st->relay_status_crc_fail_count;
-                st->last_relay_crc_warn = now;
-            }
-            return;
-        }
-        st->last_relay = decoded.relay;
-        st->last_safety = decoded.safety;
+
+        // Populate Relay/Safety status so existing fault gating logic continues to work.
+        st->last_relay.relay[0] = (tlm.relay_state_mask & 0x01u) != 0;
+        st->last_relay.relay[1] = (tlm.relay_state_mask & 0x02u) != 0;
+        st->last_relay.relay[2] = (tlm.relay_state_mask & 0x04u) != 0;
+        st->last_relay.relay_fault[0] = (tlm.relay_fault_mask & 0x01u) != 0;
+        st->last_relay.relay_fault[1] = (tlm.relay_fault_mask & 0x02u) != 0;
+        st->last_relay.relay_fault[2] = (tlm.relay_fault_mask & 0x04u) != 0;
+        st->last_relay.safety_ok = tlm.safety_ok;
+        st->last_relay.estop_latched = tlm.estop;
+        st->last_relay.estop_input = tlm.estop;
+        st->last_relay.earth_fault = tlm.earth_fault;
+        st->last_relay.comm_fault = tlm.comm_fault;
+        st->last_relay.fault_reason = tlm.fault_reason;
+        st->last_relay.crc_ok = tlm.crc_ok;
+
+        st->last_safety.safety_ok = tlm.safety_ok;
+        st->last_safety.estop_latched = tlm.estop;
+        st->last_safety.estop_input = tlm.estop;
+        st->last_safety.earth_fault = tlm.earth_fault;
+        st->last_safety.crc_ok = tlm.crc_ok;
+
         st->last_relay_rx = now;
         st->last_safety_rx = now;
-        st->last_status_rx = now;
-        if (cfg_.plc_relay_feedback || cfg_.plc_owns_gun_relay) {
-            st->output_enabled = st->last_relay.relay[0];
+
+        st->ev_target_voltage_v = tlm.ev_target_voltage_v;
+        st->ev_target_current_a = tlm.ev_target_current_a;
+        st->last_ev_targets_rx = now;
+
+        // In protocol v3, EVSE limit ACKs are conveyed by the low-byte of the PLC's received-limits counter.
+        bool ack_advanced = false;
+        const uint32_t extended =
+            can_contract::extend_counter_lsb(st->evse_limit_ack_count, tlm.limits_rx_count_lsb, &ack_advanced);
+        if (ack_advanced) {
+            st->evse_limit_ack_count = extended;
+            st->last_evse_limit_ack = now;
         }
+
+        // Authorization is controller-owned; keep the HLC echo state aligned so get_status() semantics remain stable.
+        st->hlc_auth_granted = st->authorized;
+        st->hlc_auth_pending = st->auth_pending;
     } else if (can_id == can_contract::energy_meter_id(plc_id)) {
         static std::atomic<uint64_t> seq{0};
         const uint8_t mux = data[0];
@@ -614,60 +723,11 @@ void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
             st->last_meter.freq_hz = m.freq_hz;
         }
         st->last_meter_rx = now;
-    } else if (can_id == can_contract::config_ack_id(plc_id)) {
-        auto ack = can_contract::decode_config_ack(data, use_crc_);
-        if (!ack.crc_ok) {
-            st->config_ack_crc_fail_count++;
-            if (st->last_config_ack_crc_warn.time_since_epoch().count() == 0 ||
-                (now - st->last_config_ack_crc_warn) > std::chrono::seconds(10)) {
-                EVLOG_warning << "ConfigAck CRC fail from PLC " << static_cast<int>(plc_id)
-                              << " count=" << st->config_ack_crc_fail_count;
-                st->last_config_ack_crc_warn = now;
-            }
-            return;
-        }
-        PlcState* target = st;
-        const uint8_t ack_plc = static_cast<uint8_t>(ack.plc_id & 0x0Fu);
-        if (ack_plc != plc_id) {
-            if (PlcState* alt = find_state_by_plc(ack_plc)) {
-                EVLOG_warning << "ConfigAck PLC ID mismatch can_id=" << static_cast<int>(plc_id)
-                              << " payload=" << static_cast<int>(ack_plc) << " (using payload id)";
-                target = alt;
-            } else {
-                EVLOG_warning << "ConfigAck PLC ID mismatch can_id=" << static_cast<int>(plc_id)
-                              << " payload=" << static_cast<int>(ack_plc) << " (no matching PLC state)";
-            }
-        }
-        const int target_plc = target ? target->plc_id : static_cast<int>(plc_id);
-        if (ack.param_id == can_contract::PARAM_EVSE_LIMIT_ACK) {
-            EVLOG_debug << "EVSE limits ack plc=" << target_plc << " count=" << ack.value;
-            target->evse_limit_ack_count = ack.value;
-            target->last_evse_limit_ack = now;
-        } else if (ack.param_id == can_contract::PARAM_PROTO_VERSION) {
-            const bool ok = (ack.status == 0) && (ack.value == can_contract::PROTOCOL_VERSION);
-            target->protocol_ok = ok;
-            target->protocol_verified = true;
-            target->last_protocol_ack = now;
-            if (!ok) {
-                EVLOG_error << "PLC protocol version mismatch plc=" << target_plc
-                            << " status=" << static_cast<int>(ack.status) << " value=" << ack.value
-                            << " expected=" << static_cast<int>(can_contract::PROTOCOL_VERSION);
-            } else {
-                EVLOG_info << "PLC protocol version OK plc=" << target_plc;
-            }
-        }
     } else if (can_id == can_contract::boot_config_id(plc_id)) {
         const auto cfg = can_contract::decode_boot_config(data);
         st->boot_feature_flags = cfg.feature_flags;
         st->meter_available = (cfg.feature_flags & can_contract::FEATURE_METER) != 0;
         st->last_boot_rx = now;
-    } else if (can_id == can_contract::evdc_targets_id(plc_id)) {
-        const auto targets = can_contract::decode_evdc_targets(data);
-        st->ev_target_voltage_v = targets.target_v;
-        st->ev_target_current_a = targets.target_a;
-        st->ev_present_voltage_v = targets.present_v;
-        st->ev_present_current_a = targets.present_a;
-        st->last_ev_targets_rx = now;
     } else if (can_id == can_contract::rfid_event_id(plc_id)) {
         const auto seg = can_contract::decode_rfid_event(data);
         if (seg.event_type == 0) {
@@ -804,8 +864,11 @@ void PlcCanHardware::set_lock_command(PlcState& st, bool lock) {
 }
 
 
-void PlcCanHardware::update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor) {
-    constexpr int kChangeTxMinMs = 200; // allow faster than 1 Hz on edges, but keep CAN load bounded
+void PlcCanHardware::update_fast_tx(PlcState& st,
+                                    std::chrono::steady_clock::time_point now,
+                                    int backoff_factor,
+                                    std::unique_lock<std::mutex>& state_lock) {
+    // Keep CAN load bounded. Relay edges bypass cadence gating via relay_tx_urgent.
     const std::array<uint8_t, 3> relay_bits{{kRelayGunMask, kRelayModule0Mask, kRelayModule1Mask}};
 
     // Apply relay transitions with per-relay minimum dwell times to reduce chatter.
@@ -914,14 +977,22 @@ void PlcCanHardware::update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::
     const uint16_t i = clamp_to_0p2_current(i_f);
     const uint16_t p = clamp_to_0p5k(p_kw_f);
     const uint8_t seq = st.seq.fetch_add(1);
-    const auto payload = can_contract::build_evse_fast_v2(v, i, p, st.output_enabled, st.regulating, st.fault_bits,
-                                                          st.relay_cmd_mask, st.relay_enable_mask, st.sys_enable,
-                                                          st.relay_force_off, st.relay_clear_faults, seq, use_crc_);
+    const auto payload = can_contract::build_evse_fast(v, i, p, st.output_enabled, st.regulating, st.fault_bits,
+                                                       st.relay_cmd_mask, st.relay_enable_mask, st.sys_enable,
+                                                       st.relay_force_off, st.relay_clear_faults, seq, use_crc_);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_present_tx).count();
-    const bool payload_changed = !st.last_present_payload_valid || (payload != st.last_present_payload);
-    const int keepalive_ms =
-        compute_interval_ms(tx_present_base_ms_, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
-    const bool allow_change_tx = elapsed >= kChangeTxMinMs;
+    // EVSE_FAST includes a sequence number and CRC; compare on a masked payload so keepalive cadence can be respected.
+    auto cmp = payload;
+    // seq spans bits 44..51 => byte5 upper nibble + byte6 lower nibble
+    cmp[5] &= 0x0Fu;
+    cmp[6] &= 0xF0u;
+    // Ignore CRC8 in comparisons.
+    cmp[7] = 0;
+    const bool payload_changed = !st.last_present_payload_valid || (cmp != st.last_present_payload);
+    const bool active = st.hlc_stage > 0 || st.relay_state_dirty || st.relay_tx_urgent;
+    const int base_ms = active ? tx_present_base_ms_ : tx_present_idle_ms_;
+    const int keepalive_ms = compute_interval_ms(base_ms, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
+    const bool allow_change_tx = elapsed >= keepalive_ms;
     const bool allow_keepalive_tx = elapsed >= keepalive_ms;
     if (st.tx_quiet_until.time_since_epoch().count() != 0 && now < st.tx_quiet_until && !st.relay_tx_urgent &&
         !st.relay_state_dirty) {
@@ -931,16 +1002,46 @@ void PlcCanHardware::update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::
         return;
     }
     const TxPriority pri = (st.relay_tx_urgent || st.relay_state_dirty) ? TxPriority::Control : TxPriority::Heartbeat;
+    const bool had_dirty = st.relay_state_dirty;
+    const bool had_urgent = st.relay_tx_urgent;
+    const bool had_clear_faults = st.relay_clear_faults;
+    // Optimistically clear so a concurrent update while unlocked won't be lost.
+    st.relay_state_dirty = false;
+    st.relay_tx_urgent = false;
+    state_lock.unlock();
+    int tx_errno = 0;
     const bool sent =
-        send_frame(st, can_contract::evse_fast_v2_id(static_cast<uint8_t>(st.plc_id)), payload, pri);
+        send_frame_raw(st.iface,
+                       st.plc_id,
+                       can_contract::evse_fast_id(static_cast<uint8_t>(st.plc_id)),
+                       payload,
+                       pri,
+                       &tx_errno);
+    state_lock.lock();
     if (!sent) {
+        st.tx_fast_fail++;
+        if (tx_errno == ENOBUFS) {
+            st.tx_errno_enobufs++;
+        } else if (tx_errno == EAGAIN || tx_errno == EWOULDBLOCK) {
+            st.tx_errno_eagain++;
+        } else if (tx_errno != 0) {
+            st.tx_errno_other++;
+        }
+        if (tx_errno == ENOBUFS || tx_errno == EAGAIN || tx_errno == EWOULDBLOCK) {
+            const int level = std::max(0, std::min(3, backpressure_level_.load(std::memory_order_relaxed)));
+            st.tx_backpressure_level_hits[static_cast<std::size_t>(level)]++;
+        }
+        if (had_dirty) st.relay_state_dirty = true;
+        if (had_urgent) st.relay_tx_urgent = true;
         const auto warn_now = std::chrono::steady_clock::now();
         const bool log_now = st.last_tx_warn.time_since_epoch().count() == 0 ||
                              (warn_now - st.last_tx_warn) > std::chrono::milliseconds(500);
         if (log_now) {
-            EVLOG_warning << "Failed to TX EVSE fast v2 on CAN for plc_id=" << st.plc_id;
+            EVLOG_warning << "Failed to TX EVSE_FAST on CAN for plc_id=" << st.plc_id;
             st.last_tx_warn = warn_now;
         }
+        st.tx_failures++;
+        st.tx_errors_recent++;
         st.last_present_tx = now; // throttle retry cadence under backpressure
         st.tx_failure_streak++;
         if (st.tx_failure_streak >= 5) {
@@ -957,17 +1058,24 @@ void PlcCanHardware::update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::
         }
         return;
     }
+    st.tx_fast_ok++;
+    st.tx_failure_streak = 0;
+    st.tx_quiet_until = std::chrono::steady_clock::time_point{};
+    st.last_tx_ok = std::chrono::steady_clock::now();
     st.last_tx_warn = std::chrono::steady_clock::time_point{};
-    st.last_present_payload = payload;
+    st.last_present_payload = cmp;
     st.last_present_payload_valid = true;
     st.last_present_tx = now;
     st.last_relay_tx = now;
-    st.relay_clear_faults = false;
-    st.relay_state_dirty = false;
-    st.relay_tx_urgent = false;
+    if (had_clear_faults) {
+        st.relay_clear_faults = false;
+    }
 }
 
-void PlcCanHardware::update_slow_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor) {
+void PlcCanHardware::update_slow_tx(PlcState& st,
+                                    std::chrono::steady_clock::time_point now,
+                                    int backoff_factor,
+                                    std::unique_lock<std::mutex>& state_lock) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_limits_tx).count();
     const double cfg_v = (st.cfg.max_voltage_v > 0.0) ? st.cfg.max_voltage_v
                                                      : (cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v
@@ -1002,41 +1110,64 @@ void PlcCanHardware::update_slow_v2_tx(PlcState& st, std::chrono::steady_clock::
         want_pending = (st.desired_auth_state == AuthorizationState::Pending);
     }
 
-    const auto payload = can_contract::build_evse_slow_v2(v,
-                                                          i,
-                                                          p,
-                                                          want_auth,
-                                                          want_pending,
-                                                          st.hlc_enabled,
-                                                          st.pnc_blocked,
-                                                          st.lock_command,
-                                                          can_contract::PROTOCOL_VERSION,
-                                                          use_crc_);
+    const auto payload = can_contract::build_evse_slow(v,
+                                                       i,
+                                                       p,
+                                                       want_auth,
+                                                       want_pending,
+                                                       st.hlc_enabled,
+                                                       st.pnc_blocked,
+                                                       st.lock_command,
+                                                       use_crc_);
     const bool payload_changed = !st.last_limits_payload_valid || (payload != st.last_limits_payload);
-    const bool hlc_quiet = st.hlc_stage > 0 && st.hlc_stage < 9;
     const int keepalive_ms =
         compute_interval_ms(tx_limits_base_ms_, kMinTxLimitsMs, kLimitsMaxIntervalMs, backoff_factor);
     const int change_ms = compute_interval_ms(kMinTxLimitsMs, kMinTxLimitsMs, kLimitsMaxIntervalMs, backoff_factor);
     const bool allow_change_tx = elapsed >= change_ms;
-    const bool allow_keepalive_tx = elapsed >= keepalive_ms * (hlc_quiet ? 2 : 1);
+    const bool allow_keepalive_tx = elapsed >= keepalive_ms;
     if (st.tx_quiet_until.time_since_epoch().count() != 0 && now < st.tx_quiet_until) {
         return;
     }
     if (!(payload_changed ? allow_change_tx : allow_keepalive_tx)) {
         return;
     }
+    state_lock.unlock();
+    int tx_errno = 0;
     const bool sent =
-        send_frame(st, can_contract::evse_slow_v2_id(static_cast<uint8_t>(st.plc_id)), payload,
-                   TxPriority::Telemetry);
+        send_frame_raw(st.iface,
+                       st.plc_id,
+                       can_contract::evse_slow_id(static_cast<uint8_t>(st.plc_id)),
+                       payload,
+                       TxPriority::Telemetry,
+                       &tx_errno);
+    state_lock.lock();
     if (!sent) {
+        st.tx_slow_fail++;
+        if (tx_errno == ENOBUFS) {
+            st.tx_errno_enobufs++;
+        } else if (tx_errno == EAGAIN || tx_errno == EWOULDBLOCK) {
+            st.tx_errno_eagain++;
+        } else if (tx_errno != 0) {
+            st.tx_errno_other++;
+        }
+        if (tx_errno == ENOBUFS || tx_errno == EAGAIN || tx_errno == EWOULDBLOCK) {
+            const int level = std::max(0, std::min(3, backpressure_level_.load(std::memory_order_relaxed)));
+            st.tx_backpressure_level_hits[static_cast<std::size_t>(level)]++;
+        }
         const auto warn_now = std::chrono::steady_clock::now();
         const bool log_now = st.last_tx_warn.time_since_epoch().count() == 0 ||
                              (warn_now - st.last_tx_warn) > std::chrono::milliseconds(500);
         if (log_now) {
-            EVLOG_warning << "Failed to TX EVSE slow v2 on CAN for plc_id=" << st.plc_id;
+            EVLOG_warning << "Failed to TX EVSE_SLOW on CAN for plc_id=" << st.plc_id;
             st.last_tx_warn = warn_now;
         }
+        st.tx_failures++;
+        st.tx_errors_recent++;
     } else {
+        st.tx_slow_ok++;
+        st.tx_failure_streak = 0;
+        st.tx_quiet_until = std::chrono::steady_clock::time_point{};
+        st.last_tx_ok = std::chrono::steady_clock::now();
         st.last_tx_warn = std::chrono::steady_clock::time_point{};
         st.last_limits_payload = payload;
         st.last_limits_payload_valid = true;
@@ -1167,7 +1298,7 @@ bool PlcCanHardware::assemble_rfid_segment(RfidAssembly& asmbl,
 }
 
 bool PlcCanHardware::enable(std::int32_t connector) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return false;
     auto& st = it->second;
@@ -1182,12 +1313,12 @@ bool PlcCanHardware::enable(std::int32_t connector) {
     (void)set_relay_command(st, false, 0x00u, false);
     st.relay_state_dirty = true;
     st.relay_tx_urgent = true;
-    update_fast_v2_tx(st, std::chrono::steady_clock::now(), 1);
+    update_fast_tx(st, std::chrono::steady_clock::now(), 1, lock);
     return true;
 }
 
 bool PlcCanHardware::disable(std::int32_t connector) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return false;
     auto& st = it->second;
@@ -1197,12 +1328,12 @@ bool PlcCanHardware::disable(std::int32_t connector) {
     (void)set_relay_command(st, false, 0x00u, true);
     st.relay_state_dirty = true;
     st.relay_tx_urgent = true;
-    update_fast_v2_tx(st, std::chrono::steady_clock::now(), 1);
+    update_fast_tx(st, std::chrono::steady_clock::now(), 1, lock);
     return true;
 }
 
 bool PlcCanHardware::pause_charging(std::int32_t connector) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return false;
     auto& st = it->second;
@@ -1213,7 +1344,7 @@ bool PlcCanHardware::pause_charging(std::int32_t connector) {
     (void)set_relay_command(st, false, 0x00u, false);
     st.relay_state_dirty = true;
     st.relay_tx_urgent = true;
-    update_fast_v2_tx(st, std::chrono::steady_clock::now(), 1);
+    update_fast_tx(st, std::chrono::steady_clock::now(), 1, lock);
     return true;
 }
 
@@ -1222,7 +1353,7 @@ bool PlcCanHardware::resume_charging(std::int32_t connector) {
 }
 
 bool PlcCanHardware::stop_transaction(std::int32_t connector, ocpp::v16::Reason) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return false;
     auto& st = it->second;
@@ -1234,7 +1365,7 @@ bool PlcCanHardware::stop_transaction(std::int32_t connector, ocpp::v16::Reason)
     (void)set_relay_command(st, false, 0x00u, true);
     st.relay_state_dirty = true;
     st.relay_tx_urgent = true;
-    update_fast_v2_tx(st, std::chrono::steady_clock::now(), 1);
+    update_fast_tx(st, std::chrono::steady_clock::now(), 1, lock);
     return true;
 }
 
@@ -1387,18 +1518,6 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     // Treat "never received any status yet" as unknown during startup grace rather than a comm fault.
     // After the grace window, missing/stale frames become actionable.
     const bool comm_missing = !status_seen && !within_startup_grace;
-    const auto protocol_grace = std::chrono::milliseconds(15000);
-    const bool protocol_grace_active =
-        started_at_.time_since_epoch().count() != 0 && (now - started_at_) < protocol_grace;
-    const bool protocol_fault = st.protocol_verified ? !st.protocol_ok : !protocol_grace_active;
-    if (protocol_fault) {
-        if (st.last_protocol_warn.time_since_epoch().count() == 0 ||
-            (now - st.last_protocol_warn) > std::chrono::seconds(10)) {
-            EVLOG_warning << "PLC protocol not verified or mismatched on plc=" << st.plc_id
-                          << " verified=" << st.protocol_verified << " ok=" << st.protocol_ok;
-            st.last_protocol_warn = now;
-        }
-    }
     // RelayStatus comm_fault is transport health (not contactor aux feedback), so honor it even when
     // relay feedback contacts are unavailable on the harness.
     const bool relay_comm_fault = relay_seen && !relay_stale && st.last_relay.comm_fault;
@@ -1407,7 +1526,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
                                st.desired_sys_enable;
     const bool raw_comm_fault =
         comm_relevant &&
-        (status_stale || comm_missing || relay_stale || safety_stale || relay_comm_fault || protocol_fault);
+        (status_stale || comm_missing || relay_stale || safety_stale || relay_comm_fault);
 
     // Safety inputs are only authoritative when their respective telemetry is fresh.
     const bool relay_status_fresh = relay_feedback && relay_seen && !relay_stale;
@@ -1645,8 +1764,9 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         pc = st.present_current_a;
         pp_kw = st.present_power_kw;
     } else if (ev_targets_fresh) {
-        pv = st.ev_present_voltage_v;
-        pc = st.ev_present_current_a;
+        // PLC telemetry provides target V/I; use these as a fallback estimate when no present reading is available.
+        pv = st.ev_target_voltage_v;
+        pc = st.ev_target_current_a;
         pp_kw = (pv > 0.0 && pc > 0.0) ? (pv * pc) / 1000.0 : 0.0;
     } else {
         pv = st.present_voltage_v;
@@ -1710,9 +1830,6 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.isolation_fault = false;
         gs.cp_fault = false;
     }
-    gs.plc_state_seq = st.last_plc_state_seq;
-    gs.plc_state_seq_valid = st.plc_state_seq_valid;
-    gs.plc_state_seq_missed = st.plc_state_seq_missed;
     gs.backpressure_level = static_cast<uint8_t>(backpressure_level_.load(std::memory_order_relaxed));
     gs.degraded_mode = gs.comm_fault || gs.backpressure_level > 0;
     gs.tx_error_count = st.tx_failures;
@@ -2011,13 +2128,13 @@ void PlcCanHardware::publish_fault_state(std::int32_t connector, uint8_t fault_b
 }
 
 void PlcCanHardware::clear_faults(std::int32_t connector) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
     if (it == connectors_.end()) return;
     auto& st = it->second;
     st.relay_clear_faults = true;
     st.relay_tx_urgent = true;
-    update_fast_v2_tx(st, std::chrono::steady_clock::now(), 1);
+    update_fast_tx(st, std::chrono::steady_clock::now(), 1, lock);
 }
 
 std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() {

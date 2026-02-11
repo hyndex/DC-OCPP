@@ -5838,9 +5838,7 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
                << " hlc_stage=" << static_cast<int>(status.hlc_stage)
                << " hlc_ready=" << (status.hlc_power_ready ? "1" : "0")
                << " fault=" << (fault_active ? "1" : "0")
-               << " meter_stale=" << (status.meter_stale ? "1" : "0")
-               << " plc_seq=" << (status.plc_state_seq_valid ? std::to_string(status.plc_state_seq) : "n/a")
-               << " plc_missed=" << status.plc_state_seq_missed;
+               << " meter_stale=" << (status.meter_stale ? "1" : "0");
 
     if (!charge_point_) {
         std::lock_guard<std::mutex> lock(state_mutex_);

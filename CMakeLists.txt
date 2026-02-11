@@ -557,6 +557,12 @@ if(BUILD_APP_TESTS)
   target_link_libraries(deterministic_vectors_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(deterministic_vectors_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(plc_tlm_v3_tests
+    tests/plc_tlm_v3_tests.cpp
+  )
+  target_include_directories(plc_tlm_v3_tests PRIVATE include)
+  target_compile_definitions(plc_tlm_v3_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(pending_token_persistence_tests
     tests/pending_token_persistence_tests.cpp
     src/ocpp_adapter.cpp
@@ -841,6 +847,7 @@ if(BUILD_APP_TESTS)
     power_manager_invariants_tests
     auth_flow_tests
     deterministic_vectors_tests
+    plc_tlm_v3_tests
     pending_token_persistence_tests
     derate_fault_tests
     limit_fallback_tests
@@ -880,6 +887,7 @@ if(BUILD_APP_TESTS)
   add_test(NAME power_manager_invariants_tests COMMAND power_manager_invariants_tests)
   add_test(NAME auth_flow_tests COMMAND auth_flow_tests)
   add_test(NAME deterministic_vectors_tests COMMAND deterministic_vectors_tests)
+  add_test(NAME plc_tlm_v3_tests COMMAND plc_tlm_v3_tests)
   add_test(NAME pending_token_persistence_tests COMMAND pending_token_persistence_tests)
   add_test(NAME derate_fault_tests COMMAND derate_fault_tests)
   add_test(NAME limit_fallback_tests COMMAND limit_fallback_tests)
@@ -912,6 +920,7 @@ if(BUILD_APP_TESTS)
       power_manager_invariants_tests
       auth_flow_tests
       deterministic_vectors_tests
+      plc_tlm_v3_tests
       pending_token_persistence_tests
       derate_fault_tests
       limit_fallback_tests

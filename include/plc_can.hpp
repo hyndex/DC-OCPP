@@ -130,8 +130,6 @@ private:
         double present_power_kw{0.0};
         double ev_target_voltage_v{0.0};
         double ev_target_current_a{0.0};
-        double ev_present_voltage_v{0.0};
-        double ev_present_current_a{0.0};
         double energy_kwh{0.0};
         double freq_hz{0.0};
         can_contract::RelayStatus last_relay{};
@@ -139,10 +137,6 @@ private:
         can_contract::MeterReading last_meter{};
         uint32_t evse_limit_ack_count{0};
         std::chrono::steady_clock::time_point last_evse_limit_ack{};
-        uint32_t last_plc_state_seq{0};
-        bool plc_state_seq_valid{false};
-        uint64_t plc_state_seq_missed{0};
-        std::chrono::steady_clock::time_point last_plc_state_seq_warn{};
         std::chrono::steady_clock::time_point last_energy_update{};
         std::chrono::steady_clock::time_point last_status_rx{};
         std::chrono::steady_clock::time_point last_relay_rx{};
@@ -166,7 +160,7 @@ private:
         uint8_t relay_enable_mask{0};
         bool relay_force_off{false};
         // Desired relay state (planner / EVSE control). Applied state is held in the fields above and is
-        // rate-limited/debounced in update_fast_v2_tx() to avoid relay chatter and excess CAN traffic.
+        // rate-limited/debounced in update_fast_tx() to avoid relay chatter and excess CAN traffic.
         bool desired_sys_enable{true};
         uint8_t desired_relay_cmd_mask{0};
         uint8_t desired_relay_enable_mask{0};
@@ -202,19 +196,8 @@ private:
         bool lock_command_set{false};
         uint8_t boot_feature_flags{0};
         bool meter_available{true};
-        bool protocol_ok{false};
-        bool protocol_verified{false};
-        bool protocol_sent{false};
-        std::chrono::steady_clock::time_point last_protocol_tx{};
-        std::chrono::steady_clock::time_point last_protocol_ack{};
-        std::chrono::steady_clock::time_point last_protocol_warn{};
-        // Track CAN-level protocol health.
-        uint64_t relay_status_crc_fail_count{0};
-        uint64_t safety_status_crc_fail_count{0};
-        uint64_t config_ack_crc_fail_count{0};
-        std::chrono::steady_clock::time_point last_relay_crc_warn{};
-        std::chrono::steady_clock::time_point last_safety_crc_warn{};
-        std::chrono::steady_clock::time_point last_config_ack_crc_warn{};
+        uint64_t tlm_v3_crc_fail_count{0};
+        std::chrono::steady_clock::time_point last_tlm_crc_warn{};
         // Debounce safety-related trips to avoid flapping on single-frame glitches.
         std::chrono::steady_clock::time_point safety_trip_since{};
         std::chrono::steady_clock::time_point estop_trip_since{};
@@ -236,6 +219,17 @@ private:
         std::chrono::steady_clock::time_point tx_quiet_until{};
         std::chrono::steady_clock::time_point last_tx_quiet_log{};
         uint32_t tx_failure_streak{0};
+
+        // PLC CAN stats (low-overhead counters used for periodic bandwidth/backpressure logs).
+        uint64_t tx_fast_ok{0};
+        uint64_t tx_fast_fail{0};
+        uint64_t tx_slow_ok{0};
+        uint64_t tx_slow_fail{0};
+        uint64_t tx_errno_enobufs{0};
+        uint64_t tx_errno_eagain{0};
+        uint64_t tx_errno_other{0};
+        std::array<uint64_t, 4> tx_backpressure_level_hits{};
+        uint64_t rx_tlm_v3{0};
     };
 
     ChargerConfig cfg_;
@@ -252,6 +246,7 @@ private:
     int connection_timeout_s_{0};
     int tx_limits_base_ms_{500};
     int tx_present_base_ms_{100};
+    int tx_present_idle_ms_{500};
     std::atomic<int> backpressure_level_{0};
     std::atomic<uint64_t> backpressure_until_ms_{0};
     std::atomic<uint64_t> last_backpressure_log_ms_{0};
@@ -260,17 +255,41 @@ private:
     std::mutex token_mutex_;
     std::vector<AuthToken> pending_tokens_;
 
+    struct IfaceStatsSnapshot {
+        std::chrono::steady_clock::time_point last_log{};
+        uint64_t tx_fast{0};
+        uint64_t tx_slow{0};
+        uint64_t rx_tlm_v3{0};
+        uint64_t tx_errno_enobufs{0};
+        uint64_t tx_errno_eagain{0};
+        uint64_t tx_errno_other{0};
+        std::array<uint64_t, 4> tx_backpressure_level_hits{};
+    };
+    std::map<std::string, IfaceStatsSnapshot> iface_stats_;
+    std::chrono::steady_clock::time_point last_can_stats_check_{};
+
+    void collect_can_stats_lines(std::chrono::steady_clock::time_point now, std::vector<std::string>& out);
 
     bool open_socket_for_iface(const std::string& iface);
-    bool send_frame(PlcState& st, uint32_t can_id, const std::array<uint8_t, 8>& data,
-                    TxPriority pri = TxPriority::Telemetry);
+    bool send_frame_raw(const std::string& iface,
+                        int plc_id,
+                        uint32_t can_id,
+                        const std::array<uint8_t, 8>& data,
+                        TxPriority pri,
+                        int* out_errno = nullptr);
     void rx_loop();
     void tx_loop();
     void handle_frame(uint32_t can_id, const uint8_t data[8]);
     PlcState* find_state_by_plc(uint8_t plc_id);
     std::int32_t connector_from_plc(uint8_t plc_id) const;
-    void update_fast_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
-    void update_slow_v2_tx(PlcState& st, std::chrono::steady_clock::time_point now, int backoff_factor);
+    void update_fast_tx(PlcState& st,
+                        std::chrono::steady_clock::time_point now,
+                        int backoff_factor,
+                        std::unique_lock<std::mutex>& state_lock);
+    void update_slow_tx(PlcState& st,
+                        std::chrono::steady_clock::time_point now,
+                        int backoff_factor,
+                        std::unique_lock<std::mutex>& state_lock);
     bool set_relay_command(PlcState& st, bool gun_on, uint8_t module_mask, bool force_off);
     void set_lock_command(PlcState& st, bool lock);
     void emit_autocharge_token(PlcState& st, const std::string& id_token,

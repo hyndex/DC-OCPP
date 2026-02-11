@@ -131,7 +131,7 @@ Constraints and defaults
 PLC/CAN contract
 - Authoritative details: `docs/CAN_CONTRACT.md` and `Ref/Basic/docs/CAN_DBC.dbc`.
 - Bus: 29-bit extended IDs, 125 kbps, CRC8 on required frames.
-- Handshake: controller expects `PROTO_VERSION` (param 91) and treats mismatches as comm faults.
+- Protocol is fixed at v3; no runtime protocol-version handshake is required.
 
 End-to-end CCS2 DC charging flows (PLC + controller + OCPP + modules)
 
@@ -149,9 +149,9 @@ Key loops and cadence (practically important for "jitter" and false positives)
 - Controller metering/auth loop: 50 ms per connector (`OcppAdapter::metering_loop` in `src/ocpp_adapter.cpp`).
 - Controller planner loop: 50 ms (`OcppAdapter::apply_power_plan` in `src/ocpp_adapter.cpp`).
 - CAN to PLC:
-  - EVSE_FAST_V2 (present V/I/P + relay cmd + faults): nominal 100 ms.
-  - EVSE_SLOW_V2 (limits + auth/pending + HLC gate + PnC block): nominal 1 s.
-  - See `docs/CAN_CONTRACT.md` for stale thresholds and ACK requirements.
+  - EVSE_FAST (present V/I/P + relay cmd + faults): nominal 100 ms.
+  - EVSE_SLOW (limits + auth/pending + HLC gate + PnC block): nominal 1 s.
+  - See `docs/CAN_CONTRACT.md` for stale thresholds and limits watchdog details.
 - PLC HLC authorization-pending timeout: default 150 s (`HLC_MAX_AUTH_PENDING_MS` in `Ref/Basic/src/defs.h`,
   enforced in `Ref/Basic/src/tcp.cpp`).
 
@@ -202,7 +202,7 @@ Token sources and connector selection
 
 HLC / digital communication gate (the critical rule)
 
-The controller controls whether the PLC advertises digital comms (5% CP duty) via EVSE_SLOW_V2 `hlc_enable`.
+The controller controls whether the PLC advertises digital comms (5% CP duty) via EVSE_SLOW `hlc_enable`.
 In the reference PLC firmware:
 - HLC gate: `hlc_gate_active() = g_hlc_enable && !g_force_preauth` (`Ref/Basic/src/main.cpp`).
 - CP duty: when `hlc_gate_active()` and CP is connected, PLC advertises digital comms (5%) and runs SLAC/ISO/DIN;
@@ -227,16 +227,16 @@ sequenceDiagram
     participant MOD as Modules
     participant CSMS
 
-    Note over CTRL,PLC: Controller publishes EVSE_SLOW_V2 (~1s) and EVSE_FAST_V2 (~100ms)
+    Note over CTRL,PLC: Controller publishes EVSE_SLOW (~1s) and EVSE_FAST (~100ms)
 
     loop Every ~50ms (planner)
-        PLC->>CTRL: PLC_STATE/STATUS + EVDC_TARGETS (EV target V/I + present V/I)
+        PLC->>CTRL: PLC_TLM_V3 (EV target V/I + present V/I)
         CTRL->>PM: compute_plan(active guns, requests, health, site limits)
         PM-->>CTRL: Plan (module allocation + setpoints + tie/GC intents)
         CTRL->>MOD: apply module setpoints + contactor sequencing (MN/MC gating)
-        CTRL->>PLC: EVSE_FAST_V2 (present V/I/P + relay cmd + fault bits)
-        CTRL->>PLC: EVSE_SLOW_V2 (max limits + auth bits + hlc_enable + pnc_blocked)
-        PLC-->>CTRL: CONFIG_ACK (EVSE_LIMIT_ACK) periodic
+        CTRL->>PLC: EVSE_FAST (present V/I/P + relay cmd + fault bits)
+        CTRL->>PLC: EVSE_SLOW (max limits + auth bits + hlc_enable + pnc_blocked)
+        PLC-->>CTRL: PLC_TLM_V3 limits_rx_count_lsb updates
     end
 
     par OCPP telemetry
@@ -256,15 +256,15 @@ sequenceDiagram
     participant CSMS
 
     EV->>PLC: Plug in (CP B)
-    PLC->>CTRL: PLC_STATE/STATUS (plugged_in=1)
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    PLC->>CTRL: PLC_TLM_V3 (cp_state indicates plug-in)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=1, pnc_blocked=0)
     PLC->>EV: CP duty 5% (digital comm advertised)
     PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
     CTRL->>CSMS: Authorize(Autocharge idTag)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1 while waiting)
+    CTRL->>PLC: EVSE_SLOW (auth_pending=1 while waiting)
     PLC->>EV: ContractAuthRes (EVSEProcessing=Ongoing)
     CSMS-->>CTRL: Authorize.conf (Accepted)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, auth_pending=0)
+    CTRL->>PLC: EVSE_SLOW (auth_granted=1, auth_pending=0)
     CTRL->>CSMS: StartTransaction (meterStart captured)
     PLC->>EV: ContractAuthRes (Finished) + proceed to CPD/CableCheck/PreCharge/PowerDelivery
     Note over PLC,CTRL: Continue in "Common post-auth charging loop"
@@ -279,23 +279,23 @@ sequenceDiagram
     participant CSMS
 
     EV->>PLC: Plug in (CP B)
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=1, pnc_blocked=0)
     PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
     CTRL->>CSMS: Authorize(Autocharge idTag)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
+    CTRL->>PLC: EVSE_SLOW (auth_pending=1)
     alt CSMS rejects Autocharge
         CSMS-->>CTRL: Authorize.conf (Denied)
     else Controller HLC auth timeout (hlcAuthorizationSeconds)
         CTRL->>CTRL: HLC auth timeout reached
     end
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
     PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
     Note right of CTRL: Autocharge blocked for TTL; requires EIM fallback
 
     CSMS->>CTRL: RemoteStartTransaction(idTag, connectorId)
     CTRL->>CSMS: Authorize(RemoteStart idTag) (or prevalidated)
     CSMS-->>CTRL: Authorize.conf (Accepted)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1, pnc_blocked=1)
+    CTRL->>PLC: EVSE_SLOW (auth_granted=1, hlc_enable=1, pnc_blocked=1)
     CTRL->>CSMS: StartTransaction
     PLC->>EV: CP duty 5% (digital comm advertised)
     Note over PLC,CTRL: Continue in "Common post-auth charging loop"
@@ -310,16 +310,16 @@ sequenceDiagram
     participant CSMS
 
     EV->>PLC: Plug in (CP B)
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=1, pnc_blocked=0)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=1, pnc_blocked=0)
     PLC->>CTRL: EV identity segments (EVMAC/EVCCID/EMAID)
     CTRL->>CSMS: Authorize(Autocharge idTag)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_pending=1)
+    CTRL->>PLC: EVSE_SLOW (auth_pending=1)
     alt CSMS rejects Autocharge
         CSMS-->>CTRL: Authorize.conf (Denied)
     else Controller HLC auth timeout (hlcAuthorizationSeconds)
         CTRL->>CTRL: HLC auth timeout reached
     end
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=0, pnc_blocked=1, auth_pending=0, auth_granted=0)
     PLC->>EV: CP duty 100% (digital comm suppressed, preauth)
     Note right of CTRL: Autocharge blocked for TTL; requires EIM fallback
 
@@ -327,7 +327,7 @@ sequenceDiagram
     PLC->>CTRL: RFID_EVENT segments (UID)
     CTRL->>CSMS: Authorize(RFID idTag)
     CSMS-->>CTRL: Authorize.conf (Accepted)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1, pnc_blocked=1)
+    CTRL->>PLC: EVSE_SLOW (auth_granted=1, hlc_enable=1, pnc_blocked=1)
     CTRL->>CSMS: StartTransaction
     PLC->>EV: CP duty 5% (digital comm advertised)
     Note over PLC,CTRL: Continue in "Common post-auth charging loop"
@@ -342,14 +342,14 @@ sequenceDiagram
     participant CSMS
 
     EV->>PLC: Plug in (CP B)
-    PLC->>CTRL: PLC_STATE/STATUS (plugged_in=1)
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
+    PLC->>CTRL: PLC_TLM_V3 (cp_state indicates plug-in)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=0, pnc_blocked=1)
     PLC->>EV: CP duty 100% (digital comm suppressed, waiting)
 
     CSMS->>CTRL: RemoteStartTransaction(idTag, connectorId)
     CTRL->>CSMS: Authorize(RemoteStart idTag) (or prevalidated)
     CSMS-->>CTRL: Authorize.conf (Accepted)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1)
+    CTRL->>PLC: EVSE_SLOW (auth_granted=1, hlc_enable=1)
     CTRL->>CSMS: StartTransaction
     PLC->>EV: CP duty 5% (digital comm advertised)
     Note over PLC,CTRL: Continue in "Common post-auth charging loop"
@@ -364,14 +364,14 @@ sequenceDiagram
     participant CSMS
 
     EV->>PLC: Plug in (CP B)
-    CTRL->>PLC: EVSE_SLOW_V2 (hlc_enable=0, pnc_blocked=1)
+    CTRL->>PLC: EVSE_SLOW (hlc_enable=0, pnc_blocked=1)
     PLC->>EV: CP duty 100% (digital comm suppressed, waiting)
 
     EV->>PLC: User taps RFID
     PLC->>CTRL: RFID_EVENT segments (UID)
     CTRL->>CSMS: Authorize(RFID idTag)
     CSMS-->>CTRL: Authorize.conf (Accepted)
-    CTRL->>PLC: EVSE_SLOW_V2 (auth_granted=1, hlc_enable=1)
+    CTRL->>PLC: EVSE_SLOW (auth_granted=1, hlc_enable=1)
     CTRL->>CSMS: StartTransaction
     PLC->>EV: CP duty 5% (digital comm advertised)
     Note over PLC,CTRL: Continue in "Common post-auth charging loop"
