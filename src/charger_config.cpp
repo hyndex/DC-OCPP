@@ -119,6 +119,7 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             mc.rated_current_a = m.value("ratedCurrentA", 0.0);
             mc.poll_interval_ms = m.value("pollMs", 500);
             mc.cmd_interval_ms = m.value("cmdIntervalMs", 500);
+            mc.poll_budget_fps = m.value("pollBudgetFps", 0);
             mc.telemetry_stale_ms = m.value("telemetryStaleMs", 0);
             mc.broadcast = m.value("broadcast", false);
             mc.probe_on_startup = m.value("probeOnStartup", true);
@@ -253,6 +254,15 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.require_auth_for_precharge = planner_value("requireAuthForPrecharge", cfg.require_auth_for_precharge);
     // Alias for legacy / clearer naming.
     cfg.require_auth_for_precharge = planner_value("blockPrechargeUntilAuthorized", cfg.require_auth_for_precharge);
+    const auto can_traffic = json.value("canTraffic", nlohmann::json::object());
+    cfg.can_traffic.max_total_kbps_per_interface =
+        can_traffic.value("maxTotalKbpsPerInterface", cfg.can_traffic.max_total_kbps_per_interface);
+    cfg.can_traffic.window_ms = can_traffic.value("windowMs", cfg.can_traffic.window_ms);
+    cfg.can_traffic.bits_per_frame_estimate =
+        can_traffic.value("bitsPerFrameEstimate", cfg.can_traffic.bits_per_frame_estimate);
+    cfg.can_traffic.over_cap_debounce_ms =
+        can_traffic.value("overCapDebounceMs", cfg.can_traffic.over_cap_debounce_ms);
+    cfg.can_traffic.enforce = can_traffic.value("enforce", cfg.can_traffic.enforce);
     if (cfg.module_power_kw <= 0.0) {
         cfg.module_power_kw = 30.0;
     }
@@ -308,6 +318,18 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.unlock_voltage_threshold_v <= 0.0) {
         cfg.unlock_voltage_threshold_v = 60.0;
+    }
+    if (cfg.can_traffic.max_total_kbps_per_interface <= 0.0) {
+        cfg.can_traffic.max_total_kbps_per_interface = 20.0;
+    }
+    if (cfg.can_traffic.window_ms < 1000) {
+        cfg.can_traffic.window_ms = 1000;
+    }
+    if (cfg.can_traffic.bits_per_frame_estimate < 80) {
+        cfg.can_traffic.bits_per_frame_estimate = 80;
+    }
+    if (cfg.can_traffic.over_cap_debounce_ms < 0) {
+        cfg.can_traffic.over_cap_debounce_ms = 0;
     }
     if (!cfg.plc_module_relays_enabled) {
         throw std::runtime_error(
@@ -436,12 +458,19 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     // Validate topology and identity mapping.
     {
         std::set<int> connector_ids;
+        std::set<std::pair<std::string, int>> connector_plc_keys;
         for (const auto& c : cfg.connectors) {
             if (c.id <= 0) {
                 throw std::runtime_error("Connector id must be > 0 (got " + std::to_string(c.id) + ")");
             }
             if (!connector_ids.insert(c.id).second) {
                 throw std::runtime_error("Duplicate connector id=" + std::to_string(c.id));
+            }
+            const std::string iface = c.can_interface.empty() ? cfg.can_interface : c.can_interface;
+            const auto key = std::make_pair(iface, c.plc_id);
+            if (!connector_plc_keys.insert(key).second) {
+                throw std::runtime_error("Duplicate PLC mapping: plcId=" + std::to_string(c.plc_id) +
+                                         " on interface '" + iface + "' is assigned to multiple connectors");
             }
         }
 
@@ -558,8 +587,14 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                 if (m.can_interface.empty()) {
                     m.can_interface = cfg.can_interface;
                 }
-                const bool is_rectifier = (m.type == "maxwell-enr" || m.type == "enr" ||
-                                           m.type == "uugreen" || m.type == "uugreenpower");
+                if (!m.type.empty()) {
+                    std::transform(m.type.begin(), m.type.end(), m.type.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                }
+                const bool is_maxwell_mxr_family =
+                    (m.type == "maxwell-mxr" || m.type == "maxwell" || m.type == "maxwell-max");
+                const bool is_rectifier =
+                    (m.type == "maxwell-enr" || m.type == "enr" || m.type == "uugreen" || m.type == "uugreenpower");
                 const bool is_tonhe = (m.type == "tonhe");
                 if (m.group < 0) {
                     m.group = 0;
@@ -593,8 +628,6 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                     m.silent_mode = -1;
                 }
                 if (!m.type.empty()) {
-                    std::transform(m.type.begin(), m.type.end(), m.type.begin(),
-                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                     if (is_tonhe && m.broadcast) {
                         throw std::runtime_error("Module " + m.id + " uses broadcast mode, which is not supported for Tonhe");
                     }
@@ -627,8 +660,22 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                     if (m.rated_current_a < 0.0) {
                         m.rated_current_a = 0.0;
                     }
+                    if (is_maxwell_mxr_family && m.rated_current_a <= 0.0) {
+                        const double default_voltage_v = cfg.default_voltage_v > 0.0 ? cfg.default_voltage_v : 800.0;
+                        const double derivation_voltage_v = std::max(200.0, default_voltage_v);
+                        if (m.rated_power_kw > 0.0) {
+                            m.rated_current_a = (m.rated_power_kw * 1000.0) / derivation_voltage_v;
+                        }
+                        if (m.rated_current_a <= 0.0) {
+                            throw std::runtime_error("Module " + m.id +
+                                                     " requires ratedCurrentA (or valid ratedPowerKW/defaultVoltageV)");
+                        }
+                    }
                     m.poll_interval_ms = std::max(100, m.poll_interval_ms);
                     m.cmd_interval_ms = std::max(100, m.cmd_interval_ms);
+                    if (m.poll_budget_fps < 0) {
+                        m.poll_budget_fps = 0;
+                    }
                     if (m.telemetry_stale_ms < 0) {
                         m.telemetry_stale_ms = 0;
                     }

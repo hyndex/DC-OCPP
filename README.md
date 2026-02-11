@@ -116,8 +116,15 @@ Module config (`slots[].modules[]`)
 - `canInterface`, `address`, `group`
 - Optional vendor fields: `monitorAddress`, `productionDay`, `serialLow`, `sourceAddress`,
   `inputMode`, `hiLoMode`, `silentMode`
-- `ratedPowerKW`, `ratedCurrentA`, `pollMs`, `cmdIntervalMs`, `telemetryStaleMs`
+- `ratedPowerKW`, `ratedCurrentA`, `pollMs`, `cmdIntervalMs`, `pollBudgetFps`, `telemetryStaleMs`
 - `broadcast`, `probeOnStartup`, `readbackLimits`, `sendOutputCurrent`, `sendOutputPower`
+
+CAN traffic policy (`canTraffic`)
+- `maxTotalKbpsPerInterface` (default `20.0`)
+- `windowMs` (default `10000`)
+- `bitsPerFrameEstimate` (default `150`)
+- `overCapDebounceMs` (default `5000`)
+- `enforce` (default `true`)
 
 Constraints and defaults
 - If `slots` is omitted, a ring is auto-generated from `connectors` order with two modules per slot.
@@ -132,6 +139,18 @@ PLC/CAN contract
 - Authoritative details: `docs/CAN_CONTRACT.md` and `Ref/Basic/docs/CAN_DBC.dbc`.
 - Bus: 29-bit extended IDs, 125 kbps, CRC8 on required frames.
 - Protocol is fixed at v3; no runtime protocol-version handshake is required.
+- Module CAN hard-cap policy:
+  - Total observed bus load target is `<20 kbps` per interface in active steady-state.
+  - Controller computes module budget with PLC reserve (`1.5 kbps` per PLC node on that interface).
+  - Non-urgent module traffic is throttled by a rolling-window governor; safety-urgent shutdown traffic bypasses throttling.
+  - If observed load remains above cap beyond debounce, controller latches `ModuleCanOverload` and derates/disables module output.
+  - Vendor protocol assumptions for module buses are based on:
+    `docs/modules/CAN Communication Protocol - Maxwell_V1.50.pdf`,
+    `docs/modules/ENR series CAN Comunication Protocol S0 (1).pdf`,
+    `docs/modules/UUGreenPower CAN Protocol (36.2 Version)Reference Guide.pdf`,
+    `docs/modules/TonHe CAN communication between charging module and monitor TONHE V1.2.pdf`.
+  - Tonhe periodic uplinks (nominal ~500 ms plus trigger traffic) are treated as non-throttleable inbound load;
+    sustained over-cap conditions latch `ModuleCanOverload`.
 
 End-to-end CCS2 DC charging flows (PLC + controller + OCPP + modules)
 
@@ -149,8 +168,9 @@ Key loops and cadence (practically important for "jitter" and false positives)
 - Controller metering/auth loop: 50 ms per connector (`OcppAdapter::metering_loop` in `src/ocpp_adapter.cpp`).
 - Controller planner loop: 50 ms (`OcppAdapter::apply_power_plan` in `src/ocpp_adapter.cpp`).
 - CAN to PLC:
-  - EVSE_FAST (present V/I/P + relay cmd + faults): nominal 100 ms.
-  - EVSE_SLOW (limits + auth/pending + HLC gate + PnC block): nominal 1 s.
+  - EVSE_FAST (present V/I/P + relay cmd + faults): 300 ms when active, 500 ms idle keepalive.
+  - EVSE_SLOW (limits + auth/pending + HLC gate + PnC block): 1500 ms keepalive, earlier on change.
+  - PLC_TLM_V3 (CP/HLC/relay/safety/targets + limits watchdog): 300 ms active, 1000 ms idle.
   - See `docs/CAN_CONTRACT.md` for stale thresholds and limits watchdog details.
 - PLC HLC authorization-pending timeout: default 150 s (`HLC_MAX_AUTH_PENDING_MS` in `Ref/Basic/src/defs.h`,
   enforced in `Ref/Basic/src/tcp.cpp`).
@@ -227,7 +247,7 @@ sequenceDiagram
     participant MOD as Modules
     participant CSMS
 
-    Note over CTRL,PLC: Controller publishes EVSE_SLOW (~1s) and EVSE_FAST (~100ms)
+    Note over CTRL,PLC: Controller publishes EVSE_FAST (300/500ms) and EVSE_SLOW (~1500ms)
 
     loop Every ~50ms (planner)
         PLC->>CTRL: PLC_TLM_V3 (EV target V/I + present V/I)

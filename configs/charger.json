@@ -140,5 +140,12 @@
     "hlcAuthorizationSeconds": 150,
     "pncBlockSeconds": 1200
   },
+  "canTraffic": {
+    "maxTotalKbpsPerInterface": 20.0,
+    "windowMs": 10000,
+    "bitsPerFrameEstimate": 150,
+    "overCapDebounceMs": 5000,
+    "enforce": true
+  },
   "userConfig": "../data/user_config.json"
 }

@@ -30,6 +30,24 @@ int main() {
         return 1;
     }
 
+    auto precharge_overcurrent = local_fault_error_code("PrechargeOverCurrent");
+    if (precharge_overcurrent != ocpp::v16::ChargePointErrorCode::OverCurrentFailure) {
+        std::cerr << "error_catalog_tests failed: PrechargeOverCurrent should map to OverCurrentFailure\n";
+        return 1;
+    }
+
+    auto precharge_overshoot = local_fault_error_code("PrechargeVoltageOvershoot");
+    if (precharge_overshoot != ocpp::v16::ChargePointErrorCode::PowerSwitchFailure) {
+        std::cerr << "error_catalog_tests failed: PrechargeVoltageOvershoot should map to PowerSwitchFailure\n";
+        return 1;
+    }
+
+    auto can_overload = local_fault_error_code("ModuleCanOverload");
+    if (can_overload != ocpp::v16::ChargePointErrorCode::InternalError) {
+        std::cerr << "error_catalog_tests failed: ModuleCanOverload should map to InternalError\n";
+        return 1;
+    }
+
     std::cout << "error_catalog_tests passed\n";
     return 0;
 }

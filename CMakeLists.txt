@@ -712,6 +712,19 @@ if(BUILD_APP_TESTS)
   target_link_libraries(precharge_current_clamp_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(precharge_current_clamp_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(precharge_fault_latch_tests
+    tests/precharge_fault_latch_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(precharge_fault_latch_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(precharge_fault_latch_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(precharge_fault_latch_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(unlock_voltage_gate_tests
     tests/unlock_voltage_gate_tests.cpp
     src/ocpp_adapter.cpp
@@ -860,6 +873,7 @@ if(BUILD_APP_TESTS)
     gc_close_gating_tests
     gc_precharge_no_timeout_tests
     precharge_current_clamp_tests
+    precharge_fault_latch_tests
     unlock_voltage_gate_tests
     cable_check_no_hv_tests
     post_precharge_hold_tests
@@ -900,6 +914,7 @@ if(BUILD_APP_TESTS)
   add_test(NAME gc_close_gating_tests COMMAND gc_close_gating_tests)
   add_test(NAME gc_precharge_no_timeout_tests COMMAND gc_precharge_no_timeout_tests)
   add_test(NAME precharge_current_clamp_tests COMMAND precharge_current_clamp_tests)
+  add_test(NAME precharge_fault_latch_tests COMMAND precharge_fault_latch_tests)
   add_test(NAME unlock_voltage_gate_tests COMMAND unlock_voltage_gate_tests)
   add_test(NAME cable_check_no_hv_tests COMMAND cable_check_no_hv_tests)
   add_test(NAME post_precharge_hold_tests COMMAND post_precharge_hold_tests)
@@ -933,6 +948,7 @@ if(BUILD_APP_TESTS)
       gc_close_gating_tests
       gc_precharge_no_timeout_tests
       precharge_current_clamp_tests
+      precharge_fault_latch_tests
       unlock_voltage_gate_tests
       cable_check_no_hv_tests
       post_precharge_hold_tests

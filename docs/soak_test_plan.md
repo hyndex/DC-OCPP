@@ -21,6 +21,9 @@ Execution
 4) Let each charging session run for ≥2 hours with at least one paused/resume cycle to exercise
    the zero-amp pause path.
 5) If PLC is enabled, pull the CAN cable briefly (<3 s) once to confirm comm fault debounce/recovery.
+6) During peak load periods, capture CAN traffic and assert per-interface cap:
+   - `candump -tz -x canX > canX.log`
+   - `python3 scripts/analyze_session.py --candump canX.log --window-ms 10000 --bits-per-frame 150 --max-kbps 20 --assert-cap`
 
 Monitoring
 ----------

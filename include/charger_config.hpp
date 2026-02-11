@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,7 @@ struct ModuleConfig {
     double rated_current_a{0.0}; // optional per-module current rating
     int poll_interval_ms{500};
     int cmd_interval_ms{500};
+    int poll_budget_fps{0};      // 0 disables budget; otherwise caps low-priority poll reads per CAN interface
     int telemetry_stale_ms{0};   // override stale telemetry threshold (0 = auto)
     bool broadcast{false};
     bool probe_on_startup{true};
@@ -85,6 +87,14 @@ struct FirmwareUpdateConfig {
     std::string systemd_service_name;
     fs::path target_binary_path;
     int max_wait_seconds{900};
+};
+
+struct CanTrafficConfig {
+    double max_total_kbps_per_interface{20.0};
+    int window_ms{10000};
+    int bits_per_frame_estimate{150};
+    int over_cap_debounce_ms{5000};
+    bool enforce{true};
 };
 
 struct ChargerConfig {
@@ -169,6 +179,7 @@ struct ChargerConfig {
 
     SecurityConfig security;
     FirmwareUpdateConfig firmware_update;
+    CanTrafficConfig can_traffic;
     int meter_sample_interval_s{30};
     std::vector<ConnectorConfig> connectors;
     std::vector<SlotMapping> slots; // optional explicit topology map for ring/modules

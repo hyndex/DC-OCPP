@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@ struct ModuleSpec {
     double rated_current_a{0.0};
     int poll_interval_ms{500};
     int cmd_interval_ms{500};
+    int poll_budget_fps{0};
     int telemetry_stale_ms{0};
     bool broadcast{false}; // send via broadcast DST (0xFE or extended)
     bool probe_on_startup{true};
@@ -55,6 +57,18 @@ struct ModuleHealthSnapshot {
     double voltage_v{0.0};
     double current_a{0.0};
     double power_kw{0.0};
+    bool can_budget_limited{false};
+    bool can_overload_latched{false};
+    double can_total_kbps{0.0};
+};
+
+struct ModuleCanTrafficPolicy {
+    double max_total_kbps_per_interface{20.0};
+    int window_ms{10000};
+    int bits_per_frame_estimate{150};
+    int over_cap_debounce_ms{5000};
+    bool enforce{true};
+    std::map<std::string, double> plc_reserve_kbps_by_interface;
 };
 
 /// \brief Externalized power-module controller with pluggable module drivers (e.g. Maxwell MXR).
@@ -62,8 +76,10 @@ class PowerModuleController {
 public:
     PowerModuleController();
     explicit PowerModuleController(const std::vector<ModuleSpec>& specs);
+    PowerModuleController(const std::vector<ModuleSpec>& specs, const ModuleCanTrafficPolicy& policy);
     ~PowerModuleController();
 
+    void set_can_traffic_policy(const ModuleCanTrafficPolicy& policy);
     void set_modules(const std::vector<ModuleSpec>& specs);
     void apply_command(const ModuleCommandRequest& req);
     ModuleHealthSnapshot snapshot_for_slot(int slot_id) const;

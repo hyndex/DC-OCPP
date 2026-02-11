@@ -66,7 +66,7 @@ Run one full DC session end-to-end:
    - Confirm current is clamped to `<= prechargeMaxCurrentA` (default 2 A).
    - Confirm only the default/home module is energized during precharge.
 3. PowerDelivery + CurrentDemand:
-   - Confirm GC closes only in power phase (not in CableCheck).
+   - Confirm GC remains open in CableCheck, then closes in PreCharge only after EVSE is armed at ~0 V with precharge current clamp active.
    - Confirm dynamic module boost works:
      - Single EV demanding 60 kW: both modules allocated.
      - Second EV plugs: system safely re-segments to 1 module per gun without dropping EV1 GC.
@@ -76,8 +76,18 @@ Run one full DC session end-to-end:
 
 ## 5) Failure Injection (Must Pass)
 - CP loss / hot unplug while charging:
-  - Current collapses quickly and output discharges.
+  - Relay force-off is transmitted urgently and current collapses quickly, then output discharges.
+  - Verify measured behavior against design-guide target: `<5 A within 30 ms` and `<60 V within 100 ms`.
 - Stuck output / suspected weld (telemetry-only):
   - If commanded OPEN but voltage/current does not collapse, session faults safe and remains locked until service action.
 - Network loss:
   - CSMS reconnect logic does not deadlock; active sessions follow local safety policy.
+
+## 6) CAN bandwidth cap validation (module + PLC bus)
+1. Capture bus traffic on each active CAN interface during worst expected steady charging:
+   - `candump -tz -x canX > canX.log`
+2. Analyze with rolling-window assertion:
+   - `python3 scripts/analyze_session.py --candump canX.log --window-ms 10000 --bits-per-frame 150 --max-kbps 20 --assert-cap`
+3. Pass criteria:
+   - No interface exceeds `20 kbps` rolling estimate.
+   - No `ModuleCanOverload` latching in charger logs.

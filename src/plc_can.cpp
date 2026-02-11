@@ -34,7 +34,6 @@ constexpr int kMinTxLimitsMs = 200;
 constexpr int kMinTxPresentMs = 50;
 // Keep relay commands at 1 Hz to avoid extra CAN load while staying below the 3 s PLC watchdog.
 constexpr int kTxRelayMs = 1000;
-constexpr int kRelayMaxIntervalMs = 2000;
 constexpr int kSegmentTimeoutMs = 2000;
 constexpr int kPlugInDebounceMs = 200;
 constexpr int kPlugOutDebounceMs = 1000;
@@ -58,6 +57,8 @@ constexpr int kBackpressureMaxLevel = 3;
 constexpr int kBackpressureLogIntervalMs = 1000;
 constexpr int kPresentMaxIntervalMs = 500;
 constexpr int kLimitsMaxIntervalMs = 1500;
+constexpr int kTxLoopActiveMs = 10;
+constexpr int kTxLoopIdleMs = 50;
 constexpr auto kCanStatsLogInterval = std::chrono::seconds(30);
 constexpr int kCanStatsBitsPerFrameEst = 150; // extended ID, 8-byte payload; excludes bit-stuff worst-case
 
@@ -112,6 +113,10 @@ bool opt_equal(const std::optional<double>& a, const std::optional<double>& b) {
 bool limits_equal(const EvseLimits& a, const EvseLimits& b) {
     return opt_equal(a.max_voltage_v, b.max_voltage_v) && opt_equal(a.max_current_a, b.max_current_a) &&
            opt_equal(a.max_power_kw, b.max_power_kw);
+}
+
+bool cp_allows_power(char cp_state) {
+    return cp_state == 'C' || cp_state == 'D';
 }
 
 } // namespace
@@ -464,16 +469,22 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
     frame.can_id = can_id | CAN_EFF_FLAG;
     frame.can_dlc = 8;
     std::memcpy(frame.data, data.data(), 8);
-    static std::chrono::steady_clock::time_point last_err_log{};
-    static std::chrono::steady_clock::time_point last_reopen{};
-    static int enobufs_count = 0;
+    TxRetryState retry{};
+    {
+        std::lock_guard<std::mutex> lock(tx_retry_mutex_);
+        retry = tx_retry_state_[iface];
+    }
     const auto now_tp = std::chrono::steady_clock::now();
     bool noted_backpressure = false;
     int last_errno = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
         const ssize_t n = write(fd, &frame, sizeof(frame));
         if (n == static_cast<ssize_t>(sizeof(frame))) {
-            enobufs_count = 0;
+            retry.enobufs_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(tx_retry_mutex_);
+                tx_retry_state_[iface] = retry;
+            }
             if (out_errno) *out_errno = 0;
             return true;
         }
@@ -489,17 +500,17 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
         }
         if (n < 0 && errno == ENOBUFS) {
             last_errno = errno;
-            enobufs_count++;
+            retry.enobufs_count++;
             note_tx_backpressure(true);
             noted_backpressure = true;
             if (pri <= TxPriority::Heartbeat) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 // If TX queue is wedged, try reopening the socket once in a while.
-                if (enobufs_count >= 5) {
-                    const bool can_reopen = last_reopen.time_since_epoch().count() == 0 ||
-                                            (now_tp - last_reopen) > std::chrono::seconds(2);
+                if (retry.enobufs_count >= 5) {
+                    const bool can_reopen = retry.last_reopen.time_since_epoch().count() == 0 ||
+                                            (now_tp - retry.last_reopen) > std::chrono::seconds(2);
                     if (can_reopen) {
-                        last_reopen = now_tp;
+                        retry.last_reopen = now_tp;
                         {
                             std::lock_guard<std::mutex> lock(sockets_mutex_);
                             const auto it = sockets_.find(iface);
@@ -515,7 +526,7 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
                             fd = (it == sockets_.end()) ? -1 : it->second;
                         }
                     }
-                    enobufs_count = 0;
+                    retry.enobufs_count = 0;
                     if (fd < 0) break;
                     continue;
                 }
@@ -529,13 +540,17 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
             noted_backpressure = true;
         }
         const auto now = std::chrono::steady_clock::now();
-        const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_err_log).count();
+        const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - retry.last_err_log).count();
         if (since > 500) {
             EVLOG_warning << "CAN write failed iface=" << iface << " plc=" << plc_id << " id=0x" << std::hex
                           << can_id << std::dec << " errno=" << errno << " (" << std::strerror(errno) << ")";
-            last_err_log = now;
+            retry.last_err_log = now;
         }
         break;
+    }
+    {
+        std::lock_guard<std::mutex> lock(tx_retry_mutex_);
+        tx_retry_state_[iface] = retry;
     }
     if (out_errno) *out_errno = (last_errno != 0) ? last_errno : errno;
     return false;
@@ -543,18 +558,21 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
 
 void PlcCanHardware::rx_loop() {
     while (running_) {
-        std::vector<int> fds;
+        std::vector<std::pair<std::string, int>> iface_fds;
         {
             std::lock_guard<std::mutex> lock(sockets_mutex_);
-            fds.reserve(sockets_.size());
+            iface_fds.reserve(sockets_.size());
             for (const auto& kv : sockets_) {
-                fds.push_back(kv.second);
+                iface_fds.push_back(kv);
             }
         }
         std::vector<pollfd> pfds;
-        pfds.reserve(fds.size());
-        for (const int fd : fds) {
-            pfds.push_back(pollfd{fd, POLLIN, 0});
+        std::vector<std::string> ifaces;
+        pfds.reserve(iface_fds.size());
+        ifaces.reserve(iface_fds.size());
+        for (const auto& kv : iface_fds) {
+            pfds.push_back(pollfd{kv.second, POLLIN, 0});
+            ifaces.push_back(kv.first);
         }
         if (pfds.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
@@ -564,12 +582,14 @@ void PlcCanHardware::rx_loop() {
         if (rv <= 0) {
             continue;
         }
-        for (const auto& p : pfds) {
+        for (std::size_t i = 0; i < pfds.size(); ++i) {
+            const auto& p = pfds[i];
             if (!(p.revents & POLLIN)) continue;
+            const auto& iface = ifaces[i];
             struct can_frame cf {};
             while (read(p.fd, &cf, sizeof(cf)) == static_cast<ssize_t>(sizeof(cf))) {
                 if (!(cf.can_id & CAN_EFF_FLAG)) continue;
-                handle_frame(cf.can_id & CAN_EFF_MASK, cf.data);
+                handle_frame(iface, cf.can_id & CAN_EFF_MASK, cf.data);
             }
         }
     }
@@ -585,10 +605,16 @@ void PlcCanHardware::tx_loop() {
         const bool severe_backpressure =
             backpressure_level >= kBackpressureMaxLevel && backpressure_until > now_ms;
         std::vector<std::string> stats_lines;
+        bool active_relay_window = false;
         {
             std::unique_lock<std::mutex> lock(state_mutex_);
             for (auto& kv : connectors_) {
                 auto& st = kv.second;
+                const bool relays_active = (st.relay_cmd_mask & st.relay_enable_mask) != 0u;
+                const bool relays_requested = (st.desired_relay_cmd_mask & st.desired_relay_enable_mask) != 0u;
+                if (relays_active || relays_requested || st.relay_tx_urgent || st.relay_state_dirty) {
+                    active_relay_window = true;
+                }
                 const int eff_backoff = backoff;
                 const bool allow_fast = !severe_backpressure || st.relay_tx_urgent || st.relay_state_dirty;
                 if (allow_fast) {
@@ -607,18 +633,28 @@ void PlcCanHardware::tx_loop() {
         for (const auto& line : stats_lines) {
             EVLOG_info << line;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const int sleep_ms = active_relay_window ? kTxLoopActiveMs : kTxLoopIdleMs;
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
     }
 }
 
-PlcCanHardware::PlcState* PlcCanHardware::find_state_by_plc(uint8_t plc_id) {
+PlcCanHardware::PlcState* PlcCanHardware::find_state_by_plc(uint8_t plc_id, const std::string* iface) {
     // Caller must hold state_mutex_.
+    PlcState* fallback = nullptr;
     for (auto& kv : connectors_) {
         if (kv.second.plc_id == static_cast<int>(plc_id)) {
-            return &kv.second;
+            if (iface) {
+                if (kv.second.iface == *iface) {
+                    return &kv.second;
+                }
+                continue;
+            }
+            if (!fallback) {
+                fallback = &kv.second;
+            }
         }
     }
-    return nullptr;
+    return fallback;
 }
 
 std::int32_t PlcCanHardware::connector_from_plc(uint8_t plc_id) const {
@@ -629,10 +665,10 @@ std::int32_t PlcCanHardware::connector_from_plc(uint8_t plc_id) const {
     return 0;
 }
 
-void PlcCanHardware::handle_frame(uint32_t can_id, const uint8_t data[8]) {
+void PlcCanHardware::handle_frame(const std::string& iface, uint32_t can_id, const uint8_t data[8]) {
     const uint8_t plc_id = static_cast<uint8_t>(can_id & 0x0Fu);
     std::lock_guard<std::mutex> lock(state_mutex_);
-    PlcState* st = find_state_by_plc(plc_id);
+    PlcState* st = find_state_by_plc(plc_id, &iface);
     if (!st) return;
 
     const auto now = std::chrono::steady_clock::now();
@@ -837,11 +873,13 @@ bool PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module
     if (relay_force_off) {
         cmd_mask = 0;
     }
+    const bool have_relays_on = (st.relay_cmd_mask & st.relay_enable_mask) != 0u;
+    const bool want_relays_on = (cmd_mask & enable_mask) != 0u;
     const bool changed = (st.desired_relay_cmd_mask != cmd_mask) ||
                          (st.desired_relay_enable_mask != enable_mask) ||
                          (st.desired_relay_force_off != relay_force_off);
     if (changed) {
-        const bool would_open_relays = relay_force_off && !st.relay_force_off;
+        const bool would_open_relays = (have_relays_on && !want_relays_on) || (relay_force_off && !st.relay_force_off);
         st.desired_relay_cmd_mask = cmd_mask;
         st.desired_relay_enable_mask = enable_mask;
         st.desired_relay_force_off = relay_force_off;
@@ -874,8 +912,21 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
     // Apply relay transitions with per-relay minimum dwell times to reduce chatter.
     const uint8_t enable_mask = st.desired_relay_enable_mask;
     const bool want_sys_enable = st.desired_sys_enable;
-    const bool want_force_off = st.desired_relay_force_off;
+    bool want_force_off = st.desired_relay_force_off;
     uint8_t want_cmd_mask = static_cast<uint8_t>(st.desired_relay_cmd_mask & enable_mask);
+    const bool cp_session_fresh =
+        st.last_session_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_session_rx).count() <=
+            telemetry_timeout_ms_;
+    const bool cp_raw_fresh =
+        st.last_cp_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_cp_rx).count() <= telemetry_timeout_ms_;
+    const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
+    const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
+    const bool cp_interlock_ok = cp_fresh && cp_allows_power(cp_state);
+    if (!cp_interlock_ok) {
+        want_force_off = true;
+    }
     if (!want_sys_enable || want_force_off) {
         want_cmd_mask = 0;
     }
@@ -1441,6 +1492,7 @@ ocpp::Measurement PlcCanHardware::sample_meter(std::int32_t connector) {
     const bool meter_ok = use_plc_meter && st.last_meter.meter_ok && !st.last_meter.stale && !st.last_meter.comm_error;
     if (meter_ok) {
         st.energy_kwh = st.last_meter.import_energy_kwh;
+        st.last_energy_update = now;
     } else {
         if (st.last_energy_update.time_since_epoch().count() != 0) {
             const auto dt = std::chrono::duration_cast<std::chrono::seconds>(now - st.last_energy_update).count();
@@ -1930,7 +1982,17 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
             st.last_ev_targets_rx.time_since_epoch().count() != 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_ev_targets_rx).count() <=
                 telemetry_timeout_ms_;
-        const bool cp_ready = (st.cp_state_session == 'C' || st.cp_state_session == 'D');
+        const bool cp_session_fresh =
+            st.last_session_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_session_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_raw_fresh =
+            st.last_cp_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_cp_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
+        const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
+        const bool cp_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
             ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
         if (ev_requesting) {
@@ -1949,7 +2011,8 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
             relays_closed = st.relay_cmd_mask != 0u;
         }
         const bool hlc_allows_relays =
-            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && !st.hlc_charge_complete;
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_ready &&
+            !st.hlc_charge_complete;
         if (!hlc_allows_relays) {
             if (gun_on || relay_mask != 0u) {
                 static std::map<int, std::chrono::steady_clock::time_point> last_log;
@@ -1962,7 +2025,9 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
                                << " charge_complete=" << (st.hlc_charge_complete ? "1" : "0")
                                << " fresh=" << (hlc_fresh ? "1" : "0")
                                << " ev_req=" << (ev_requesting ? "1" : "0")
-                               << " cp=" << st.cp_state_session
+                               << " cp=" << cp_state
+                               << " cp_fresh=" << (cp_fresh ? "1" : "0")
+                               << " cp_ready=" << (cp_ready ? "1" : "0")
                                << " targetI=" << st.ev_target_current_a
                                << " targetV=" << st.ev_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");
@@ -2032,7 +2097,17 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
             st.last_ev_targets_rx.time_since_epoch().count() != 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_ev_targets_rx).count() <=
                 telemetry_timeout_ms_;
-        const bool cp_ready = (st.cp_state_session == 'C' || st.cp_state_session == 'D');
+        const bool cp_session_fresh =
+            st.last_session_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_session_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_raw_fresh =
+            st.last_cp_rx.time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_cp_rx).count() <=
+                telemetry_timeout_ms_;
+        const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
+        const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
+        const bool cp_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
             ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
         if (ev_requesting) {
@@ -2051,7 +2126,8 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
             relays_closed = st.relay_cmd_mask != 0u;
         }
         const bool hlc_allows_relays =
-            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && !st.hlc_charge_complete;
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_ready &&
+            !st.hlc_charge_complete;
         if (!hlc_allows_relays) {
             if (want_power) {
                 static std::map<int, std::chrono::steady_clock::time_point> last_log;
@@ -2064,7 +2140,9 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
                                << " charge_complete=" << (st.hlc_charge_complete ? "1" : "0")
                                << " fresh=" << (hlc_fresh ? "1" : "0")
                                << " ev_req=" << (ev_requesting ? "1" : "0")
-                               << " cp=" << st.cp_state_session
+                               << " cp=" << cp_state
+                               << " cp_fresh=" << (cp_fresh ? "1" : "0")
+                               << " cp_ready=" << (cp_ready ? "1" : "0")
                                << " targetI=" << st.ev_target_current_a
                                << " targetV=" << st.ev_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");

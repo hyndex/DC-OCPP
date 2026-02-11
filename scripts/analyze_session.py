@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 CANDUMP_RE = re.compile(
-    r"^\s*\((?P<t>[0-9.]+)\)\s+can0\s+(?P<dir>TX|RX)\s+-\s+-\s+(?P<id>[0-9A-Fa-f]+)\s+\[8\]\s+(?P<b>(?:[0-9A-Fa-f]{2}\s+){7}[0-9A-Fa-f]{2})\s*$"
+    r"^\s*\((?P<t>[0-9.]+)\)\s+(?P<iface>\S+)\s+(?P<dir>TX|RX)\s+-\s+-\s+(?P<id>[0-9A-Fa-f]+)\s+\[8\]\s+(?P<b>(?:[0-9A-Fa-f]{2}\s+){7}[0-9A-Fa-f]{2})\s*$"
 )
 
 
@@ -20,6 +20,7 @@ def parse_u32_le(bs: List[int], offset: int) -> int:
 @dataclasses.dataclass
 class Frame:
     t: float
+    iface: str
     direction: str
     can_id: int
     data: List[int]
@@ -111,10 +112,11 @@ def parse_candump(path: Path) -> List[Frame]:
         if not m:
             continue
         t = float(m.group("t"))
+        iface = m.group("iface")
         direction = m.group("dir")
         can_id = int(m.group("id"), 16)
         data = [int(x, 16) for x in m.group("b").split()]
-        frames.append(Frame(t=t, direction=direction, can_id=can_id, data=data))
+        frames.append(Frame(t=t, iface=iface, direction=direction, can_id=can_id, data=data))
     return frames
 
 
@@ -125,7 +127,14 @@ def parse_dc_tail(path: Path) -> List[str]:
         return []
 
 
-def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
+def summarize(
+    frames: List[Frame],
+    dc_lines: List[str],
+    window_ms: int = 10000,
+    bits_per_frame: int = 150,
+    max_kbps: Optional[float] = None,
+    assert_cap: bool = False,
+) -> int:
     if not frames:
         print("No CAN frames parsed (is this a candump -tz -x log?)")
         return 2
@@ -143,8 +152,11 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
     ID_CONFIG_ACK = 0x01A0
 
     per_id: Dict[int, int] = {}
+    per_iface_id: Dict[str, Dict[int, int]] = {}
     for f in frames:
         per_id[f.can_id] = per_id.get(f.can_id, 0) + 1
+        iface_counts = per_iface_id.setdefault(f.iface, {})
+        iface_counts[f.can_id] = iface_counts.get(f.can_id, 0) + 1
 
     print("\nKey frame rates:")
     for can_id, name in (
@@ -157,6 +169,21 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
     ):
         count = per_id.get(can_id, 0)
         print(f"  {name:11s} id=0x{can_id:03X} count={count:5d} fps={count / dt:7.2f}")
+    if per_iface_id:
+        print("\nKey frame rates by interface:")
+        for iface in sorted(per_iface_id.keys()):
+            counts = per_iface_id[iface]
+            print(f"  [{iface}]")
+            for can_id, name in (
+                (ID_EVSE_FAST, "EVSE_FAST"),
+                (ID_EVSE_SLOW, "EVSE_SLOW"),
+                (ID_PLC_TLM_V3, "PLC_TLM_V3"),
+                (ID_CONFIG_CMD, "ConfigCmd"),
+                (ID_CONFIG_ACK, "ConfigAck"),
+                (ID_RFID, "RFIDEvent"),
+            ):
+                count = counts.get(can_id, 0)
+                print(f"    {name:11s} id=0x{can_id:03X} count={count:5d} fps={count / dt:7.2f}")
 
     last_tlm: Optional[PlcTlmV3] = None
     first_nonzero_target: Optional[Tuple[float, float, float]] = None
@@ -282,6 +309,34 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
             for ln in interesting[-20:]:
                 print(f"  {ln}")
 
+    # Rolling-window bus load estimates (all frames, per interface).
+    if window_ms <= 0:
+        window_ms = 10000
+    window_s = max(1e-3, float(window_ms) / 1000.0)
+    bits = max(1, bits_per_frame)
+    max_kbps_by_iface: Dict[str, float] = {}
+    from collections import deque
+
+    iface_frames: Dict[str, List[Frame]] = {}
+    for f in frames:
+        iface_frames.setdefault(f.iface, []).append(f)
+    print("\nRolling bus load estimates:")
+    for iface in sorted(iface_frames.keys()):
+        q: deque = deque()
+        max_frames = 0
+        for f in iface_frames[iface]:
+            q.append(f.t)
+            cutoff = f.t - window_s
+            while q and q[0] < cutoff:
+                q.popleft()
+            if len(q) > max_frames:
+                max_frames = len(q)
+        max_kbps_iface = (float(max_frames) * float(bits)) / window_s / 1000.0
+        max_kbps_by_iface[iface] = max_kbps_iface
+        print(
+            f"  iface={iface} window_ms={window_ms} bits_per_frame={bits} max_kbps={max_kbps_iface:.3f}"
+        )
+
     print("\nHeuristics:")
     if per_id.get(ID_PLC_TLM_V3, 0) == 0:
         print("  - No PLC_TLM_V3 received: PLC TX path or CAN routing likely broken.")
@@ -292,6 +347,15 @@ def summarize(frames: List[Frame], dc_lines: List[str]) -> int:
     if first_nonzero_target is None:
         print("  - EV targets stayed zero: HLC may not have reached current-demand/precharge state.")
 
+    if assert_cap and max_kbps is not None:
+        offenders = [(iface, kbps) for iface, kbps in max_kbps_by_iface.items() if kbps > max_kbps]
+        if offenders:
+            print("\nCAP ASSERTION FAILED:")
+            for iface, kbps in offenders:
+                print(f"  iface={iface} max_kbps={kbps:.3f} > cap={max_kbps:.3f}")
+            return 3
+        print(f"\nCAP ASSERTION PASSED: all interfaces <= {max_kbps:.3f} kbps")
+
     return 0
 
 
@@ -299,13 +363,24 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize a v3 PLC/controller CAN session capture (candump -tz -x).")
     ap.add_argument("--candump", required=True, type=Path, help="Path to candump log")
     ap.add_argument("--dc-tail", type=Path, default=None, help="Optional dc_ocpp tail log")
+    ap.add_argument("--window-ms", type=int, default=10000, help="Rolling window (ms) for bus-load estimate")
+    ap.add_argument("--bits-per-frame", type=int, default=150, help="Estimated bits per CAN frame")
+    ap.add_argument("--max-kbps", type=float, default=None, help="CAN kbps cap for assertions")
+    ap.add_argument("--assert-cap", action="store_true", help="Fail if any interface exceeds --max-kbps")
     args = ap.parse_args()
 
     frames = parse_candump(args.candump)
     dc_lines: List[str] = []
     if args.dc_tail:
         dc_lines = parse_dc_tail(args.dc_tail)
-    return summarize(frames, dc_lines)
+    return summarize(
+        frames,
+        dc_lines,
+        window_ms=args.window_ms,
+        bits_per_frame=args.bits_per_frame,
+        max_kbps=args.max_kbps,
+        assert_cap=args.assert_cap,
+    )
 
 
 if __name__ == "__main__":

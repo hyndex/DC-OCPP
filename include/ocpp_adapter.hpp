@@ -201,6 +201,27 @@ public:
             return adapter.handle_resume_charging(connector);
         }
 
+        static void mark_local_hw_disable(OcppAdapter& adapter, std::int32_t connector, const std::string& reason) {
+            adapter.mark_local_hw_disable(connector, reason);
+        }
+
+        static void maybe_reenable_local_hw(OcppAdapter& adapter, std::int32_t connector, const GunStatus& status,
+                                            bool block_reenable, bool disabled_by_csms, bool paused) {
+            adapter.maybe_reenable_local_hw(connector, status, block_reenable, disabled_by_csms, paused);
+        }
+
+        static bool local_hw_disabled(OcppAdapter& adapter, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(adapter.state_mutex_);
+            const auto it = adapter.local_hw_disable_.find(connector);
+            return it != adapter.local_hw_disable_.end() && it->second;
+        }
+
+        static std::string local_hw_disable_reason(OcppAdapter& adapter, std::int32_t connector) {
+            std::lock_guard<std::mutex> lock(adapter.state_mutex_);
+            const auto it = adapter.local_hw_disable_reason_.find(connector);
+            return it != adapter.local_hw_disable_reason_.end() ? it->second : "";
+        }
+
         static bool evse_disabled(OcppAdapter& adapter, std::int32_t connector) {
             std::lock_guard<std::mutex> lock(adapter.plan_mutex_);
             const auto it = adapter.evse_disabled_.find(connector);
@@ -287,6 +308,7 @@ private:
     bool slots_initialized_{false};
     std::map<int, int> last_module_alloc_;
     std::map<int, double> last_voltage_v_;
+    std::map<int, double> precharge_ramp_cmd_voltage_v_;
     std::map<int, double> last_power_w_;
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
@@ -301,6 +323,12 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_arm_ready_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_ramp_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_voltage_stable_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_transition_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_overcurrent_since_;
+    std::map<int, std::chrono::steady_clock::time_point> precharge_overshoot_since_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_command_change_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> gc_command_change_time_;
     std::map<int, bool> paused_evse_;

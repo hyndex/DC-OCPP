@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -143,6 +144,59 @@ int main() {
         assert(threw);
     }
 
+    // Duplicate PLC IDs on the same CAN interface are invalid.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "canInterface": "can0", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 2 } },
+  "connectors": [
+    { "id": 1, "plcId": 2, "canInterface": "can0" },
+    { "id": 2, "plcId": 2, "canInterface": "can0" }
+  ],
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 2, "ccw": 2, "gc": "GC_1", "mc": "MC_1" },
+    { "id": 2, "gunId": 2, "cw": 1, "ccw": 1, "gc": "GC_2", "mc": "MC_2" }
+  ]
+}
+)JSON");
+        bool threw = false;
+        try {
+            (void)load_charger_config(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    // The same PLC ID is allowed when connectors are on different CAN interfaces.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "canInterface": "can0", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 2 } },
+  "connectors": [
+    { "id": 1, "plcId": 2, "canInterface": "can0" },
+    { "id": 2, "plcId": 2, "canInterface": "can1" }
+  ],
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 2, "ccw": 2, "gc": "GC_1", "mc": "MC_1" },
+    { "id": 2, "gunId": 2, "cw": 1, "ccw": 1, "gc": "GC_2", "mc": "MC_2" }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(cfg.connectors.size() == 2);
+        assert(cfg.connectors[0].plc_id == 2);
+        assert(cfg.connectors[1].plc_id == 2);
+    }
+
     // Split charging: allow 1 module per slot, reject >2 modules.
     {
         const auto dir = make_temp_dir();
@@ -161,13 +215,14 @@ int main() {
   },
   "slots": [
     { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
-      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0, "pollBudgetFps": 25 } ] }
   ]
 }
 )JSON");
         const auto cfg = load_charger_config(path);
         assert(cfg.slots.size() == 1);
         assert(cfg.slots.front().modules.size() == 1);
+        assert(cfg.slots.front().modules.front().poll_budget_fps == 25);
     }
 
     {
@@ -202,6 +257,63 @@ int main() {
             threw = true;
         }
         assert(threw);
+    }
+
+    // Maxwell MXR modules must always have a finite rated current (derive from power/default voltage when omitted).
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "defaultVoltageV": 800,
+  "modulePowerKW": 30,
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0, "ratedPowerKW": 40 } ] }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(cfg.slots.size() == 1);
+        assert(cfg.slots.front().modules.size() == 1);
+        const auto& module = cfg.slots.front().modules.front();
+        const double expected = 50.0; // 40kW / 800V
+        assert(std::fabs(module.rated_current_a - expected) < 1e-6);
+    }
+
+    // CAN traffic policy parsing and clamping.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "canTraffic": {
+    "maxTotalKbpsPerInterface": 18.5,
+    "windowMs": 5000,
+    "bitsPerFrameEstimate": 140,
+    "overCapDebounceMs": 2500,
+    "enforce": true
+  },
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(std::fabs(cfg.can_traffic.max_total_kbps_per_interface - 18.5) < 1e-9);
+        assert(cfg.can_traffic.window_ms == 5000);
+        assert(cfg.can_traffic.bits_per_frame_estimate == 140);
+        assert(cfg.can_traffic.over_cap_debounce_ms == 2500);
+        assert(cfg.can_traffic.enforce);
     }
 
     std::cout << "charger_config_tests passed\n";

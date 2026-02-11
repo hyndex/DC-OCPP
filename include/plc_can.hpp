@@ -268,6 +268,14 @@ private:
     std::map<std::string, IfaceStatsSnapshot> iface_stats_;
     std::chrono::steady_clock::time_point last_can_stats_check_{};
 
+    struct TxRetryState {
+        std::chrono::steady_clock::time_point last_err_log{};
+        std::chrono::steady_clock::time_point last_reopen{};
+        int enobufs_count{0};
+    };
+    std::mutex tx_retry_mutex_;
+    std::map<std::string, TxRetryState> tx_retry_state_;
+
     void collect_can_stats_lines(std::chrono::steady_clock::time_point now, std::vector<std::string>& out);
 
     bool open_socket_for_iface(const std::string& iface);
@@ -279,8 +287,8 @@ private:
                         int* out_errno = nullptr);
     void rx_loop();
     void tx_loop();
-    void handle_frame(uint32_t can_id, const uint8_t data[8]);
-    PlcState* find_state_by_plc(uint8_t plc_id);
+    void handle_frame(const std::string& iface, uint32_t can_id, const uint8_t data[8]);
+    PlcState* find_state_by_plc(uint8_t plc_id, const std::string* iface = nullptr);
     std::int32_t connector_from_plc(uint8_t plc_id) const;
     void update_fast_tx(PlcState& st,
                         std::chrono::steady_clock::time_point now,

@@ -28,6 +28,7 @@ enum class ErrorKey {
     McWelded,
     ModulesUnavailable,
     ModuleDegraded,
+    ModuleCanOverload,
     LockFault,
     MeterStale,
     GlobalFault
@@ -61,6 +62,8 @@ inline ErrorDescriptor descriptor(ErrorKey key) {
         return {ocpp::v16::ChargePointErrorCode::OtherError, true, "ModulesUnavailable", "MODULES"};
     case ErrorKey::ModuleDegraded:
         return {ocpp::v16::ChargePointErrorCode::OtherError, false, "ModulesDegraded", "MODULE_DEGRADED"};
+    case ErrorKey::ModuleCanOverload:
+        return {ocpp::v16::ChargePointErrorCode::InternalError, true, "ModuleCanOverload", "MODULE_CAN_OVERLOAD"};
     case ErrorKey::LockFault:
         return {ocpp::v16::ChargePointErrorCode::ConnectorLockFailure, true, "LockFault", "LOCK"};
     case ErrorKey::MeterStale:
@@ -86,8 +89,13 @@ inline ocpp::v16::ChargePointErrorCode local_fault_error_code(const std::string&
     if (reason == "GCWelded" || reason == "MCWelded" ||
         reason == "GCOpenTimeout" || reason == "GCCloseTimeout" ||
         reason == "MCOpenTimeout" || reason == "PowerDeliveryStalled" ||
-        reason == "StuckVoltage" || reason == "StuckCurrent") {
+        reason == "StuckVoltage" || reason == "StuckCurrent" ||
+        reason == "PrechargeTimeout" || reason == "PrechargeCloseTimeout" ||
+        reason == "PrechargeTransitionTimeout" || reason == "PrechargeVoltageOvershoot") {
         return ocpp::v16::ChargePointErrorCode::PowerSwitchFailure;
+    }
+    if (reason == "PrechargeOverCurrent") {
+        return ocpp::v16::ChargePointErrorCode::OverCurrentFailure;
     }
     if (reason == "Isolation") {
         return ocpp::v16::ChargePointErrorCode::GroundFailure;
@@ -99,6 +107,9 @@ inline ocpp::v16::ChargePointErrorCode local_fault_error_code(const std::string&
         return ocpp::v16::ChargePointErrorCode::OverCurrentFailure;
     }
     if (reason == "CommFault") {
+        return ocpp::v16::ChargePointErrorCode::InternalError;
+    }
+    if (reason == "ModuleCanOverload") {
         return ocpp::v16::ChargePointErrorCode::InternalError;
     }
     return ocpp::v16::ChargePointErrorCode::OtherError;

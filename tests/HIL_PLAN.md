@@ -57,9 +57,9 @@
 10. **Seamless retry tolerance**
     - Drop ISO15118 briefly (B1/B2 toggles) without unplug; controller keeps session, resumes Charging
 
-11. **PowerDelivery contactor closure**
-    - Run ISO15118 precharge to completion; send PowerDeliveryReq(Start)
-    - Expect: GC closes within tolerance window, CurrentDemand shows rising current, OCPP transitions to Charging
+11. **PreCharge contactor closure + PowerDelivery transition**
+    - Run ISO15118 precharge sequence with EV PreChargeReq active
+    - Expect: GC closes only after EVSE arm-at-0V + low-current clamp, precharge voltage ramps without dropping to 0, then CurrentDemand shows rising current after PowerDeliveryReq(Start)
 
 12. **Power delivery stall / GC close timeout**
     - Simulate GC close blocked or contactor closed with 0A (no current)

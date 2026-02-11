@@ -79,22 +79,49 @@ int main() {
         std::cerr << "gc_precharge_no_timeout_tests failed: missing power command\n";
         return 1;
     }
-    if (cmd0->gc_closed) {
-        std::cerr << "gc_precharge_no_timeout_tests failed: expected GC open during precharge\n";
+    if (!cmd0->gc_closed) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: expected GC closed at precharge arm\n";
+        return 1;
+    }
+    if (cmd0->current_limit_a > cfg.precharge_max_current_a + 1e-6) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: expected precharge current clamp\n";
         return 1;
     }
 
-    // Wait long enough to exceed the GC close timeout used for POWER_DELIVERY,
-    // ensuring we do not incorrectly fault/abort in precharge.
-    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
-    st.last_telemetry = std::chrono::steady_clock::now();
-    hw->set_status_override(1, st);
-    OcppAdapter::TestHook::apply_power_plan(adapter);
+    // Simulate normal precharge voltage rise; session must remain active (no false timeout).
+    for (double v : {40.0, 100.0, 180.0, 260.0, 340.0, 395.0}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        st.present_voltage_v = v;
+        st.last_telemetry = std::chrono::steady_clock::now();
+        hw->set_status_override(1, st);
+        OcppAdapter::TestHook::apply_power_plan(adapter);
+    }
 
     {
         std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter));
         if (OcppAdapter::TestHook::sessions(adapter).find(1) == OcppAdapter::TestHook::sessions(adapter).end()) {
-            std::cerr << "gc_precharge_no_timeout_tests failed: session cleared during precharge\n";
+            std::cerr << "gc_precharge_no_timeout_tests failed: session cleared during healthy precharge ramp\n";
+            return 1;
+        }
+    }
+
+    // Separate scenario: voltage never rises to target => precharge timeout fault should clear the session.
+    auto hw_stuck = std::make_shared<TestHardware>(cfg);
+    OcppAdapter adapter_stuck(cfg, hw_stuck);
+    seed_session(adapter_stuck, 1);
+
+    auto stuck = make_status(0.0, 400.0, 5.0);
+    hw_stuck->set_status_override(1, stuck);
+    OcppAdapter::TestHook::apply_power_plan(adapter_stuck);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    stuck.last_telemetry = std::chrono::steady_clock::now();
+    hw_stuck->set_status_override(1, stuck);
+    OcppAdapter::TestHook::apply_power_plan(adapter_stuck);
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_stuck));
+        if (OcppAdapter::TestHook::sessions(adapter_stuck).find(1) !=
+            OcppAdapter::TestHook::sessions(adapter_stuck).end()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: expected precharge timeout to clear session\n";
             return 1;
         }
     }
@@ -102,4 +129,3 @@ int main() {
     std::cout << "gc_precharge_no_timeout_tests passed\n";
     return 0;
 }
-

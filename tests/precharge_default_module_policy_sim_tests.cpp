@@ -158,7 +158,10 @@ int main() {
     GunStatus st2 = make_status(false, false, /*hlc_stage=*/0, false, false,
                                 /*present_v=*/0.0, /*present_i=*/0.0, /*target_v=*/0.0, /*target_i=*/0.0);
 
-    for (int tick = 0; tick < 3; ++tick) {
+    double prev_precharge_v = -1.0;
+    bool saw_precharge_gc_close = false;
+    bool reached_precharge_target = false;
+    for (int tick = 0; tick < 12; ++tick) {
         refresh_telem(st1);
         refresh_telem(st2);
         hw->set_status_override(1, st1);
@@ -175,6 +178,11 @@ int main() {
                       << cmd->module_count << "\n";
             return 1;
         }
+        if (!cmd->gc_closed) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: expected GC closed during precharge\n";
+            return 1;
+        }
+        saw_precharge_gc_close = true;
 
         const auto m1 = OcppAdapter::TestHook::last_module_command_for_slot(adapter, SLOT_M1);
         const auto m2 = OcppAdapter::TestHook::last_module_command_for_slot(adapter, SLOT_M2);
@@ -190,9 +198,14 @@ int main() {
             std::cerr << "precharge_default_module_policy_sim_tests failed: expected boost module disabled in precharge\n";
             return 1;
         }
-        if (m1->voltage_v < V - 5.0 || m1->voltage_v > V + 5.0) {
+        if (m1->voltage_v < -1e-6 || m1->voltage_v > V + 5.0) {
             std::cerr << "precharge_default_module_policy_sim_tests failed: unexpected precharge voltage cmd=" << m1->voltage_v
-                      << "V expected ~" << V << "V\n";
+                      << "V expected within [0," << V << "]\n";
+            return 1;
+        }
+        if (prev_precharge_v >= 0.0 && (m1->voltage_v + 1e-6) < prev_precharge_v) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: precharge voltage ramp regressed from "
+                      << prev_precharge_v << "V to " << m1->voltage_v << "V\n";
             return 1;
         }
         if (m1->current_a > cfg.precharge_max_current_a + 1e-6) {
@@ -200,6 +213,22 @@ int main() {
                       << m1->current_a << "A\n";
             return 1;
         }
+        prev_precharge_v = m1->voltage_v;
+        if (m1->voltage_v >= V - 5.0) {
+            reached_precharge_target = true;
+        }
+
+        // Simulate EV bus following the commanded precharge voltage.
+        st1.relay_closed = cmd->gc_closed;
+        st1.present_voltage_v = m1->voltage_v;
+    }
+    if (!saw_precharge_gc_close) {
+        std::cerr << "precharge_default_module_policy_sim_tests failed: GC never closed in precharge\n";
+        return 1;
+    }
+    if (!reached_precharge_target) {
+        std::cerr << "precharge_default_module_policy_sim_tests failed: precharge voltage never reached target\n";
+        return 1;
     }
 
     // Phase B: power delivery/current demand. Policy: allocate a second module only now, if demand requires.
@@ -251,4 +280,3 @@ int main() {
     std::cout << "precharge_default_module_policy_sim_tests passed\n";
     return 0;
 }
-

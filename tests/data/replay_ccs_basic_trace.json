@@ -25,7 +25,7 @@
     }
   },
   {
-    "name": "PreCharge_Clamp2A_DefaultModuleOnly",
+    "name": "PreCharge_CloseAtZeroAndRamp",
     "ticks": 3,
     "gun": {
       "safety_ok": true,
@@ -47,11 +47,11 @@
       "target_current_a": 10.0
     },
     "expect": {
-      "gc_closed": false,
+      "gc_closed": true,
       "module_count": 1,
       "max_current_limit_a": 2.0,
-      "min_voltage_set_v": 390.0,
-      "max_voltage_set_v": 410.0
+      "min_voltage_set_v": 70.0,
+      "max_voltage_set_v": 90.0
     }
   },
   {

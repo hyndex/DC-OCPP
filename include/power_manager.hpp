@@ -46,6 +46,7 @@ struct ModuleState {
     double rated_current_a{0.0};
     int poll_interval_ms{500};
     int cmd_interval_ms{500};
+    int poll_budget_fps{0};
     int telemetry_stale_ms{0};
     bool broadcast{false};
     bool probe_on_startup{true};

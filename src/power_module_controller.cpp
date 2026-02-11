@@ -3,14 +3,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -46,8 +53,6 @@ constexpr uint8_t MAXWELL_TYPE_FLOAT = 0x41;
 constexpr uint8_t MAXWELL_TYPE_INT = 0x42;
 constexpr uint8_t MAXWELL_OK = 0xF0;
 constexpr uint8_t MAXWELL_CONTROLLER_ADDR = 0xF0;
-constexpr std::chrono::milliseconds MAXWELL_PERIODIC_TX(500);
-constexpr std::chrono::milliseconds MAXWELL_POLL_PERIOD(500);
 // Severe faults that should mark modules unusable.
 constexpr uint32_t MAXWELL_ALARM_SEVERE_MASK =
     (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14) |
@@ -79,7 +84,6 @@ constexpr uint16_t TONHE_EXT_FAULT_SEVERE_MASK =
     (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 6) | (1u << 7) | (1u << 10);
 
 constexpr uint32_t TONHE_PGN_STATE = 0x000100;
-constexpr uint32_t TONHE_PGN_CONFIRM = 0x000200;
 constexpr uint32_t TONHE_PGN_STARTSTOP = 0x000600;
 constexpr uint32_t TONHE_PGN_AC_INFO = 0x000B00;
 constexpr uint32_t TONHE_PGN_EXT_STATUS = 0x009100;
@@ -153,15 +157,6 @@ uint16_t decode_u16_le(const uint8_t* buf) {
     return static_cast<uint16_t>(buf[0] | (static_cast<uint16_t>(buf[1]) << 8));
 }
 
-uint32_t decode_u32_be_from_bytes(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
-    return (static_cast<uint32_t>(b0) << 24) |
-           (static_cast<uint32_t>(b1) << 16) |
-           (static_cast<uint32_t>(b2) << 8) |
-           static_cast<uint32_t>(b3);
-}
-
-uint32_t encode_u32_be_bytes(uint32_t v) { return v; }
-
 uint32_t build_tonhe_id(uint8_t priority, uint32_t pgn, uint8_t dest, uint8_t src) {
     const uint8_t pf = static_cast<uint8_t>((pgn >> 8) & 0xFF);
     const uint8_t ps = dest;
@@ -178,9 +173,439 @@ struct CanFilterSpec {
     bool enabled{false};
 };
 
+enum class TxClass { SafetyUrgent, Control, Telemetry };
+
+class CanTrafficGovernor {
+public:
+    struct IfaceStatus {
+        double total_kbps{0.0};
+        double module_budget_kbps{0.0};
+        bool budget_limited{false};
+        bool overload_latched{false};
+        uint64_t module_tx_frames{0};
+        uint64_t module_rx_frames{0};
+        uint64_t budget_drops{0};
+        int64_t control_backlog_age_ms{0};
+    };
+
+    static CanTrafficGovernor& instance() {
+        static CanTrafficGovernor g;
+        return g;
+    }
+
+    void configure(const ModuleCanTrafficPolicy& policy, const std::set<std::string>& ifaces) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        default_policy_ = policy;
+        for (const auto& iface : ifaces) {
+            auto& st = states_[iface];
+            apply_policy_locked(st, iface);
+            ensure_monitor_socket_locked(iface, st);
+        }
+        start_monitor_if_needed_locked();
+    }
+
+    void ensure_iface(const std::string& iface) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto& st = states_[iface];
+        apply_policy_locked(st, iface);
+        ensure_monitor_socket_locked(iface, st);
+        start_monitor_if_needed_locked();
+    }
+
+    bool allow_send(const std::string& iface, TxClass tx_class, int expected_rx_frames) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto& st = states_[iface];
+        apply_policy_locked(st, iface);
+        prune_locked(st, now);
+        refresh_overcap_locked(st, now);
+        maybe_log_locked(iface, st, now);
+
+        if (tx_class == TxClass::SafetyUrgent) {
+            return true;
+        }
+
+        if (st.overload_latched && st.enforce) {
+            st.budget_drops++;
+            st.last_budget_drop = now;
+            if (tx_class == TxClass::Control && st.control_backlog_since.time_since_epoch().count() == 0) {
+                st.control_backlog_since = now;
+            }
+            return false;
+        }
+
+        const int rx_frames = std::max(0, expected_rx_frames);
+        const uint64_t estimate_bits =
+            static_cast<uint64_t>(st.bits_per_frame_estimate) * static_cast<uint64_t>(1 + rx_frames);
+        const uint64_t projected_bits = st.observed_bits + st.reserved_bits + estimate_bits;
+        const double projected_kbps = window_kbps(st, projected_bits);
+
+        if (st.enforce && projected_kbps > st.module_budget_kbps) {
+            st.budget_drops++;
+            st.last_budget_drop = now;
+            if (tx_class == TxClass::Control && st.control_backlog_since.time_since_epoch().count() == 0) {
+                st.control_backlog_since = now;
+            }
+            return false;
+        }
+
+        st.reserved_bits += estimate_bits;
+        st.reserved_events.push_back({now, estimate_bits});
+        if (tx_class == TxClass::Control) {
+            st.control_backlog_since = std::chrono::steady_clock::time_point{};
+        }
+        return true;
+    }
+
+    void note_send_result(const std::string& iface,
+                          TxClass tx_class,
+                          bool success,
+                          int expected_rx_frames,
+                          bool had_reservation) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto& st = states_[iface];
+        apply_policy_locked(st, iface);
+        prune_locked(st, now);
+        if (!success && had_reservation) {
+            const int rx_frames = std::max(0, expected_rx_frames);
+            const uint64_t estimate_bits =
+                static_cast<uint64_t>(st.bits_per_frame_estimate) * static_cast<uint64_t>(1 + rx_frames);
+            release_reserved_locked(st, estimate_bits);
+        }
+        if (success) {
+            st.module_tx_frames++;
+            st.tx_events.push_back(now);
+            if (tx_class == TxClass::Control) {
+                st.control_backlog_since = std::chrono::steady_clock::time_point{};
+            }
+        } else if (tx_class == TxClass::Control && st.control_backlog_since.time_since_epoch().count() == 0) {
+            st.control_backlog_since = now;
+        }
+        refresh_overcap_locked(st, now);
+        maybe_log_locked(iface, st, now);
+    }
+
+    bool overload_latched(const std::string& iface) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto it = states_.find(iface);
+        if (it == states_.end()) {
+            return false;
+        }
+        prune_locked(it->second, now);
+        refresh_overcap_locked(it->second, now);
+        return it->second.overload_latched;
+    }
+
+    IfaceStatus status(const std::string& iface) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto it = states_.find(iface);
+        if (it == states_.end()) {
+            return {};
+        }
+        auto& st = it->second;
+        prune_locked(st, now);
+        refresh_overcap_locked(st, now);
+        IfaceStatus out;
+        out.total_kbps = window_kbps(st, st.observed_bits + st.reserved_bits);
+        out.module_budget_kbps = st.module_budget_kbps;
+        out.budget_limited = st.last_budget_drop.time_since_epoch().count() != 0 &&
+                             (now - st.last_budget_drop) <= std::chrono::milliseconds(st.window_ms);
+        out.overload_latched = st.overload_latched;
+        out.module_tx_frames = st.module_tx_frames;
+        out.module_rx_frames = st.module_rx_frames;
+        out.budget_drops = st.budget_drops;
+        if (st.control_backlog_since.time_since_epoch().count() != 0) {
+            out.control_backlog_age_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - st.control_backlog_since).count();
+        }
+        return out;
+    }
+
+    ~CanTrafficGovernor() {
+        running_.store(false);
+        if (monitor_thread_.joinable()) {
+            monitor_thread_.join();
+        }
+#ifdef __linux__
+        for (auto& kv : states_) {
+            if (kv.second.monitor_sock >= 0) {
+                ::close(kv.second.monitor_sock);
+                kv.second.monitor_sock = -1;
+            }
+        }
+#endif
+    }
+
+private:
+    struct BitEvent {
+        std::chrono::steady_clock::time_point ts{};
+        uint64_t bits{0};
+    };
+
+    struct IfaceState {
+        double max_total_kbps{20.0};
+        double plc_reserve_kbps{0.0};
+        double module_budget_kbps{20.0};
+        int window_ms{10000};
+        int bits_per_frame_estimate{150};
+        int over_cap_debounce_ms{5000};
+        bool enforce{true};
+        std::deque<BitEvent> observed_events;
+        std::deque<BitEvent> reserved_events;
+        std::deque<std::chrono::steady_clock::time_point> tx_events;
+        std::deque<std::chrono::steady_clock::time_point> rx_events;
+        uint64_t observed_bits{0};
+        uint64_t reserved_bits{0};
+        uint64_t module_tx_frames{0};
+        uint64_t module_rx_frames{0};
+        uint64_t budget_drops{0};
+        std::chrono::steady_clock::time_point last_budget_drop{};
+        std::chrono::steady_clock::time_point control_backlog_since{};
+        std::chrono::steady_clock::time_point over_cap_since{};
+        bool overload_latched{false};
+        bool overcap_log_latched{false};
+        std::chrono::steady_clock::time_point last_log{};
+#ifdef __linux__
+        int monitor_sock{-1};
+#endif
+    };
+
+    CanTrafficGovernor() = default;
+    CanTrafficGovernor(const CanTrafficGovernor&) = delete;
+    CanTrafficGovernor& operator=(const CanTrafficGovernor&) = delete;
+
+    static double window_kbps(const IfaceState& st, uint64_t bits) {
+        const double window_s = std::max(0.001, static_cast<double>(st.window_ms) / 1000.0);
+        return static_cast<double>(bits) / window_s / 1000.0;
+    }
+
+    static void prune_locked(IfaceState& st, const std::chrono::steady_clock::time_point& now) {
+        const auto horizon = now - std::chrono::milliseconds(std::max(1000, st.window_ms));
+        while (!st.observed_events.empty() && st.observed_events.front().ts < horizon) {
+            st.observed_bits -= st.observed_events.front().bits;
+            st.observed_events.pop_front();
+        }
+        while (!st.reserved_events.empty() && st.reserved_events.front().ts < horizon) {
+            st.reserved_bits -= st.reserved_events.front().bits;
+            st.reserved_events.pop_front();
+        }
+        while (!st.tx_events.empty() && st.tx_events.front() < horizon) {
+            st.tx_events.pop_front();
+        }
+        while (!st.rx_events.empty() && st.rx_events.front() < horizon) {
+            st.rx_events.pop_front();
+        }
+    }
+
+    static void release_reserved_locked(IfaceState& st, uint64_t bits) {
+        while (bits > 0 && !st.reserved_events.empty()) {
+            auto& ev = st.reserved_events.back();
+            const uint64_t take = std::min(bits, ev.bits);
+            ev.bits -= take;
+            st.reserved_bits -= take;
+            bits -= take;
+            if (ev.bits == 0) {
+                st.reserved_events.pop_back();
+            }
+        }
+        if (bits > 0) {
+            st.reserved_bits = (st.reserved_bits > bits) ? (st.reserved_bits - bits) : 0;
+        }
+    }
+
+    static void consume_reserved_locked(IfaceState& st, uint64_t bits) {
+        while (bits > 0 && !st.reserved_events.empty()) {
+            auto& ev = st.reserved_events.front();
+            const uint64_t take = std::min(bits, ev.bits);
+            ev.bits -= take;
+            st.reserved_bits -= take;
+            bits -= take;
+            if (ev.bits == 0) {
+                st.reserved_events.pop_front();
+            }
+        }
+    }
+
+    static void refresh_overcap_locked(IfaceState& st, const std::chrono::steady_clock::time_point& now) {
+        const double observed_kbps = window_kbps(st, st.observed_bits);
+        if (observed_kbps > st.max_total_kbps) {
+            if (st.over_cap_since.time_since_epoch().count() == 0) {
+                st.over_cap_since = now;
+            } else if (!st.overload_latched && st.enforce &&
+                       (now - st.over_cap_since) >= std::chrono::milliseconds(std::max(0, st.over_cap_debounce_ms))) {
+                st.overload_latched = true;
+            }
+            return;
+        }
+        if (!st.overload_latched) {
+            st.over_cap_since = std::chrono::steady_clock::time_point{};
+        }
+    }
+
+    void apply_policy_locked(IfaceState& st, const std::string& iface) {
+        st.max_total_kbps = default_policy_.max_total_kbps_per_interface > 0.0
+                                ? default_policy_.max_total_kbps_per_interface
+                                : 20.0;
+        st.window_ms = std::max(1000, default_policy_.window_ms);
+        st.bits_per_frame_estimate = std::max(80, default_policy_.bits_per_frame_estimate);
+        st.over_cap_debounce_ms = std::max(0, default_policy_.over_cap_debounce_ms);
+        st.enforce = default_policy_.enforce;
+        const auto reserve_it = default_policy_.plc_reserve_kbps_by_interface.find(iface);
+        st.plc_reserve_kbps = reserve_it != default_policy_.plc_reserve_kbps_by_interface.end()
+                                  ? std::max(0.0, reserve_it->second)
+                                  : 0.0;
+        st.module_budget_kbps = std::max(0.0, st.max_total_kbps - st.plc_reserve_kbps);
+    }
+
+    void maybe_log_locked(const std::string& iface, IfaceState& st,
+                          const std::chrono::steady_clock::time_point& now) {
+        if (st.last_log.time_since_epoch().count() != 0 && (now - st.last_log) < std::chrono::seconds(10)) {
+            return;
+        }
+        const double total_kbps = window_kbps(st, st.observed_bits + st.reserved_bits);
+        const double window_s = std::max(0.001, static_cast<double>(st.window_ms) / 1000.0);
+        const double tx_fps = static_cast<double>(st.tx_events.size()) / window_s;
+        const double rx_fps = static_cast<double>(st.rx_events.size()) / window_s;
+        const bool budget_limited = st.last_budget_drop.time_since_epoch().count() != 0 &&
+                                    (now - st.last_budget_drop) <= std::chrono::milliseconds(st.window_ms);
+        const int64_t backlog_age_ms = st.control_backlog_since.time_since_epoch().count() == 0
+                                           ? 0
+                                           : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 now - st.control_backlog_since)
+                                                 .count();
+        std::ostringstream oss;
+        oss << "Module CAN stats"
+            << " iface=" << iface
+            << " total_kbps=" << total_kbps
+            << " module_budget_kbps=" << st.module_budget_kbps
+            << " module_tx_fps=" << tx_fps
+            << " module_rx_fps=" << rx_fps
+            << " budget_drops=" << st.budget_drops
+            << " control_backlog_age_ms=" << backlog_age_ms
+            << " overcap_state=" << (st.overload_latched ? "latched" : (budget_limited ? "limited" : "ok"));
+        EVLOG_info << oss.str();
+        st.last_log = now;
+    }
+
+    void start_monitor_if_needed_locked() {
+#ifdef __linux__
+        if (running_.load()) {
+            return;
+        }
+        bool have_socket = false;
+        for (const auto& kv : states_) {
+            if (kv.second.monitor_sock >= 0) {
+                have_socket = true;
+                break;
+            }
+        }
+        if (!have_socket) {
+            return;
+        }
+        running_.store(true);
+        monitor_thread_ = std::thread([this]() { monitor_loop(); });
+#endif
+    }
+
+    void ensure_monitor_socket_locked(const std::string& iface, IfaceState& st) {
+#ifdef __linux__
+        if (st.monitor_sock >= 0) {
+            return;
+        }
+        const int fd = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+        if (fd < 0) {
+            EVLOG_warning << "CAN monitor socket open failed on " << iface;
+            return;
+        }
+        struct ifreq ifr {};
+        std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+        if (::ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+            EVLOG_warning << "CAN monitor ioctl failed on " << iface;
+            ::close(fd);
+            return;
+        }
+        struct sockaddr_can addr {};
+        addr.can_family = AF_CAN;
+        addr.can_ifindex = ifr.ifr_ifindex;
+        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            EVLOG_warning << "CAN monitor bind failed on " << iface;
+            ::close(fd);
+            return;
+        }
+        const int rcvbuf = 512 * 1024;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        st.monitor_sock = fd;
+#else
+        (void)iface;
+        (void)st;
+#endif
+    }
+
+    void note_observed_frame(const std::string& iface, const std::chrono::steady_clock::time_point& now) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto& st = states_[iface];
+        apply_policy_locked(st, iface);
+        prune_locked(st, now);
+        const uint64_t bits = static_cast<uint64_t>(std::max(80, st.bits_per_frame_estimate));
+        st.observed_bits += bits;
+        st.observed_events.push_back({now, bits});
+        consume_reserved_locked(st, bits);
+        st.module_rx_frames++;
+        st.rx_events.push_back(now);
+        refresh_overcap_locked(st, now);
+        maybe_log_locked(iface, st, now);
+        if (st.overload_latched && st.enforce && !st.overcap_log_latched) {
+            EVLOG_error << "Module CAN overload latched on iface=" << iface
+                        << " total_kbps=" << window_kbps(st, st.observed_bits)
+                        << " cap_kbps=" << st.max_total_kbps;
+            st.overcap_log_latched = true;
+        }
+    }
+
+    void monitor_loop() {
+#ifdef __linux__
+        while (running_.load()) {
+            std::vector<std::pair<std::string, int>> sockets;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (const auto& kv : states_) {
+                    if (kv.second.monitor_sock >= 0) {
+                        sockets.emplace_back(kv.first, kv.second.monitor_sock);
+                    }
+                }
+            }
+
+            bool saw_frame = false;
+            for (const auto& sock : sockets) {
+                can_frame frame{};
+                while (::recv(sock.second, &frame, sizeof(frame), MSG_DONTWAIT) == sizeof(frame)) {
+                    saw_frame = true;
+                    note_observed_frame(sock.first, std::chrono::steady_clock::now());
+                }
+            }
+            if (!saw_frame) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+#endif
+    }
+
+    mutable std::mutex mtx_;
+    ModuleCanTrafficPolicy default_policy_{};
+    std::unordered_map<std::string, IfaceState> states_;
+    std::atomic<bool> running_{false};
+    std::thread monitor_thread_;
+};
+
 class CanChannel {
 public:
-    explicit CanChannel(std::string iface, CanFilterSpec filter = {}) : iface_(std::move(iface)), filter_(filter) {
+    explicit CanChannel(std::string iface, CanFilterSpec filter = {}, int poll_budget_fps = 0) :
+        iface_(std::move(iface)), filter_(filter), poll_budget_fps_(std::max(0, poll_budget_fps)) {
 #ifdef __linux__
         sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
         if (sock_ < 0) {
@@ -222,6 +647,8 @@ public:
         const int flags = ::fcntl(sock_, F_GETFL, 0);
         ::fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
 #endif
+        configure_poll_budget();
+        CanTrafficGovernor::instance().ensure_iface(iface_);
     }
 
     ~CanChannel() {
@@ -234,31 +661,54 @@ public:
 
     bool valid() const { return sock_ >= 0; }
 
-    bool send(const can_frame& frame, bool critical) {
+    bool send(const can_frame& frame, TxClass tx_class, int expected_rx_frames = 0) {
 #ifdef __linux__
         if (sock_ < 0) return false;
-        const int attempts = critical ? 3 : 1;
+        bool had_reservation = false;
+        if (tx_class == TxClass::Telemetry && !consume_poll_budget_token()) {
+            CanTrafficGovernor::instance().note_send_result(iface_, tx_class, false, expected_rx_frames, false);
+            return false;
+        }
+        if (tx_class != TxClass::SafetyUrgent) {
+            if (!CanTrafficGovernor::instance().allow_send(iface_, tx_class, expected_rx_frames)) {
+                CanTrafficGovernor::instance().note_send_result(iface_, tx_class, false, expected_rx_frames, false);
+                return false;
+            }
+            had_reservation = true;
+        }
+        const int attempts = tx_class == TxClass::Telemetry ? 1 : 3;
         for (int attempt = 0; attempt < attempts; ++attempt) {
             const auto n = ::write(sock_, &frame, sizeof(frame));
             if (n == sizeof(frame)) {
+                CanTrafficGovernor::instance().note_send_result(
+                    iface_, tx_class, true, expected_rx_frames, had_reservation);
                 return true;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-                if (!critical) {
+                if (tx_class == TxClass::Telemetry) {
+                    CanTrafficGovernor::instance().note_send_result(
+                        iface_, tx_class, false, expected_rx_frames, had_reservation);
                     return false; // drop low-priority reads instead of queueing
                 }
                 const int sleep_ms = (errno == ENOBUFS) ? 5 : 2;
                 std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                 continue;
             }
+            CanTrafficGovernor::instance().note_send_result(iface_, tx_class, false, expected_rx_frames, had_reservation);
             return false;
         }
+        CanTrafficGovernor::instance().note_send_result(iface_, tx_class, false, expected_rx_frames, had_reservation);
         return false;
 #else
         (void)frame;
-        (void)critical;
+        (void)tx_class;
+        (void)expected_rx_frames;
         return false;
 #endif
+    }
+
+    bool send(const can_frame& frame, bool critical) {
+        return send(frame, critical ? TxClass::Control : TxClass::Telemetry, 0);
     }
 
     bool recv(can_frame& frame) {
@@ -273,10 +723,66 @@ public:
     }
 
 private:
+    struct PollBudgetState {
+        int fps{0};
+        double tokens{0.0};
+        std::chrono::steady_clock::time_point last_refill{};
+    };
+
+    void configure_poll_budget() {
+        if (poll_budget_fps_ <= 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(budget_mutex_);
+        auto& st = poll_budgets_[iface_];
+        if (st.fps <= 0) {
+            st.fps = poll_budget_fps_;
+            st.tokens = static_cast<double>(poll_budget_fps_);
+            st.last_refill = std::chrono::steady_clock::now();
+            return;
+        }
+        if (poll_budget_fps_ < st.fps) {
+            st.fps = poll_budget_fps_;
+            st.tokens = std::min(st.tokens, static_cast<double>(st.fps));
+        }
+    }
+
+    bool consume_poll_budget_token() {
+        std::lock_guard<std::mutex> lock(budget_mutex_);
+        auto it = poll_budgets_.find(iface_);
+        if (it == poll_budgets_.end() || it->second.fps <= 0) {
+            return true;
+        }
+        auto& st = it->second;
+        const auto now = std::chrono::steady_clock::now();
+        if (st.last_refill.time_since_epoch().count() == 0) {
+            st.last_refill = now;
+            st.tokens = static_cast<double>(st.fps);
+        } else {
+            const double elapsed_s =
+                std::chrono::duration_cast<std::chrono::duration<double>>(now - st.last_refill).count();
+            if (elapsed_s > 0.0) {
+                st.tokens = std::min(static_cast<double>(st.fps), st.tokens + elapsed_s * static_cast<double>(st.fps));
+                st.last_refill = now;
+            }
+        }
+        if (st.tokens < 1.0) {
+            return false;
+        }
+        st.tokens -= 1.0;
+        return true;
+    }
+
     std::string iface_;
     CanFilterSpec filter_;
+    int poll_budget_fps_{0};
     int sock_{-1};
+    static std::mutex budget_mutex_;
+    static std::map<std::string, PollBudgetState> poll_budgets_;
 };
+
+std::mutex CanChannel::budget_mutex_{};
+std::map<std::string, CanChannel::PollBudgetState> CanChannel::poll_budgets_{};
 
 class ModuleDriver {
 public:
@@ -383,6 +889,26 @@ public:
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
         const bool power_changed = std::fabs(sp.power_kw - last_sent_.power_kw) > 0.1;
+        const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
+                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
+                                      (!std::isfinite(sp.power_kw) || sp.power_kw < 0.0);
+        if (invalid_setpoint) {
+            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                    : 0x00;
+            telemetry_.fault = true;
+            telemetry_.healthy = false;
+            telemetry_.fault_mask = bit;
+            telemetry_.healthy_mask = 0;
+            telemetry_.last_update = now;
+            const bool sent = send_set_int(0x0030, 0x00010000, TxClass::SafetyUrgent); // shutdown (fail-safe)
+            if (sent) {
+                last_sent_ = ModuleSetpoint{};
+                last_tx_ = now;
+            }
+            desired_ = ModuleSetpoint{};
+            return;
+        }
 
         const bool have_recent_status =
             last_status_update_.time_since_epoch().count() != 0 &&
@@ -399,27 +925,9 @@ public:
             return;
         }
 
-        const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
-                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
-                                      (!std::isfinite(sp.power_kw) || sp.power_kw < 0.0);
-        if (invalid_setpoint) {
-            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
-                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
-                                    : 0x00;
-            telemetry_.fault = true;
-            telemetry_.healthy = false;
-            telemetry_.fault_mask = bit;
-            telemetry_.healthy_mask = 0;
-            telemetry_.last_update = now;
-            send_set_int(0x0030, 0x00010000); // shutdown (fail-safe)
-            last_sent_ = ModuleSetpoint{};
-            last_tx_ = now;
-            desired_ = ModuleSetpoint{};
-            return;
-        }
-
         const double voltage_v = sp.voltage_v > 0.0 ? sp.voltage_v : 0.0;
         const double current_a = sp.current_a > 0.0 ? sp.current_a : 0.0;
+        bool sent_control = false;
 
         const bool need_input_mode = spec_.input_mode >= 0;
         if (need_input_mode) {
@@ -429,8 +937,10 @@ public:
                 const bool mismatch = (input_mode_reported_ && telemetry_.input_mode !=
                                                           static_cast<uint32_t>(spec_.input_mode));
                 if (!input_mode_reported_ || mismatch) {
-                    send_set_int(0x0046, static_cast<uint32_t>(spec_.input_mode));
-                    last_input_mode_tx_ = now;
+                    if (send_set_int(0x0046, static_cast<uint32_t>(spec_.input_mode))) {
+                        last_input_mode_tx_ = now;
+                        sent_control = true;
+                    }
                 }
             }
         }
@@ -438,7 +948,10 @@ public:
         if (sp.enable) {
             // Start once when transitioning to enable, and retry during periodic updates if the module still reports OFF.
             if (enable_edge_on || (periodic && module_off)) {
-                send_set_int(0x0030, 0x00000000); // startup
+                if (send_set_int(0x0030, 0x00000000)) { // startup
+                    last_sent_.enable = true;
+                    sent_control = true;
+                }
             }
             const double rated_current = spec_.rated_current_a > 0.0
                                              ? spec_.rated_current_a
@@ -451,32 +964,54 @@ public:
             } else if (rated_current > 0.0) {
                 frac = static_cast<float>(std::clamp(current_a / rated_current, 0.0, 1.0));
             } else {
-                // If the module doesn't report a rated current and voltage is too low to infer it,
-                // keep Ilim at max only for non-zero current requests.
-                frac = 1.0f;
+                // Fail safe: do not drive current if rated current is unknown at low bus voltage.
+                frac = 0.0f;
+                if (current_a > 0.0 &&
+                    (last_missing_rated_current_log_.time_since_epoch().count() == 0 ||
+                     (now - last_missing_rated_current_log_) >= std::chrono::seconds(2))) {
+                    EVLOG_error << "MXR module " << spec_.id
+                                << " missing rated current at low voltage; forcing current ratio=0";
+                    last_missing_rated_current_log_ = now;
+                }
             }
             if (enable_edge_on || current_changed || periodic) {
-                send_set_float(0x0022, frac);
-                last_limit_fraction_ = frac;
+                if (send_set_float(0x0022, frac)) {
+                    last_limit_fraction_ = frac;
+                    last_sent_.current_a = sp.current_a;
+                    sent_control = true;
+                }
             }
             if (enable_edge_on || voltage_changed || periodic) {
-                send_set_float(0x0021, static_cast<float>(voltage_v));
+                if (send_set_float(0x0021, static_cast<float>(voltage_v))) {
+                    last_sent_.voltage_v = sp.voltage_v;
+                    sent_control = true;
+                }
             }
             if (spec_.send_output_current && (enable_edge_on || current_changed || periodic)) {
                 const double clamped_a = std::clamp(sp.current_a, 0.0, 4096.0);
                 const uint32_t val = static_cast<uint32_t>(clamped_a * 1024.0);
-                send_set_int(0x001B, val);
+                if (send_set_int(0x001B, val)) {
+                    last_sent_.current_a = sp.current_a;
+                    sent_control = true;
+                }
             }
             if (spec_.send_output_power && (enable_edge_on || power_changed || periodic)) {
-                send_set_float(0x0020, static_cast<float>(std::max(0.0, sp.power_kw)));
+                if (send_set_float(0x0020, static_cast<float>(std::max(0.0, sp.power_kw)))) {
+                    last_sent_.power_kw = sp.power_kw;
+                    sent_control = true;
+                }
             }
         } else {
             if (enable_edge_off || periodic) {
-                send_set_int(0x0030, 0x00010000); // shutdown
+                if (send_set_int(0x0030, 0x00010000)) { // shutdown
+                    last_sent_ = ModuleSetpoint{};
+                    sent_control = true;
+                }
             }
         }
-        last_sent_ = sp;
-        last_tx_ = now;
+        if (sent_control) {
+            last_tx_ = now;
+        }
     }
 
     void poll() override {
@@ -523,12 +1058,6 @@ public:
                     last_poll_input_mode_ = now;
                 }
             }
-        } else if (spec_.probe_on_startup) {
-            const auto probe_interval = std::chrono::milliseconds(1000);
-            if ((now - last_probe_tx_) >= probe_interval) {
-                send_read(0x0043);
-                last_probe_tx_ = now;
-            }
         }
         can_frame frame{};
         while (channel_->recv(frame)) {
@@ -571,7 +1100,7 @@ private:
         return id | CAN_EFF_FLAG;
     }
 
-    void send_set_float(uint16_t reg, float value) {
+    bool send_set_float(uint16_t reg, float value, TxClass tx_class = TxClass::Control) {
         can_frame frame{};
         frame.can_id = build_can_id();
         frame.can_dlc = 8;
@@ -584,10 +1113,11 @@ private:
         frame.data[5] = static_cast<uint8_t>((raw >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((raw >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(raw & 0xFF);
-        channel_->send(frame, /*critical=*/true);
+        const int expected_rx = tx_class == TxClass::SafetyUrgent ? 0 : 1;
+        return channel_->send(frame, tx_class, expected_rx);
     }
 
-    void send_set_int(uint16_t reg, uint32_t value) {
+    bool send_set_int(uint16_t reg, uint32_t value, TxClass tx_class = TxClass::Control) {
         can_frame frame{};
         frame.can_id = build_can_id();
         frame.can_dlc = 8;
@@ -599,7 +1129,8 @@ private:
         frame.data[5] = static_cast<uint8_t>((value >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((value >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(value & 0xFF);
-        channel_->send(frame, /*critical=*/true);
+        const int expected_rx = tx_class == TxClass::SafetyUrgent ? 0 : 1;
+        return channel_->send(frame, tx_class, expected_rx);
     }
 
     void send_read(uint16_t reg) {
@@ -614,7 +1145,7 @@ private:
         frame.data[5] = 0x00;
         frame.data[6] = 0x00;
         frame.data[7] = 0x00;
-        channel_->send(frame, /*critical=*/false);
+        channel_->send(frame, TxClass::Telemetry, 1);
     }
 
     void handle_frame(const can_frame& frame) {
@@ -777,6 +1308,7 @@ private:
     std::optional<uint8_t> resolved_addr_{};
     std::optional<uint8_t> resolved_group_{};
     std::chrono::steady_clock::time_point last_probe_tx_{};
+    std::chrono::steady_clock::time_point last_missing_rated_current_log_{};
     double last_limit_fraction_{0.0};
     int limit_mismatch_count_{0};
 };
@@ -819,6 +1351,25 @@ public:
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
+        const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
+                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0);
+        if (invalid_setpoint) {
+            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
+                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
+                                    : 0x00;
+            telemetry_.fault = true;
+            telemetry_.healthy = false;
+            telemetry_.fault_mask = bit;
+            telemetry_.healthy_mask = 0;
+            telemetry_.last_update = now;
+            const bool sent = send_set(4, 1, TxClass::SafetyUrgent); // shutdown
+            if (sent) {
+                last_sent_ = ModuleSetpoint{};
+                last_tx_ = now;
+            }
+            desired_ = ModuleSetpoint{};
+            return;
+        }
 
         const bool have_recent_status =
             last_status_update_.time_since_epoch().count() != 0 &&
@@ -833,48 +1384,44 @@ public:
             return;
         }
 
-        const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
-                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0);
-        if (invalid_setpoint) {
-            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
-                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
-                                    : 0x00;
-            telemetry_.fault = true;
-            telemetry_.healthy = false;
-            telemetry_.fault_mask = bit;
-            telemetry_.healthy_mask = 0;
-            telemetry_.last_update = now;
-            send_set(4, 1); // shutdown
-            last_sent_ = ModuleSetpoint{};
-            last_tx_ = now;
-            desired_ = ModuleSetpoint{};
-            return;
-        }
-
         maybe_send_modes(now);
 
         const double voltage_v = std::max(0.0, sp.voltage_v);
         const double current_a = std::max(0.0, sp.current_a);
+        bool sent_control = false;
 
         if (sp.enable) {
             if (enable_edge_on || (periodic && module_off)) {
-                send_set(4, 0); // power on
+                if (send_set(4, 0)) { // power on
+                    last_sent_.enable = true;
+                    sent_control = true;
+                }
             }
             if (enable_edge_on || voltage_changed || periodic) {
                 const uint32_t mv = static_cast<uint32_t>(std::clamp(voltage_v * 1000.0, 0.0, 4.0e9));
-                send_set(2, mv); // voltage reference
+                if (send_set(2, mv)) { // voltage reference
+                    last_sent_.voltage_v = sp.voltage_v;
+                    sent_control = true;
+                }
             }
             if (enable_edge_on || current_changed || periodic) {
                 const uint32_t ma = static_cast<uint32_t>(std::clamp(current_a * 1000.0, 0.0, 4.0e9));
-                send_set(3, ma); // current limit
+                if (send_set(3, ma)) { // current limit
+                    last_sent_.current_a = sp.current_a;
+                    sent_control = true;
+                }
             }
         } else {
             if (enable_edge_off || periodic) {
-                send_set(4, 1); // power off
+                if (send_set(4, 1)) { // power off
+                    last_sent_ = ModuleSetpoint{};
+                    sent_control = true;
+                }
             }
         }
-        last_sent_ = sp;
-        last_tx_ = now;
+        if (sent_control) {
+            last_tx_ = now;
+        }
     }
 
     void poll() override {
@@ -917,13 +1464,6 @@ public:
                     last_poll_group_ = now;
                 }
             }
-        } else if (spec_.probe_on_startup) {
-            // Avoid flooding the bus with broadcast polls; probe slowly until an address is resolved.
-            const auto probe_interval = std::chrono::milliseconds(1000);
-            if (due(last_poll_group_, probe_interval)) {
-                send_read(89);
-                last_poll_group_ = now;
-            }
         }
         can_frame frame{};
         while (channel_->recv(frame)) {
@@ -946,7 +1486,7 @@ private:
         return id | CAN_EFF_FLAG;
     }
 
-    void send_frame(uint8_t msg_type, uint8_t cmd, uint32_t data) {
+    bool send_frame(uint8_t msg_type, uint8_t cmd, uint32_t data, TxClass tx_class, int expected_rx) {
         const bool broadcast = spec_.broadcast && !resolved_addr_.has_value();
         can_frame frame{};
         frame.can_id = build_can_id(broadcast);
@@ -960,31 +1500,37 @@ private:
         frame.data[5] = static_cast<uint8_t>((data >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((data >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(data & 0xFF);
-        channel_->send(frame, /*critical=*/msg_type == RECTIFIER_MSG_SET);
+        return channel_->send(frame, tx_class, expected_rx);
     }
 
-    void send_set(uint8_t cmd, uint32_t data) { send_frame(RECTIFIER_MSG_SET, cmd, data); }
-    void send_read(uint8_t cmd) { send_frame(RECTIFIER_MSG_READ, cmd, 0); }
+    bool send_set(uint8_t cmd, uint32_t data, TxClass tx_class = TxClass::Control) {
+        const int expected_rx = tx_class == TxClass::SafetyUrgent ? 0 : 1;
+        return send_frame(RECTIFIER_MSG_SET, cmd, data, tx_class, expected_rx);
+    }
+    bool send_read(uint8_t cmd) { return send_frame(RECTIFIER_MSG_READ, cmd, 0, TxClass::Telemetry, 1); }
 
     void maybe_send_modes(const std::chrono::steady_clock::time_point& now) {
         if (!channel_ || !channel_->valid()) return;
         const auto interval = std::chrono::milliseconds(std::max(200, spec_.cmd_interval_ms));
         if (spec_.hi_lo_mode >= 0 && !desired_.enable && (now - last_mode_tx_) >= interval) {
             if (!mode_known_ || mode_reported_ != static_cast<uint8_t>(spec_.hi_lo_mode)) {
-                send_set(95, static_cast<uint32_t>(spec_.hi_lo_mode));
-                last_mode_tx_ = now;
+                if (send_set(95, static_cast<uint32_t>(spec_.hi_lo_mode))) {
+                    last_mode_tx_ = now;
+                }
             }
         }
         if (spec_.silent_mode >= 0 && (now - last_silent_tx_) >= interval) {
             if (!silent_known_ || silent_reported_ != static_cast<uint8_t>(spec_.silent_mode)) {
-                send_set(62, static_cast<uint32_t>(spec_.silent_mode));
-                last_silent_tx_ = now;
+                if (send_set(62, static_cast<uint32_t>(spec_.silent_mode))) {
+                    last_silent_tx_ = now;
+                }
             }
         }
         if (spec_.group > 0 && !desired_.enable && (now - last_group_tx_) >= interval) {
             if (!group_known_ || group_reported_ != static_cast<uint8_t>(spec_.group)) {
-                send_set(89, static_cast<uint32_t>(spec_.group & 0x0F));
-                last_group_tx_ = now;
+                if (send_set(89, static_cast<uint32_t>(spec_.group & 0x0F))) {
+                    last_group_tx_ = now;
+                }
             }
         }
     }
@@ -1144,9 +1690,11 @@ public:
             telemetry_.fault_mask = bit;
             telemetry_.healthy_mask = 0;
             telemetry_.last_update = now;
-            send_startstop(false, 0.0, 0.0);
-            last_sent_ = ModuleSetpoint{};
-            last_tx_ = now;
+            const bool sent = send_startstop(false, 0.0, 0.0, TxClass::SafetyUrgent);
+            if (sent) {
+                last_sent_ = ModuleSetpoint{};
+                last_tx_ = now;
+            }
             desired_ = ModuleSetpoint{};
             return;
         }
@@ -1160,9 +1708,10 @@ public:
         if (should_send) {
             const double voltage_v = std::max(0.0, sp.voltage_v);
             const double current_a = std::max(0.0, sp.current_a);
-            send_startstop(sp.enable, voltage_v, current_a);
-            last_sent_ = sp;
-            last_tx_ = now;
+            if (send_startstop(sp.enable, voltage_v, current_a, TxClass::Control)) {
+                last_sent_ = sp;
+                last_tx_ = now;
+            }
         }
     }
 
@@ -1177,8 +1726,7 @@ public:
     }
 
 private:
-    void send_startstop(bool enable, double voltage_v, double current_a) {
-        const auto now = std::chrono::steady_clock::now();
+    bool send_startstop(bool enable, double voltage_v, double current_a, TxClass tx_class) {
         can_frame frame{};
         frame.can_id = build_tonhe_id(2, TONHE_PGN_STARTSTOP,
                                       static_cast<uint8_t>(spec_.address & 0xFF),
@@ -1194,10 +1742,8 @@ private:
         frame.data[5] = static_cast<uint8_t>((i >> 8) & 0xFF);
         frame.data[6] = 0x00;
         frame.data[7] = 0x00;
-        channel_->send(frame, /*critical=*/true);
-        confirm_pending_ = true;
-        confirm_received_ = false;
-        confirm_deadline_ = now + std::chrono::milliseconds(1000);
+        const int expected_rx = tx_class == TxClass::SafetyUrgent ? 0 : 0;
+        return channel_->send(frame, tx_class, expected_rx);
     }
 
     void maybe_send_input_mode(const std::chrono::steady_clock::time_point& now) {
@@ -1220,10 +1766,11 @@ private:
         for (int i = 1; i < 8; ++i) {
             frame.data[i] = 0x00;
         }
-        channel_->send(frame, /*critical=*/false);
-        input_mode_sent_ = true;
-        last_input_mode_ = desired_mode;
-        last_input_mode_tx_ = now;
+        if (channel_->send(frame, TxClass::Telemetry, 0)) {
+            input_mode_sent_ = true;
+            last_input_mode_ = desired_mode;
+            last_input_mode_tx_ = now;
+        }
     }
 
     void update_fault_state(const std::chrono::steady_clock::time_point& now, bool update_last) {
@@ -1277,12 +1824,6 @@ private:
             telemetry_.voltage_v = static_cast<double>(v_raw) * 0.1;
             telemetry_.current_a = static_cast<double>(i_raw) * 0.01;
             update_fault_state(now, true);
-        } else if (pgn == TONHE_PGN_CONFIRM) {
-            confirm_received_ = frame.data[0] == 0x01;
-            if (confirm_received_) {
-                confirm_pending_ = false;
-                confirm_miss_count_ = 0;
-            }
         } else if (pgn == TONHE_PGN_AC_INFO) {
             const uint16_t temp_raw = decode_u16_le(&frame.data[6]);
             telemetry_.temperature_c = static_cast<double>(temp_raw);
@@ -1303,10 +1844,6 @@ private:
     uint16_t last_fault_bits_{0};
     uint8_t last_pfc_fault_{0};
     uint16_t last_ext_fault_bits_{0};
-    bool confirm_received_{false};
-    bool confirm_pending_{false};
-    int confirm_miss_count_{0};
-    std::chrono::steady_clock::time_point confirm_deadline_{};
     bool input_mode_sent_{false};
     int last_input_mode_{-1};
     std::chrono::steady_clock::time_point last_input_mode_tx_{};
@@ -1317,10 +1854,25 @@ public:
     PowerModuleControllerImpl() = default;
     explicit PowerModuleControllerImpl(std::vector<ModuleSpec> specs) { set_modules(std::move(specs)); }
 
+    void set_can_traffic_policy(const ModuleCanTrafficPolicy& policy) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        policy_ = policy;
+        std::set<std::string> ifaces;
+        for (const auto& mod : modules_) {
+            if (mod.spec.can_interface.empty() || mod.spec.type == "sim" || mod.spec.type == "simulated") {
+                continue;
+            }
+            ifaces.insert(mod.spec.can_interface);
+        }
+        CanTrafficGovernor::instance().configure(policy_, ifaces);
+    }
+
     void set_modules(std::vector<ModuleSpec> specs) {
         std::lock_guard<std::mutex> lock(mtx_);
         modules_.clear();
         slot_index_.clear();
+        poll_rr_cursor_by_iface_.clear();
+        std::set<std::string> ifaces;
         for (auto& spec : specs) {
             if (spec.type.empty()) {
                 continue;
@@ -1347,7 +1899,10 @@ public:
             // (Each socket will still see the bus, but they don't steal frames from each other.)
             std::shared_ptr<CanChannel> chan;
             if (!(spec.type == "sim" || spec.type == "simulated")) {
-                chan = std::make_shared<CanChannel>(spec.can_interface, filter_for_type(spec));
+                chan = std::make_shared<CanChannel>(spec.can_interface, filter_for_type(spec), spec.poll_budget_fps);
+                if (!spec.can_interface.empty()) {
+                    ifaces.insert(spec.can_interface);
+                }
             }
             ModuleRuntime rt;
             rt.spec = spec;
@@ -1361,6 +1916,7 @@ public:
             modules_.push_back(std::move(rt));
             slot_index_[spec.slot_id].push_back(idx);
         }
+        CanTrafficGovernor::instance().configure(policy_, ifaces);
     }
 
     void apply(const ModuleCommandRequest& req) {
@@ -1387,7 +1943,9 @@ public:
             auto& mod = modules_[idx];
             const bool selected = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8) &&
                                   (((req.mask >> mod.spec.slot_index) & 0x1) != 0);
-            const bool active = req.enable && selected;
+            const bool iface_overload =
+                !mod.spec.can_interface.empty() && CanTrafficGovernor::instance().overload_latched(mod.spec.can_interface);
+            const bool active = req.enable && selected && !iface_overload;
             ModuleSetpoint sp;
             sp.enable = active;
             sp.voltage_v = req.voltage_v;
@@ -1416,6 +1974,12 @@ public:
         for (auto idx : it->second) {
             if (idx >= modules_.size()) continue;
             const auto& mod = modules_[idx];
+            const auto iface_status = mod.spec.can_interface.empty()
+                                          ? CanTrafficGovernor::IfaceStatus{}
+                                          : CanTrafficGovernor::instance().status(mod.spec.can_interface);
+            snap.can_total_kbps = std::max(snap.can_total_kbps, iface_status.total_kbps);
+            snap.can_budget_limited = snap.can_budget_limited || iface_status.budget_limited;
+            snap.can_overload_latched = snap.can_overload_latched || iface_status.overload_latched;
             const auto& telem = mod.driver ? mod.driver->telemetry() : ModuleTelemetryState{};
             const bool fresh = telem.last_update.time_since_epoch().count() > 0 &&
                                (now - telem.last_update) <= telemetry_stale_interval(mod.spec);
@@ -1426,6 +1990,11 @@ public:
             const uint8_t bit = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8)
                                     ? static_cast<uint8_t>(1U << static_cast<uint8_t>(mod.spec.slot_index))
                                     : 0x00;
+            if (iface_status.overload_latched) {
+                snap.fault_mask |= bit;
+                any_fresh = true;
+                continue;
+            }
             if (fresh) {
                 if (healthy) {
                     if (telem.healthy_mask) {
@@ -1463,10 +2032,28 @@ public:
 
     void poll() {
         std::lock_guard<std::mutex> lock(mtx_);
-        for (auto& mod : modules_) {
-            if (mod.driver) {
-                mod.driver->poll();
+        std::map<std::string, std::vector<size_t>> by_iface;
+        for (size_t idx = 0; idx < modules_.size(); ++idx) {
+            if (!modules_[idx].driver) {
+                continue;
             }
+            const std::string iface = modules_[idx].spec.can_interface.empty() ? "__no_iface__" : modules_[idx].spec.can_interface;
+            by_iface[iface].push_back(idx);
+        }
+        for (auto& kv : by_iface) {
+            auto& indices = kv.second;
+            if (indices.empty()) {
+                continue;
+            }
+            const size_t start = poll_rr_cursor_by_iface_[kv.first] % indices.size();
+            for (size_t i = 0; i < indices.size(); ++i) {
+                const size_t pos = (start + i) % indices.size();
+                auto& mod = modules_[indices[pos]];
+                if (mod.driver) {
+                    mod.driver->poll();
+                }
+            }
+            poll_rr_cursor_by_iface_[kv.first] = (start + 1) % indices.size();
         }
     }
 
@@ -1485,6 +2072,11 @@ private:
             spec.type == "uugreenpower") {
             return {CAN_EFF_FLAG | (static_cast<uint32_t>(RECTIFIER_PROTO_NO) << 25),
                     CAN_EFF_FLAG | (0x0Fu << 25), true};
+        }
+        if (spec.type == "tonhe" && spec.address >= 0) {
+            // Tonhe/J1939-style frames carry module address in SRC (lowest 8 bits).
+            return {CAN_EFF_FLAG | static_cast<uint32_t>(spec.address & 0xFF),
+                    CAN_EFF_FLAG | 0xFFu, true};
         }
         return {};
     }
@@ -1510,6 +2102,8 @@ private:
     mutable std::mutex mtx_;
     std::vector<ModuleRuntime> modules_;
     std::map<int, std::vector<size_t>> slot_index_;
+    std::map<std::string, size_t> poll_rr_cursor_by_iface_;
+    ModuleCanTrafficPolicy policy_{};
 };
 } // namespace
 
@@ -1524,7 +2118,19 @@ PowerModuleController::PowerModuleController(const std::vector<ModuleSpec>& spec
     impl_->impl.set_modules(specs);
 }
 
+PowerModuleController::PowerModuleController(const std::vector<ModuleSpec>& specs,
+                                             const ModuleCanTrafficPolicy& policy) :
+    impl_(std::make_unique<Impl>()) {
+    impl_->impl.set_can_traffic_policy(policy);
+    impl_->impl.set_modules(specs);
+}
+
 PowerModuleController::~PowerModuleController() = default;
+
+void PowerModuleController::set_can_traffic_policy(const ModuleCanTrafficPolicy& policy) {
+    if (!impl_) return;
+    impl_->impl.set_can_traffic_policy(policy);
+}
 
 void PowerModuleController::set_modules(const std::vector<ModuleSpec>& specs) {
     if (!impl_) return;

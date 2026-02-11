@@ -65,8 +65,31 @@ PLC should map these into ISO/DIN ResponseCode + DC_EVSEStatusCode.
   - PLC reports `limits_rx_count_lsb` in `PLC_TLM_V3`.
   - Controller reconstructs a wrap-safe counter and uses it as the EVSE limits ACK watchdog.
 
+## Module CAN bandwidth policy
+
+- This repo enforces a production module traffic budget in addition to PLC protocol cadence:
+  - Target: `<20 kbps` total CAN load per interface in active steady-state.
+  - Rolling window defaults: `windowMs=10000`, `bitsPerFrameEstimate=150`, `overCapDebounceMs=5000`.
+  - Per-interface module budget is computed from configured cap minus PLC reserve:
+    - `module_budget_kbps = maxTotalKbpsPerInterface - (1.5 * plc_count_on_iface)`.
+- Traffic classes:
+  - `SafetyUrgent`: allowed even during cap events (fail-safe shutdown path).
+  - `Control`: subject to bandwidth governor.
+  - `Telemetry`: subject to bandwidth governor and poll budget.
+- Over-cap behavior:
+  - If observed interface load remains above cap beyond debounce, controller latches `ModuleCanOverload`,
+    blocks non-urgent module traffic, and drives safe derate/disable behavior.
+- Protocol references used for module-side assumptions:
+  - `docs/modules/CAN Communication Protocol - Maxwell_V1.50.pdf`
+  - `docs/modules/ENR series CAN Comunication Protocol S0 (1).pdf`
+  - `docs/modules/UUGreenPower CAN Protocol (36.2 Version)Reference Guide.pdf`
+  - `docs/modules/TonHe CAN communication between charging module and monitor TONHE V1.2.pdf`
+- Tonhe caveat:
+  - Tonhe periodic/status uplinks include non-host-controllable inbound traffic (nominal ~500 ms plus triggers).
+    If this inbound load alone keeps interface occupancy above cap beyond debounce, the controller latches
+    `ModuleCanOverload` and holds modules in safe derate/disable state.
+
 ## Identity / Autocharge
 
 PLC may emit EVCCID/EMAID/EVMAC in segmented frames. Controller reconstructs segments by `plc_id` and exposes tokens
 to OCPP authorization.
-
