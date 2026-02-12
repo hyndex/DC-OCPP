@@ -93,6 +93,29 @@ int main() {
         }
     }
 
+    // Do not arm stall fault if EVSE is intentionally offering very low current.
+    auto low_offer_cfg = make_cfg();
+    low_offer_cfg.connectors[0].max_current_a = 0.2;
+    auto low_offer_hw = std::make_shared<TestHardware>(low_offer_cfg);
+    OcppAdapter low_offer_adapter(low_offer_cfg, low_offer_hw);
+    seed_session(low_offer_adapter, 1);
+    auto low_offer_st = make_status(355.0, 355.0, 30.0);
+    low_offer_st.relay_closed = true;
+    low_offer_hw->set_status_override(1, low_offer_st);
+    OcppAdapter::TestHook::apply_power_plan(low_offer_adapter);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    low_offer_st.last_telemetry = std::chrono::steady_clock::now();
+    low_offer_hw->set_status_override(1, low_offer_st);
+    OcppAdapter::TestHook::apply_power_plan(low_offer_adapter);
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(low_offer_adapter));
+        if (OcppAdapter::TestHook::sessions(low_offer_adapter).find(1) ==
+            OcppAdapter::TestHook::sessions(low_offer_adapter).end()) {
+            std::cerr << "Power delivery stall test failed: session cleared while EVSE current offer was low\n";
+            return 1;
+        }
+    }
+
     std::cout << "power_delivery_stall_tests passed\n";
     return 0;
 }

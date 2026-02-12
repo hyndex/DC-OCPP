@@ -43,15 +43,15 @@ static ChargerConfig make_cfg() {
                         .max_power_w = 60000,
                         .max_voltage_v = 1000,
                         .min_voltage_v = 200,
-                        .meter_source = "module",
-                        .require_lock = false},
+                        .require_lock = false,
+                        .meter_source = "module"},
         ConnectorConfig{.id = 2,
                         .max_current_a = 200,
                         .max_power_w = 60000,
                         .max_voltage_v = 1000,
                         .min_voltage_v = 200,
-                        .meter_source = "module",
-                        .require_lock = false},
+                        .require_lock = false,
+                        .meter_source = "module"},
     };
 
     // Physical topology: two guns on a ring, one 30 kW module per gun.
@@ -136,6 +136,15 @@ static GunStatus make_status(bool plugged_in, bool relay_closed, uint8_t hlc_sta
 
 static void refresh_telem(GunStatus& st) { st.last_telemetry = std::chrono::steady_clock::now(); }
 
+static int popcount_u8(uint8_t v) {
+    int count = 0;
+    while (v != 0u) {
+        count += static_cast<int>(v & 0x1u);
+        v = static_cast<uint8_t>(v >> 1u);
+    }
+    return count;
+}
+
 int main() {
     auto cfg = make_cfg();
     auto hw = std::make_shared<TestHardware>(cfg);
@@ -182,6 +191,11 @@ int main() {
             std::cerr << "precharge_default_module_policy_sim_tests failed: expected GC closed during precharge\n";
             return 1;
         }
+        if (cmd->module_mask == 0u || popcount_u8(cmd->module_mask) != 1) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: expected single relay path during precharge, mask=0x"
+                      << std::hex << static_cast<int>(cmd->module_mask) << std::dec << "\n";
+            return 1;
+        }
         saw_precharge_gc_close = true;
 
         const auto m1 = OcppAdapter::TestHook::last_module_command_for_slot(adapter, SLOT_M1);
@@ -211,6 +225,12 @@ int main() {
         if (m1->current_a > cfg.precharge_max_current_a + 1e-6) {
             std::cerr << "precharge_default_module_policy_sim_tests failed: expected precharge current<=2A, got "
                       << m1->current_a << "A\n";
+            return 1;
+        }
+        const double precharge_current_floor = cfg.precharge_max_current_a * 0.75;
+        if (m1->current_a + 1e-6 < precharge_current_floor) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: precharge current collapsed to "
+                      << m1->current_a << "A (expected >= " << precharge_current_floor << "A)\n";
             return 1;
         }
         prev_precharge_v = m1->voltage_v;

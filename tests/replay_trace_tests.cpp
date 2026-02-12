@@ -46,8 +46,8 @@ static ChargerConfig make_cfg() {
                         .max_power_w = 60000,
                         .max_voltage_v = 1000,
                         .min_voltage_v = 200,
-                        .meter_source = "module",
-                        .require_lock = false},
+                        .require_lock = false,
+                        .meter_source = "module"},
     };
     populate_minimal_slots(cfg);
     return cfg;

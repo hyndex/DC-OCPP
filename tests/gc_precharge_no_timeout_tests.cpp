@@ -29,9 +29,9 @@ static ChargerConfig make_cfg() {
     return cfg;
 }
 
-static void seed_session(OcppAdapter& adapter, int connector) {
+static void seed_session(OcppAdapter& adapter, int connector, const std::string& session_id = "sess") {
     OcppAdapter::TestHook::ActiveSession session{};
-    session.session_id = "sess";
+    session.session_id = session_id;
     session.id_token = "TAG";
     session.authorized = true;
     session.ev_connected = true;
@@ -122,6 +122,31 @@ int main() {
         if (OcppAdapter::TestHook::sessions(adapter_stuck).find(1) !=
             OcppAdapter::TestHook::sessions(adapter_stuck).end()) {
             std::cerr << "gc_precharge_no_timeout_tests failed: expected precharge timeout to clear session\n";
+            return 1;
+        }
+    }
+
+    // Session-epoch reset: stale GC close timeout state must not carry over to a fresh session.
+    auto hw_epoch = std::make_shared<TestHardware>(cfg);
+    OcppAdapter adapter_epoch(cfg, hw_epoch);
+    seed_session(adapter_epoch, 1, "sess-old");
+
+    auto blocked = make_status(/*present_v=*/120.0, /*target_v=*/400.0, /*target_i=*/5.0);
+    hw_epoch->set_status_override(1, blocked);
+    OcppAdapter::TestHook::apply_power_plan(adapter_epoch); // starts GC close timeout tracking
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+
+    // New session on the same connector while still plugged in.
+    seed_session(adapter_epoch, 1, "sess-new");
+    auto fresh = make_status(/*present_v=*/0.0, /*target_v=*/400.0, /*target_i=*/5.0);
+    fresh.last_telemetry = std::chrono::steady_clock::now();
+    hw_epoch->set_status_override(1, fresh);
+    OcppAdapter::TestHook::apply_power_plan(adapter_epoch);
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_epoch));
+        if (OcppAdapter::TestHook::sessions(adapter_epoch).find(1) ==
+            OcppAdapter::TestHook::sessions(adapter_epoch).end()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: stale GC close timeout carried into new session\n";
             return 1;
         }
     }

@@ -1,6 +1,7 @@
 {
     "Internal": {
-        "LogMessagesFormat": []
+        "LogMessagesFormat": [],
+        "VerifyCsmsAllowWildcards": true
     },
     "Core": {
         "AuthorizationCacheEnabled": true,
@@ -16,7 +17,7 @@
         "MeterValuesSampledData": "Energy.Active.Import.Register,Power.Active.Import,Voltage,Current.Import",
         "MeterValueSampleInterval": 0,
         "MinimumStatusDuration": 0,
-        "NumberOfConnectors": 1,
+        "NumberOfConnectors": 2,
         "ResetRetries": 1,
         "StopTransactionOnEVSideDisconnect": true,
         "StopTransactionOnInvalidId": true,
@@ -42,6 +43,7 @@
         "MaxChargingProfilesInstalled": 42
     },
     "Security": {
+        "AuthorizationKey": "DEADBEEFDEADBEEF",
         "SecurityProfile": 2
     },
     "CostAndPrice": {

@@ -68,6 +68,8 @@ int main() {
     session.session_id = "s1";
     session.authorized = true;
     session.ev_connected = true;
+    session.transaction_started = true;
+    session.transaction_started_at = now - std::chrono::seconds(5);
     session.connected_at = now;
     {
         std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter));

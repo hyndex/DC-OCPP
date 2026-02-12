@@ -29,33 +29,49 @@ int main() {
     st.plugged_in = true;
     st.hlc_stage = 5; // HLC_WAIT_AUTHORIZATION
 
-    // Pre-HLC: autocharge disabled => digital comm stays off, PnC blocked.
+    // Autocharge disabled: keep HLC digital comm enabled while EV is present, but block PnC offers.
     OcppAdapter::TestHook::set_autocharge_enabled(adapter, false);
     OcppAdapter::TestHook::ActiveSession sess{};
     auto out = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
                                                         std::nullopt, false, now);
-    assert(out.desired_digital == false);
+    assert(out.desired_digital == true);
     assert(out.desired_pnc_blocked == true);
 
-    // Autocharge auth timeout triggers PnC block + EIM fallback.
+    // Autocharge auth timeout while CSMS is offline should not force fallback.
     OcppAdapter::TestHook::set_autocharge_enabled(adapter, true);
+    OcppAdapter::TestHook::set_csms_connected(adapter, false);
     out = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
                                                    std::nullopt, false, now);
     auto out2 = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
                                                          std::nullopt, false,
                                                          now + std::chrono::seconds(cfg.hlc_auth_timeout_s + 1));
     assert(out2.auth_timeout_triggered == true);
-    assert(out2.force_auth_denied == true);
-    assert(out2.desired_pnc_blocked == true);
-    assert(out2.desired_digital == false);
+    assert(out2.force_auth_denied == false);
+    assert(out2.desired_pnc_blocked == false);
+    assert(out2.desired_digital == true);
+
+    // Autocharge auth timeout while CSMS is online should trigger PnC block + EIM fallback.
+    GunStatus unplugged{};
+    unplugged.plugged_in = false;
+    unplugged.hlc_stage = 0;
+    const auto t0 = now + std::chrono::seconds(10);
+    OcppAdapter::TestHook::apply_hlc_control(adapter, 1, unplugged, false, sess, false,
+                                             std::nullopt, false, t0);
+    OcppAdapter::TestHook::set_csms_connected(adapter, true);
+    OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
+                                             std::nullopt, false, t0 + std::chrono::seconds(1));
+    auto out3 = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
+                                                         std::nullopt, false,
+                                                         t0 + std::chrono::seconds(cfg.hlc_auth_timeout_s + 2));
+    assert(out3.auth_timeout_triggered == true);
+    assert(out3.force_auth_denied == true);
+    assert(out3.desired_pnc_blocked == true);
+    assert(out3.desired_digital == true);
 
     // PnC block TTL expiry restores Contract offer.
-    auto out3 = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
-                                                         std::optional<std::string>("AUTO1"), false, now);
-    assert(out3.desired_pnc_blocked == true);
     auto out4 = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, st, false, sess, false,
                                                          std::nullopt, false,
-                                                         now + std::chrono::seconds(cfg.pnc_block_ttl_s + 1));
+                                                         t0 + std::chrono::seconds(cfg.hlc_auth_timeout_s + cfg.pnc_block_ttl_s + 3));
     assert(out4.desired_pnc_blocked == false);
 
     std::cout << "HLC fallback tests passed\n";

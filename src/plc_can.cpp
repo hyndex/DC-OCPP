@@ -119,6 +119,10 @@ bool cp_allows_power(char cp_state) {
     return cp_state == 'C' || cp_state == 'D';
 }
 
+bool cp_is_connected(char cp_state) {
+    return cp_state == 'B' || cp_state == 'C' || cp_state == 'D';
+}
+
 } // namespace
 
 int PlcCanHardware::compute_interval_ms(int base_ms, int min_ms, int max_ms, int backoff_factor) const {
@@ -923,7 +927,24 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
         std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_cp_rx).count() <= telemetry_timeout_ms_;
     const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
     const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
-    const bool cp_interlock_ok = cp_fresh && cp_allows_power(cp_state);
+    const bool chargeinfo_fresh =
+        st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
+            telemetry_timeout_ms_;
+    const bool precharge_from_stage =
+        chargeinfo_fresh &&
+        st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
+        !st.hlc_charge_complete;
+    const bool hlc_precharge_phase = chargeinfo_fresh && (st.hlc_precharge_active || precharge_from_stage);
+    const bool hlc_power_phase = chargeinfo_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
+    const bool hlc_session_active = hlc_precharge_phase || hlc_power_phase;
+    // CP frames can briefly gap while HLC/session traffic is otherwise healthy.
+    // Keep CP-connected true in that window to avoid force-off relay chatter.
+    const bool cp_connected_raw = cp_fresh && cp_is_connected(cp_state);
+    const bool cp_connected_effective = cp_connected_raw || (!cp_fresh && chargeinfo_fresh && st.hlc_stage > 0);
+    const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
+    const bool cp_interlock_ok =
+        cp_connected_effective && !st.hlc_charge_complete && (cp_power_ready || hlc_session_active);
     if (!cp_interlock_ok) {
         want_force_off = true;
     }
@@ -1992,9 +2013,13 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
                 telemetry_timeout_ms_;
         const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
         const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
-        const bool cp_ready = cp_fresh && cp_allows_power(cp_state);
+        // CP frames can briefly gap while HLC/session traffic is otherwise healthy.
+        // Keep CP-connected true in that window to avoid force-off relay chatter.
+        const bool cp_connected_raw = cp_fresh && cp_is_connected(cp_state);
+        const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
+        const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
-            ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }
@@ -2011,7 +2036,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
             relays_closed = st.relay_cmd_mask != 0u;
         }
         const bool hlc_allows_relays =
-            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_ready &&
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_connected &&
             !st.hlc_charge_complete;
         if (!hlc_allows_relays) {
             if (gun_on || relay_mask != 0u) {
@@ -2027,7 +2052,8 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
                                << " ev_req=" << (ev_requesting ? "1" : "0")
                                << " cp=" << cp_state
                                << " cp_fresh=" << (cp_fresh ? "1" : "0")
-                               << " cp_ready=" << (cp_ready ? "1" : "0")
+                               << " cp_connected=" << (cp_connected ? "1" : "0")
+                               << " cp_power=" << (cp_power_ready ? "1" : "0")
                                << " targetI=" << st.ev_target_current_a
                                << " targetV=" << st.ev_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");
@@ -2107,9 +2133,13 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
                 telemetry_timeout_ms_;
         const bool cp_fresh = cp_session_fresh || cp_raw_fresh;
         const char cp_state = cp_session_fresh ? st.cp_state_session : (cp_raw_fresh ? st.cp_state_raw : 'U');
-        const bool cp_ready = cp_fresh && cp_allows_power(cp_state);
+        // CP frames can briefly gap while HLC/session traffic is otherwise healthy.
+        // Keep CP-connected true in that window to avoid force-off relay chatter.
+        const bool cp_connected_raw = cp_fresh && cp_is_connected(cp_state);
+        const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
+        const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
-            ev_targets_fresh && cp_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }
@@ -2126,7 +2156,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
             relays_closed = st.relay_cmd_mask != 0u;
         }
         const bool hlc_allows_relays =
-            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_ready &&
+            (hlc_active || (hlc_recent && relays_closed) || ev_requesting) && st.plugged_in && cp_connected &&
             !st.hlc_charge_complete;
         if (!hlc_allows_relays) {
             if (want_power) {
@@ -2142,7 +2172,8 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
                                << " ev_req=" << (ev_requesting ? "1" : "0")
                                << " cp=" << cp_state
                                << " cp_fresh=" << (cp_fresh ? "1" : "0")
-                               << " cp_ready=" << (cp_ready ? "1" : "0")
+                               << " cp_connected=" << (cp_connected ? "1" : "0")
+                               << " cp_power=" << (cp_power_ready ? "1" : "0")
                                << " targetI=" << st.ev_target_current_a
                                << " targetV=" << st.ev_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");

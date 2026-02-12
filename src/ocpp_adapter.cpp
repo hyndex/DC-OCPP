@@ -287,6 +287,18 @@ bool is_hlc_precharge_phase(const GunStatus& status) {
     return status.hlc_stage == HLC_STAGE_PRECHARGE;
 }
 
+bool evse_limit_ack_watchdog_relevant(const GunStatus& status, bool lock_required) {
+    const bool hlc_power_phase =
+        status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+    const bool cp_power_requesting = status.cp_state == 'C' || status.cp_state == 'D';
+    const bool power_requested = power_delivery_requested(status, lock_required);
+    const bool ev_current_requested = status.target_current_a && status.target_current_a.value() > 0.5;
+    const bool ev_current_measured = status.present_current_a && std::fabs(status.present_current_a.value()) > 1.0;
+    const bool ev_power_measured = status.present_power_w && std::fabs(status.present_power_w.value()) > 500.0;
+    return status.relay_closed && cp_power_requesting && hlc_power_phase && power_requested &&
+           (ev_current_requested || ev_current_measured || ev_power_measured);
+}
+
 bool local_disable_latches_until_unplug(const std::string& reason) {
     if (reason.empty()) {
         return false;
@@ -440,6 +452,8 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
     HlcControlOutcome out{};
     out.force_auth_denied = force_auth_denied;
     const bool autocharge_allowed = autocharge_enabled_.load();
+    const bool csms_online = csms_connected_.load();
+    const bool mac_autocharge_mode = cfg_.autocharge_id_source == "evmac";
 
     bool pending_changed = false;
     {
@@ -459,17 +473,31 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
         }
 
         if (autocharge_reject_id) {
-            flow.pnc_blocked = true;
-            flow.blocked_identity = autocharge_reject_id;
-            flow.block_expires = cfg_.pnc_block_ttl_s > 0
-                                     ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
-                                     : std::chrono::steady_clock::time_point{};
-            flow.auth_pending_since = std::chrono::steady_clock::time_point{};
-            if (clear_pending_autocharge_tokens_for_connector_locked(connector)) {
-                pending_changed = true;
+            if (mac_autocharge_mode) {
+                // In MAC-ID mode keep PnC open so the same EV identity can be retried
+                // without collapsing active digital communication.
+                flow.pnc_blocked = false;
+                flow.blocked_identity.reset();
+                flow.block_expires = std::chrono::steady_clock::time_point{};
+                if (flow.auth_pending_since.time_since_epoch().count() == 0) {
+                    flow.auth_pending_since = now;
+                }
+                out.force_auth_denied = false;
+                EVLOG_warning << "Autocharge rejected on connector " << connector
+                              << " in MAC mode; keeping PnC open for retry";
+            } else {
+                flow.pnc_blocked = true;
+                flow.blocked_identity = autocharge_reject_id;
+                flow.block_expires = cfg_.pnc_block_ttl_s > 0
+                                         ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
+                                         : std::chrono::steady_clock::time_point{};
+                flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+                if (clear_pending_autocharge_tokens_for_connector_locked(connector)) {
+                    pending_changed = true;
+                }
+                out.force_auth_denied = true;
+                EVLOG_warning << "Autocharge rejected; blocking PnC on connector " << connector;
             }
-            out.force_auth_denied = true;
-            EVLOG_warning << "Autocharge rejected; blocking PnC on connector " << connector;
         }
 
         const bool session_authorized = had_session && session.authorized;
@@ -479,35 +507,61 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
                 flow.auth_pending_since = now;
             } else if (cfg_.hlc_auth_timeout_s > 0 &&
                        (now - flow.auth_pending_since) > std::chrono::seconds(cfg_.hlc_auth_timeout_s)) {
-                flow.pnc_blocked = true;
-                flow.blocked_identity = flow.last_autocharge_id;
-                flow.block_expires = cfg_.pnc_block_ttl_s > 0
-                                         ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
-                                         : std::chrono::steady_clock::time_point{};
-                flow.auth_pending_since = std::chrono::steady_clock::time_point{};
-                if (clear_pending_autocharge_tokens_for_connector_locked(connector)) {
-                    pending_changed = true;
+                // In MAC-ID mode (or while CSMS is offline), do not tear down digital comms mid-HLC.
+                // Keep auth pending and retry instead of forcing fallback that drops SLAC/HLC.
+                if (mac_autocharge_mode || !csms_online) {
+                    flow.auth_pending_since = now;
+                    out.auth_timeout_triggered = true;
+                    EVLOG_warning << "Autocharge pending timeout on connector " << connector
+                                  << " (mode=" << cfg_.autocharge_id_source
+                                  << ", csms_online=" << (csms_online ? "true" : "false")
+                                  << "); keeping HLC active";
+                } else {
+                    flow.pnc_blocked = true;
+                    flow.blocked_identity = flow.last_autocharge_id;
+                    flow.block_expires = cfg_.pnc_block_ttl_s > 0
+                                             ? (now + std::chrono::seconds(cfg_.pnc_block_ttl_s))
+                                             : std::chrono::steady_clock::time_point{};
+                    flow.auth_pending_since = std::chrono::steady_clock::time_point{};
+                    if (clear_pending_autocharge_tokens_for_connector_locked(connector)) {
+                        pending_changed = true;
+                    }
+                    out.auth_timeout_triggered = true;
+                    out.force_auth_denied = true;
+                    EVLOG_warning << "Autocharge timed out on connector " << connector
+                                  << "; forcing EIM fallback";
                 }
-                out.auth_timeout_triggered = true;
-                out.force_auth_denied = true;
-                EVLOG_warning << "Autocharge timed out on connector " << connector << "; forcing EIM fallback";
             }
         } else {
             flow.auth_pending_since = std::chrono::steady_clock::time_point{};
         }
 
-        // Advertise digital communication (SLAC/ISO15118/DIN) when appropriate.
-        // - If AutoCharge/PnC is enabled and not blocked, keep digital comms on while plugged so the PLC can learn
-        //   EV identity early (EVMAC/EVCCID/EMAID depending on the configured source).
-        // - Otherwise (AutoCharge disabled or blocked), wait for explicit authorization (EIM/app) to avoid HLC
-        //   authorization-pending timeouts in the PLC firmware.
+        // Advertise digital communication (SLAC/ISO15118/DIN) while the EV is physically present.
+        // Keep this stable across auth retries/blocks to avoid tearing down active SLAC/HLC sessions.
+        // Brief CP/telemetry blips (e.g. cp_state='U' for a cycle) must not flap the HLC gate.
+        constexpr auto kDigitalDisableDebounce = std::chrono::milliseconds(3000);
         const bool cp_known = status.cp_state != 'U';
-        const bool plugged_hint = status.plugged_in || (cp_known && status.cp_state != 'A');
+        const bool cp_present = cp_known && status.cp_state != 'A';
+        const bool hlc_runtime_active =
+            status.hlc_stage > 0 || status.hlc_precharge_active || status.hlc_power_ready || status.relay_closed;
+        const bool strong_presence = status.plugged_in || cp_present || had_session || hlc_runtime_active;
+        if (strong_presence) {
+            flow.last_presence_hint = now;
+        }
+        const bool explicit_absent = cp_known && status.cp_state == 'A' && !status.plugged_in && !had_session &&
+                                     !hlc_runtime_active;
+        bool plugged_hint = strong_presence;
+        if (!plugged_hint && !explicit_absent && flow.last_presence_hint.time_since_epoch().count() != 0) {
+            plugged_hint = (now - flow.last_presence_hint) <= kDigitalDisableDebounce;
+        }
+        if (explicit_absent) {
+            flow.last_presence_hint = std::chrono::steady_clock::time_point{};
+        }
         const bool allow_autocharge = autocharge_allowed && !flow.pnc_blocked;
         if (allow_autocharge) {
             out.desired_digital = plugged_hint;
         } else {
-            out.desired_digital = plugged_hint && session_authorized && !post_stop_plugged;
+            out.desired_digital = plugged_hint && !post_stop_plugged;
         }
         // Keep PnC available unless explicitly blocked; MAC-based AutoCharge should not force-disable HLC.
         out.desired_pnc_blocked = (!autocharge_allowed) || flow.pnc_blocked;
@@ -515,10 +569,18 @@ OcppAdapter::apply_hlc_control(std::int32_t connector, const GunStatus& status, 
         if (out.desired_digital != flow.digital_enabled) {
             flow.digital_enabled = out.desired_digital;
             out.digital_update = true;
+            EVLOG_info << "HLC digital gate connector " << connector
+                       << " -> " << (out.desired_digital ? "ENABLED" : "DISABLED")
+                       << " (autocharge=" << (allow_autocharge ? "yes" : "no")
+                       << ", session_auth=" << (session_authorized ? "yes" : "no")
+                       << ", hlc_stage=" << static_cast<int>(status.hlc_stage)
+                       << ", plugged=" << (plugged_hint ? "yes" : "no") << ")";
         }
         if (out.desired_pnc_blocked != flow.pnc_blocked_sent) {
             flow.pnc_blocked_sent = out.desired_pnc_blocked;
             out.pnc_block_update = true;
+            EVLOG_info << "PnC block connector " << connector
+                       << " -> " << (out.desired_pnc_blocked ? "ON" : "OFF");
         }
     }
     if (pending_changed) {
@@ -2292,17 +2354,40 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 connector_faulted_[connector] = false;
             }
 
-            if (!fault && had_session && session.transaction_started &&
-                status.last_evse_limit_ack.time_since_epoch().count() != 0) {
-                const auto age = now - status.last_evse_limit_ack;
+            if (!fault && had_session && session.transaction_started) {
                 const auto ack_timeout = evse_limit_ack_timeout(cfg_);
-                const bool ack_relevant = status.relay_closed || status.hlc_power_ready ||
-                    is_hlc_precharge_phase(status) || status.hlc_stage >= HLC_MIN_POWER_STAGE;
-                if (ack_relevant && age > ack_timeout) {
-                    EVLOG_error << "EVSE limit ACK stale on connector " << connector
-                                << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(age).count()
-                                << "ms ack_count=" << status.evse_limit_ack_count
-                                << " -- stopping session for safety";
+                // Enforce hard-stop only during actual power-delivery phase.
+                // During CP=B pauses, precharge, or auth-hold, keep the watchdog non-fatal.
+                const bool ack_relevant = evse_limit_ack_watchdog_relevant(status, lock_required);
+                const auto tx_start = session.transaction_started_at;
+                const bool tx_start_known = tx_start.time_since_epoch().count() != 0;
+                const bool ack_seen = status.last_evse_limit_ack.time_since_epoch().count() != 0;
+                const bool ack_after_tx_start = ack_seen && (!tx_start_known || status.last_evse_limit_ack >= tx_start);
+                bool stale = false;
+                std::int64_t age_ms = 0;
+                if (ack_relevant) {
+                    if (ack_after_tx_start) {
+                        const auto age = now - status.last_evse_limit_ack;
+                        age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
+                        stale = age > ack_timeout;
+                    } else if (tx_start_known) {
+                        const auto since_tx_start = now - tx_start;
+                        age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(since_tx_start).count();
+                        stale = since_tx_start > ack_timeout;
+                    }
+                }
+                if (stale) {
+                    if (ack_after_tx_start) {
+                        EVLOG_error << "EVSE limit ACK stale on connector " << connector
+                                    << " age=" << age_ms
+                                    << "ms ack_count=" << status.evse_limit_ack_count
+                                    << " -- stopping session for safety";
+                    } else {
+                        EVLOG_error << "EVSE limit ACK missing since transaction start on connector " << connector
+                                    << " age=" << age_ms
+                                    << "ms ack_count=" << status.evse_limit_ack_count
+                                    << " -- stopping session for safety";
+                    }
                     {
                         std::lock_guard<std::mutex> lock(state_mutex_);
                         limit_ack_stale_events_[connector]++;
@@ -2405,6 +2490,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                                           it->second.meter_start_wh, std::nullopt, ocpp::DateTime(),
                                                           std::nullopt);
                     it->second.transaction_started = true;
+                    it->second.transaction_started_at = now;
                     it->second.power_requested_at = now;
                     session = it->second;
                 }
@@ -2879,10 +2965,13 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
     } else {
         AuthorizationState state = AuthorizationState::Denied;
         if (pending.token.source == AuthTokenSource::Autocharge) {
-            if (!csms_connected_.load()) {
+            const bool mac_autocharge_mode = cfg_.autocharge_id_source == "evmac";
+            const bool csms_online = csms_connected_.load();
+            if (mac_autocharge_mode || !csms_online) {
                 state = AuthorizationState::Pending;
-                EVLOG_info << "Autocharge rejected on connector " << connector
-                           << "; keeping auth pending to allow RemoteStart";
+                EVLOG_info << "Autocharge not accepted on connector " << connector
+                           << "; keeping auth pending for retry (mode=" << cfg_.autocharge_id_source
+                           << ", csms_online=" << (csms_online ? "true" : "false") << ")";
             } else {
                 EVLOG_info << "Autocharge rejected on connector " << connector
                            << "; forcing EIM fallback";
@@ -2930,16 +3019,26 @@ AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connecto
     const bool csms_offline = !charge_point_ || !csms_connected_.load();
     bool pending_changed = false;
     if (!accepted && pending.token.source == AuthTokenSource::Autocharge) {
-        if (csms_offline) {
+        const bool mac_autocharge_mode = cfg_.autocharge_id_source == "evmac";
+        if (csms_offline || mac_autocharge_mode) {
             new_state = AuthorizationState::Pending;
-            EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
-                       << "; keeping auth pending to allow RemoteStart";
-            if (autocharge_enabled_.load() && pending.expires_at > now && !pending.defer_until_online) {
+            EVLOG_info << "Autocharge not accepted for session " << session_id << " on connector " << connector
+                       << "; keeping auth pending for retry (mode=" << cfg_.autocharge_id_source
+                       << ", csms_online=" << (csms_offline ? "false" : "true") << ")";
+            if (autocharge_enabled_.load() && pending.expires_at > now) {
                 std::lock_guard<std::mutex> lock(session_mutex_);
-                PendingToken retry = pending;
-                retry.defer_until_online = true;
-                pending_tokens_[connector].push_back(std::move(retry));
-                pending_changed = true;
+                const auto& queue = pending_tokens_[connector];
+                const bool already_queued = std::any_of(queue.begin(), queue.end(), [&](const PendingToken& existing) {
+                    return existing.token.source == AuthTokenSource::Autocharge &&
+                           clamp_id_token(existing.token.id_token) == trimmed;
+                });
+                if (!already_queued) {
+                    PendingToken retry = pending;
+                    // Retry immediately in MAC mode while online; defer only when CSMS is actually offline.
+                    retry.defer_until_online = csms_offline;
+                    pending_tokens_[connector].push_back(std::move(retry));
+                    pending_changed = true;
+                }
             }
         } else {
             EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
@@ -3558,13 +3657,71 @@ void OcppAdapter::apply_power_plan() {
         const bool lock_ok = !lock_required || st.lock_engaged;
         bool session_present = false;
         bool session_authorized = false;
+        bool session_transaction_started = false;
+        std::chrono::steady_clock::time_point session_tx_start{};
+        std::string active_session_id;
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
             auto sit = sessions_.find(c.id);
             if (sit != sessions_.end()) {
                 session_present = true;
                 session_authorized = sit->second.authorized;
+                session_transaction_started = sit->second.transaction_started;
+                session_tx_start = sit->second.transaction_started_at;
+                active_session_id = sit->second.session_id;
             }
+        }
+        auto reset_connector_runtime_state = [&](int connector_id) {
+            gc_open_pending_.erase(connector_id);
+            gc_open_request_time_.erase(connector_id);
+            gc_close_request_time_.erase(connector_id);
+            power_delivery_stall_since_.erase(connector_id);
+            precharge_arm_ready_since_.erase(connector_id);
+            precharge_ramp_since_.erase(connector_id);
+            precharge_voltage_stable_since_.erase(connector_id);
+            precharge_transition_since_.erase(connector_id);
+            precharge_overcurrent_since_.erase(connector_id);
+            precharge_overshoot_since_.erase(connector_id);
+            precharge_ramp_cmd_voltage_v_.erase(connector_id);
+            precharge_target_power_kw_.erase(connector_id);
+            module_missing_since_.erase(connector_id);
+            stuck_output_voltage_since_.erase(connector_id);
+            stuck_output_current_since_.erase(connector_id);
+
+            const auto module_slots_it = connector_module_slots_.find(connector_id);
+            if (module_slots_it != connector_module_slots_.end()) {
+                for (const int slot_id : module_slots_it->second) {
+                    if (slot_id <= 0) {
+                        continue;
+                    }
+                    mc_open_pending_.erase(slot_id);
+                    mc_open_request_time_.erase(slot_id);
+                    const Slot* runtime_slot = find_slot(slots_, slot_id);
+                    if (!runtime_slot) {
+                        continue;
+                    }
+                    mc_switch_ready_since_.erase(runtime_slot->mc_id);
+                    if (!runtime_slot->gc_id.empty()) {
+                        gc_switch_ready_since_.erase(runtime_slot->gc_id);
+                    }
+                }
+            } else if (slot_for_conn) {
+                mc_open_pending_.erase(slot_for_conn->id);
+                mc_open_request_time_.erase(slot_for_conn->id);
+                mc_switch_ready_since_.erase(slot_for_conn->mc_id);
+                if (!slot_for_conn->gc_id.empty()) {
+                    gc_switch_ready_since_.erase(slot_for_conn->gc_id);
+                }
+            }
+        };
+        if (session_present && !active_session_id.empty()) {
+            auto& last_session_id = last_plan_session_id_[c.id];
+            if (last_session_id != active_session_id) {
+                reset_connector_runtime_state(c.id);
+                last_session_id = active_session_id;
+            }
+        } else if (last_plan_session_id_.erase(c.id) > 0) {
+            reset_connector_runtime_state(c.id);
         }
         const bool disabled_by_csms = evse_disabled_.count(c.id) ? evse_disabled_[c.id] : false;
         const bool disabled_by_local = local_disabled.count(c.id) ? local_disabled.at(c.id) : false;
@@ -3602,16 +3759,9 @@ void OcppAdapter::apply_power_plan() {
             reserved_connectors_[c.id] = false;
         }
 
-        if (st.evse_max_current_a) {
-            g.gun_current_limit_a = g.gun_current_limit_a > 0.0
-                                        ? std::min(g.gun_current_limit_a, st.evse_max_current_a.value())
-                                        : st.evse_max_current_a.value();
-        }
-        if (st.evse_max_power_kw) {
-            g.gun_power_limit_kw = g.gun_power_limit_kw > 0.0
-                                       ? std::min(g.gun_power_limit_kw, st.evse_max_power_kw.value())
-                                       : st.evse_max_power_kw.value();
-        }
+        // Do not feed back PLC-reported EVSE limits into planner caps.
+        // Those limits are controller-published outputs and can transiently reflect
+        // dynamic command throttling; re-applying them here creates a recursive clamp.
         if (profile_current_limit_a_.count(c.id) && profile_current_limit_a_[c.id] > 0.0) {
             g.gun_current_limit_a = g.gun_current_limit_a > 0.0
                                         ? std::min(g.gun_current_limit_a, profile_current_limit_a_[c.id])
@@ -3894,9 +4044,6 @@ void OcppAdapter::apply_power_plan() {
         if (c.max_voltage_v > 0.0) {
             max_voltage_v = c.max_voltage_v;
         }
-        if (st.evse_max_voltage_v) {
-            max_voltage_v = std::min(max_voltage_v, st.evse_max_voltage_v.value());
-        }
         if (g.min_voltage_v > 0.0 && g.ev_req_voltage_v < g.min_voltage_v) {
             g.ev_req_voltage_v = g.min_voltage_v;
         }
@@ -3925,14 +4072,35 @@ void OcppAdapter::apply_power_plan() {
             g.fsm_state = GunFsmState::Idle;
         }
         // EVSE limit watchdog: if we have offered limits recently but PLC hasn't ACKed, constrain power.
-        if (st.last_evse_limit_ack.time_since_epoch().count() > 0) {
-            const auto age = now - st.last_evse_limit_ack;
+        {
             const auto warn_threshold = std::max(std::chrono::milliseconds(500),
                                                  evse_limit_ack_timeout(cfg_) / 2);
-            if (age > warn_threshold && ready_for_power) {
+            const bool ack_relevant = evse_limit_ack_watchdog_relevant(st, lock_required);
+            const bool tx_started = session_present && session_transaction_started;
+            const bool tx_start_known = session_tx_start.time_since_epoch().count() != 0;
+            const bool ack_after_tx_start =
+                tx_started && st.last_evse_limit_ack.time_since_epoch().count() > 0 &&
+                (!tx_start_known || st.last_evse_limit_ack >= session_tx_start);
+            bool ack_watchdog_constrained = false;
+            if (ack_after_tx_start) {
+                const auto age = now - st.last_evse_limit_ack;
+                if (age > warn_threshold && ack_relevant && ready_for_power) {
+                    ack_watchdog_constrained = true;
+                    EVLOG_warning << "Connector " << c.id << " EVSE limit ACK stale ("
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(age).count()
+                                  << "ms)";
+                }
+            } else if (tx_started && tx_start_known && ack_relevant && ready_for_power) {
+                const auto since_tx_start = now - session_tx_start;
+                if (since_tx_start > warn_threshold) {
+                    ack_watchdog_constrained = true;
+                    EVLOG_warning << "Connector " << c.id << " EVSE limit ACK missing since transaction start ("
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(since_tx_start).count()
+                                  << "ms)";
+                }
+            }
+            if (ack_watchdog_constrained) {
                 power_constrained_[c.id] = true;
-                EVLOG_warning << "Connector " << c.id << " EVSE limit ACK stale (" << age.count()
-                              << "ms); constraining power";
             }
         }
         guns.push_back(g);
@@ -4060,6 +4228,10 @@ void OcppAdapter::apply_power_plan() {
     std::map<int, int> actual_modules_per_gun;
     std::map<int, bool> island_fault;
     std::map<int, std::string> island_fault_reason;
+    std::map<int, int> precharge_home_slot_for_gun;
+    std::map<int, uint8_t> precharge_home_mask_for_gun;
+    std::map<int, uint8_t> precharge_home_relay_mask_for_gun;
+    std::set<int> precharge_frozen_mc_slots;
 
     for (const auto& slot : slots_) {
         SlotCommandInfo info{};
@@ -4132,14 +4304,18 @@ void OcppAdapter::apply_power_plan() {
         if (info.module_health_valid && info.modules_healthy) {
             last_module_health_ok_[slot.id] = now;
         }
-        if (!info.module_health_valid) {
-            const auto it = last_module_health_ok_.find(slot.id);
-            if (it != last_module_health_ok_.end() &&
-                (now - it->second) <= std::chrono::milliseconds(grace_ms)) {
-                module_health_ok = true;
-            } else {
-                module_health_ok = false;
-            }
+        bool module_grace_active = false;
+        const auto grace_it = last_module_health_ok_.find(slot.id);
+        if (grace_it != last_module_health_ok_.end() &&
+            (now - grace_it->second) <= std::chrono::milliseconds(grace_ms)) {
+            module_grace_active = true;
+        }
+        // Module telemetry can dip during tie switching / relay transitions.
+        // Honor a short grace window before declaring module loss.
+        if ((!info.module_health_valid || !info.modules_healthy) && module_grace_active) {
+            module_health_ok = true;
+        } else if (!info.module_health_valid) {
+            module_health_ok = false;
         }
         if (info.module_unavailable_fault) {
             module_health_ok = false;
@@ -4150,9 +4326,13 @@ void OcppAdapter::apply_power_plan() {
 
         if (info.status.gc_welded) info.fault_reason = "GCWelded";
         if (info.status.mc_welded) info.fault_reason = "MCWelded";
+        if (info.status.estop && info.fault_reason.empty()) info.fault_reason = "EmergencyStop";
+        if (info.status.earth_fault && info.fault_reason.empty()) info.fault_reason = "EarthFault";
         if (info.status.isolation_fault && info.fault_reason.empty()) info.fault_reason = "Isolation";
         if (info.status.overtemp_fault && info.fault_reason.empty()) info.fault_reason = "Overtemp";
         if (info.status.overcurrent_fault && info.fault_reason.empty()) info.fault_reason = "Overcurrent";
+        if (info.status.cp_fault && info.fault_reason.empty()) info.fault_reason = "CPFault";
+        if (!info.status.safety_ok && info.fault_reason.empty()) info.fault_reason = "SafetyTrip";
         if (info.status.comm_fault && info.fault_reason.empty()) info.fault_reason = "CommFault";
         if (info.module_can_overload && info.fault_reason.empty()) info.fault_reason = "ModuleCanOverload";
         const bool forced_fault = snap_it != snapshots.end() && snap_it->second.forced_fault;
@@ -4160,11 +4340,15 @@ void OcppAdapter::apply_power_plan() {
             info.fault_reason =
                 !snap_it->second.forced_fault_reason.empty() ? snap_it->second.forced_fault_reason : "ForcedFault";
         }
-        const bool modules_known_bad = slot_has_modules && info.module_health_valid && runtime_healthy_modules <= 0;
-        if (modules_known_bad && info.fault_reason.empty()) info.fault_reason = "ModuleOffline";
+        const bool modules_expected = info.selection.gun_id > 0 && info.selection.module_count > 0 && !info.disabled_by_csms;
+        // Treat missing/invalid module health here as a soft degraded condition only.
+        // Hard-stop is handled by the debounced module_unavailable_fault path from snapshots.
+        const bool modules_degraded = slot_has_modules && modules_expected && !module_health_ok;
+        (void)modules_degraded;
         if (info.module_unavailable_fault && info.fault_reason.empty()) info.fault_reason = "ModuleUnavailable";
-        info.local_fault = !info.gun_state.safety_ok || forced_fault || modules_known_bad || info.module_unavailable_fault ||
-                           info.module_can_overload ||
+        const bool hard_safety_fault =
+            !info.status.safety_ok || info.status.estop || info.status.earth_fault || info.status.cp_fault;
+        info.local_fault = hard_safety_fault || forced_fault || info.module_unavailable_fault || info.module_can_overload ||
                            info.status.gc_welded || info.status.mc_welded || info.status.isolation_fault ||
                            info.status.overtemp_fault || info.status.overcurrent_fault || info.status.comm_fault;
 
@@ -4194,6 +4378,40 @@ void OcppAdapter::apply_power_plan() {
         info.slot_cfg_mask = cfg_mask;
 
         slot_info[slot.id] = info;
+    }
+
+    if (tie_mode) {
+        for (const auto& c : cfg_.connectors) {
+            const auto st_it = status_by_connector.find(c.id);
+            if (st_it == status_by_connector.end()) {
+                continue;
+            }
+            const GunStatus& st = st_it->second;
+            const bool hlc_power_phase =
+                st.hlc_power_ready || (st.hlc_stage >= HLC_MIN_POWER_STAGE && !st.hlc_charge_complete);
+            const bool hlc_precharge_only = is_hlc_precharge_phase(st) && !hlc_power_phase;
+            if (!hlc_precharge_only) {
+                continue;
+            }
+            const Slot* home = find_slot_for_gun(c.id);
+            if (!home) {
+                continue;
+            }
+            const auto info_it = slot_info.find(home->id);
+            if (info_it == slot_info.end()) {
+                continue;
+            }
+            const auto& info = info_it->second;
+            if (info.disabled_by_csms || info.local_fault) {
+                continue;
+            }
+            // Keep bus topology stable during precharge to avoid MC relay chatter.
+            precharge_frozen_mc_slots.insert(home->id);
+            const Slot* ccw = find_slot(slots_, home->ccw_id);
+            if (ccw) {
+                precharge_frozen_mc_slots.insert(ccw->id);
+            }
+        }
     }
 
     std::map<int, int> island_gc_request_count;
@@ -4233,6 +4451,14 @@ void OcppAdapter::apply_power_plan() {
                 desired = ContactorState::Open;
             }
 
+            const bool precharge_mc_frozen =
+                precharge_frozen_mc_slots.count(slot.id) > 0 && !info.disabled_by_csms && !info.local_fault;
+            if (precharge_mc_frozen) {
+                // During precharge, force MC boundaries closed around the home segment so GC sequencing can proceed
+                // without island open/close jitter.
+                desired = ContactorState::Closed;
+            }
+
             ContactorState prev = ContactorState::Open;
             const auto prev_it = last_mc_state_.find(slot.mc_id);
             if (prev_it != last_mc_state_.end()) {
@@ -4240,6 +4466,12 @@ void OcppAdapter::apply_power_plan() {
             }
 
             ContactorState gated = prev;
+            if (precharge_mc_frozen) {
+                const auto held = enforce_hold(slot.mc_id, desired, last_mc_state_, mc_command_change_time_,
+                                               planner_cfg_.min_mc_hold_ms, true);
+                mc_state_cmd_by_slot[slot.id] = held;
+                continue;
+            }
             if (desired == prev) {
                 mc_switch_ready_since_.erase(slot.mc_id);
                 mc_open_pending_.erase(slot.id);
@@ -4556,6 +4788,106 @@ void OcppAdapter::apply_power_plan() {
         }
     }
 
+    // Precharge lock: use exactly one healthy module from the connector's home slot and keep other slot modules
+    // for that gun disabled until power phase starts. This avoids relay/mask jitter during HLC precharge.
+    for (const auto& c : cfg_.connectors) {
+        const auto st_it = status_by_connector.find(c.id);
+        if (st_it == status_by_connector.end()) {
+            continue;
+        }
+        const GunStatus& st = st_it->second;
+        const bool hlc_power_phase =
+            st.hlc_power_ready || (st.hlc_stage >= HLC_MIN_POWER_STAGE && !st.hlc_charge_complete);
+        const bool hlc_precharge_only = is_hlc_precharge_phase(st) && !hlc_power_phase;
+        if (!hlc_precharge_only) {
+            continue;
+        }
+
+        const Slot* home = find_slot_for_gun(c.id);
+        if (!home || home->modules.empty()) {
+            continue;
+        }
+        const auto home_it = slot_info.find(home->id);
+        if (home_it == slot_info.end()) {
+            continue;
+        }
+        auto& home_info = home_it->second;
+        if (home_info.disabled_by_csms || home_info.local_fault || !home_info.modules_healthy) {
+            continue;
+        }
+
+        uint8_t precharge_mask = 0u;
+        for (const auto& module_id : home->modules) {
+            const auto bit_it = module_slot_index.find(module_id);
+            if (bit_it == module_slot_index.end()) {
+                continue;
+            }
+            const auto health_it = module_health_by_id.find(module_id);
+            if (health_it == module_health_by_id.end() || !health_it->second) {
+                continue;
+            }
+            const int bit = bit_it->second;
+            if (bit < 0 || bit >= 8) {
+                continue;
+            }
+            precharge_mask = static_cast<uint8_t>(1u << bit);
+            break;
+        }
+        if (precharge_mask == 0u) {
+            for (int bit = 0; bit < 8; ++bit) {
+                const uint8_t bit_mask = static_cast<uint8_t>(1u << bit);
+                if ((home_info.slot_cfg_mask & bit_mask) != 0u) {
+                    precharge_mask = bit_mask;
+                    break;
+                }
+            }
+        }
+        if (precharge_mask == 0u) {
+            continue;
+        }
+
+        precharge_home_slot_for_gun[c.id] = home->id;
+        precharge_home_mask_for_gun[c.id] = precharge_mask;
+        uint8_t precharge_relay_mask = 0u;
+        const auto relay_slots_it = connector_module_slots_.find(c.id);
+        if (relay_slots_it != connector_module_slots_.end()) {
+            const auto& relay_slots = relay_slots_it->second;
+            if (relay_slots[0] == home->id) {
+                precharge_relay_mask |= 0x01u;
+            }
+            if (relay_slots[1] == home->id) {
+                precharge_relay_mask |= 0x02u;
+            }
+        }
+        if (precharge_relay_mask != 0u) {
+            precharge_home_relay_mask_for_gun[c.id] = precharge_relay_mask;
+        }
+        home_info.modules_final = 1;
+        home_info.mask_final = precharge_mask;
+
+        for (auto& slot_kv : slot_info) {
+            if (slot_kv.first == home->id) {
+                continue;
+            }
+            auto& info = slot_kv.second;
+            if (info.selection.gun_id == c.id) {
+                info.modules_final = 0;
+                info.mask_final = 0u;
+            }
+        }
+
+        static std::map<int, std::chrono::steady_clock::time_point> last_log;
+        auto& ts = last_log[c.id];
+        const bool allow_log =
+            ts.time_since_epoch().count() == 0 || (now - ts) > std::chrono::seconds(1);
+        if (allow_log) {
+            EVLOG_info << "Precharge single-module lock connector=" << c.id
+                       << " slot=" << home->id << " mask=0x" << std::hex
+                       << static_cast<int>(precharge_mask) << std::dec;
+            ts = now;
+        }
+    }
+
     for (const auto& kv : slot_info) {
         const auto& info = kv.second;
         const int gid = info.selection.gun_id;
@@ -4631,6 +4963,7 @@ void OcppAdapter::apply_power_plan() {
             const bool hlc_precharge_only = is_hlc_precharge_phase(st) && !hlc_power_phase;
             if (!hlc_precharge_only) {
                 precharge_ramp_cmd_voltage_v_.erase(gid);
+                precharge_target_power_kw_.erase(gid);
                 precharge_arm_ready_since_.erase(gid);
                 precharge_ramp_since_.erase(gid);
                 precharge_voltage_stable_since_.erase(gid);
@@ -4639,7 +4972,27 @@ void OcppAdapter::apply_power_plan() {
                 precharge_overshoot_since_.erase(gid);
                 continue;
             }
-            disp.current_limit_a = std::min(disp.current_limit_a, precharge_i_max);
+            const auto g_it = gun_lookup.find(gid);
+            double precharge_current_cmd = precharge_i_max;
+            if (g_it != gun_lookup.end() && g_it->second.gun_current_limit_a > 0.0) {
+                precharge_current_cmd = std::min(precharge_current_cmd, g_it->second.gun_current_limit_a);
+            }
+            if (hold_guns_no_current.count(gid)) {
+                precharge_current_cmd = 0.0;
+            }
+            disp.current_limit_a = precharge_current_cmd;
+            double precharge_target_v = disp.voltage_set_v;
+            if (g_it != gun_lookup.end() && g_it->second.ev_req_voltage_v > 0.0) {
+                precharge_target_v = g_it->second.ev_req_voltage_v;
+            }
+            precharge_target_v = std::max(precharge_arm_v_max, precharge_target_v);
+            double& precharge_target_p_kw = precharge_target_power_kw_[gid];
+            if (precharge_current_cmd <= 0.0) {
+                precharge_target_p_kw = 0.0;
+            } else if (precharge_target_p_kw <= 0.0) {
+                const double precharge_cap_kw = (precharge_target_v * precharge_current_cmd) / 1000.0;
+                precharge_target_p_kw = std::max(disp.p_set_kw, precharge_cap_kw);
+            }
             const bool gc_closed = relay_closed_effective(gid, st);
             if (!gc_closed) {
                 // Arm at ~0V before closing GC.
@@ -4647,7 +5000,7 @@ void OcppAdapter::apply_power_plan() {
                 disp.voltage_set_v = 0.0;
                 disp.p_set_kw = 0.0;
             } else {
-                const double target_v = std::max(precharge_arm_v_max, disp.voltage_set_v);
+                const double target_v = precharge_target_v;
                 double& ramp_v = precharge_ramp_cmd_voltage_v_[gid];
                 if (ramp_v < 0.0) {
                     ramp_v = 0.0;
@@ -4659,15 +5012,20 @@ void OcppAdapter::apply_power_plan() {
                     ramp_v = target_v;
                 }
                 disp.voltage_set_v = ramp_v;
-                const double v_safe = std::max(planner_cfg_.min_voltage_v_for_div, disp.voltage_set_v);
-                const double p_max = (v_safe * disp.current_limit_a) / 1000.0;
-                disp.p_set_kw = std::min(disp.p_set_kw, p_max);
+                if (precharge_current_cmd <= 0.0) {
+                    disp.p_set_kw = 0.0;
+                } else {
+                    const double v_safe = std::max(planner_cfg_.min_voltage_v_for_div, disp.voltage_set_v);
+                    const double p_max = (v_safe * precharge_current_cmd) / 1000.0;
+                    disp.p_set_kw = std::min(precharge_target_p_kw, p_max);
+                }
             }
         }
     }
     for (const auto& c : cfg_.connectors) {
         if (!adjusted_dispatch.count(c.id)) {
             precharge_ramp_cmd_voltage_v_.erase(c.id);
+            precharge_target_power_kw_.erase(c.id);
             precharge_arm_ready_since_.erase(c.id);
             precharge_ramp_since_.erase(c.id);
             precharge_voltage_stable_since_.erase(c.id);
@@ -4758,9 +5116,14 @@ void OcppAdapter::apply_power_plan() {
                     gun_blocked_by_island_conflict.at(gun_for_slot);
                 const int gc_requests =
                     island_gc_request_count.count(current_island) ? island_gc_request_count.at(current_island) : 0;
-                // If only one gun is active in the island and this slot's MC is already closed,
-                // allow GC sequencing to proceed even if tie boundaries are still settling.
-                if (gc_requests <= 1 && !island_conflict && mc_closed_cmd) {
+                const bool mc_settled = (actual == info.desired_mc_state);
+                const bool home_module_available =
+                    !slot->modules.empty() && info.modules_healthy && !info.disabled_by_csms && !local_fault;
+                // If only one gun is active in the island, allow GC sequencing when either:
+                // - this MC is already in its target state, or
+                // - the home slot already has a healthy local module that can sustain precharge.
+                // This prevents deadlock when non-critical tie boundaries are still settling.
+                if (gc_requests <= 1 && !island_conflict && (mc_settled || home_module_available)) {
                     block_isolation = false;
                 }
             }
@@ -4796,8 +5159,20 @@ void OcppAdapter::apply_power_plan() {
         const auto precharge_transition_timeout =
             std::chrono::milliseconds(std::max(30000, cfg_.precharge_timeout_ms * 20));
 
+        const bool precharge_single_home_slot =
+            is_home && precharge_home_slot_for_gun.count(c.id) &&
+            precharge_home_slot_for_gun.at(c.id) == slot->id;
+        if (hlc_precharge_only && precharge_single_home_slot && !local_fault && !info.disabled_by_csms) {
+            // Precharge path should not be blocked by tie/island churn.
+            mc_closed_cmd = true;
+            isolation_ready = true;
+        }
+
         bool gc_close_requested = is_home && (info.desired_gc_state == ContactorState::Closed) &&
                                   dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
+        if (hlc_precharge_only && precharge_single_home_slot && !info.disabled_by_csms && !local_fault) {
+            gc_close_requested = dispatch.modules_assigned > 0;
+        }
         bool gc_closed_cmd = gc_close_requested;
         const bool power_request_active =
             ev_requesting && (hlc_power_phase || (!hlc_known && ev_current_req && ev_voltage_req));
@@ -5087,9 +5462,14 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
-        if (!local_fault && !hold_no_current && gc_close_requested && power_request_active && current_valid &&
-            (gc_closed_cmd || gc_closed_effective)) {
-            if (std::fabs(meas_i) < gc_open_thresh) {
+        const double stall_current_req_thresh = 1.0;
+        const bool stall_current_requested =
+            status.target_current_a && status.target_current_a.value() >= stall_current_req_thresh;
+        const bool evse_current_offered = dispatch.current_limit_a >= stall_current_req_thresh;
+        const double stall_no_current_thresh = std::max(gc_open_thresh, 1.0);
+        if (!local_fault && !hold_no_current && gc_close_requested && power_request_active &&
+            stall_current_requested && evse_current_offered && current_valid && (gc_closed_cmd || gc_closed_effective)) {
+            if (std::fabs(meas_i) < stall_no_current_thresh) {
                 auto& ts = power_delivery_stall_since_[c.id];
                 if (ts.time_since_epoch().count() == 0) {
                     ts = now;
@@ -5103,7 +5483,9 @@ void OcppAdapter::apply_power_plan() {
                         }
                         EVLOG_warning << "Power delivery stalled for connector " << c.id
                                       << " (I_meas=" << meas_i
-                                      << "A target_I=" << status.target_current_a.value_or(0.0) << "A)";
+                                      << "A I_offered=" << dispatch.current_limit_a
+                                      << "A target_I=" << status.target_current_a.value_or(0.0)
+                                      << "A I_thresh=" << stall_no_current_thresh << "A)";
                     }
                 }
             } else {
@@ -5204,6 +5586,13 @@ void OcppAdapter::apply_power_plan() {
             }
             if (slot_closed(module_slots[1])) {
                 relay_mask_cmd |= 0x02u;
+            }
+        }
+        if (hlc_precharge_only && precharge_single_home_slot) {
+            const auto precharge_relay_it = precharge_home_relay_mask_for_gun.find(c.id);
+            if (precharge_relay_it != precharge_home_relay_mask_for_gun.end() &&
+                precharge_relay_it->second != 0u) {
+                relay_mask_cmd = precharge_relay_it->second;
             }
         }
         const bool connector_fault = !info.gun_state.safety_ok;
@@ -5466,8 +5855,22 @@ void OcppAdapter::apply_power_plan() {
                 warmup_status.hlc_power_ready ||
                 (warmup_status.hlc_stage >= HLC_MIN_POWER_STAGE && !warmup_status.hlc_charge_complete) ||
                 warmup_status.relay_closed;
-            const bool warmup = warmup_safe && !drive_modules && warmup_phase;
+            bool warmup = warmup_safe && !drive_modules && warmup_phase;
             uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
+            const auto precharge_slot_it = precharge_home_slot_for_gun.find(warmup_owner_id);
+            if (precharge_slot_it != precharge_home_slot_for_gun.end()) {
+                const int precharge_home_slot = precharge_slot_it->second;
+                if (precharge_home_slot != slot.id) {
+                    warmup = false;
+                    warmup_mask = 0u;
+                } else {
+                    const auto precharge_mask_it = precharge_home_mask_for_gun.find(warmup_owner_id);
+                    if (precharge_mask_it != precharge_home_mask_for_gun.end() &&
+                        precharge_mask_it->second != 0u) {
+                        warmup_mask = precharge_mask_it->second;
+                    }
+                }
+            }
             if (warmup && warmup_mask == 0u) {
                 const int fallback_count =
                     dispatch.modules_assigned > 0 ? dispatch.modules_assigned : info.modules_final;
@@ -5609,6 +6012,7 @@ void OcppAdapter::apply_zero_power_plan() {
     gc_switch_ready_since_.clear();
     power_delivery_stall_since_.clear();
     precharge_ramp_cmd_voltage_v_.clear();
+    precharge_target_power_kw_.clear();
     precharge_arm_ready_since_.clear();
     precharge_ramp_since_.clear();
     precharge_voltage_stable_since_.clear();

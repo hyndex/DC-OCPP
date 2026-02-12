@@ -57,6 +57,7 @@ private:
         std::chrono::steady_clock::time_point pending_started;
         std::chrono::steady_clock::time_point last_seen_plugged;
         bool transaction_started{false};
+        std::chrono::steady_clock::time_point transaction_started_at{};
         bool authorized{false};
         bool ev_connected{false};
         AuthTokenSource token_source{AuthTokenSource::RFID};
@@ -89,6 +90,7 @@ private:
         std::optional<std::string> blocked_identity{};
         std::chrono::steady_clock::time_point block_expires{};
         std::chrono::steady_clock::time_point auth_pending_since{};
+        std::chrono::steady_clock::time_point last_presence_hint{};
         std::optional<std::string> last_autocharge_id{};
     };
 
@@ -309,10 +311,12 @@ private:
     std::map<int, int> last_module_alloc_;
     std::map<int, double> last_voltage_v_;
     std::map<int, double> precharge_ramp_cmd_voltage_v_;
+    std::map<int, double> precharge_target_power_kw_;
     std::map<int, double> last_power_w_;
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
     std::map<int, double> last_ev_target_power_kw_;
+    std::map<int, std::string> last_plan_session_id_;
     std::map<std::string, ContactorState> last_gc_state_;
     std::map<std::string, ContactorState> last_mc_state_;
     std::map<int, bool> mc_open_pending_;

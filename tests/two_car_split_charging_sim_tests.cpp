@@ -43,15 +43,15 @@ static ChargerConfig make_cfg() {
                         .max_power_w = 60000,
                         .max_voltage_v = 1000,
                         .min_voltage_v = 200,
-                        .meter_source = "module",
-                        .require_lock = false},
+                        .require_lock = false,
+                        .meter_source = "module"},
         ConnectorConfig{.id = 2,
                         .max_current_a = 200,
                         .max_power_w = 60000,
                         .max_voltage_v = 1000,
                         .min_voltage_v = 200,
-                        .meter_source = "module",
-                        .require_lock = false},
+                        .require_lock = false,
+                        .meter_source = "module"},
     };
 
     // Physical topology: two guns on a ring, one 30 kW module per gun.

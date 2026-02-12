@@ -61,6 +61,13 @@ constexpr uint8_t MAXWELL_ALARM_ONOFF_BIT = 22; // 0=On, 1=Off per V1.50 table.
 constexpr auto MAXWELL_START_TIMEOUT = std::chrono::seconds(2);
 constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(3);
 constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(3);
+constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
+constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
+
+inline bool startup_load_requested(double current_a, double power_kw) {
+    return current_a > MODULE_START_FAULT_MIN_CURRENT_A ||
+           power_kw > MODULE_START_FAULT_MIN_POWER_KW;
+}
 
 constexpr uint32_t RECTIFIER_STATUS_IGNORE_MASK =
     (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26) | (1u << 27) | (1u << 30);
@@ -1243,7 +1250,9 @@ private:
                 const bool module_off = (val & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0;
                 const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
                 bool fault = severe;
-                if (!fault && desired_.enable && enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
+                if (!fault && desired_.enable &&
+                    startup_load_requested(desired_.current_a, desired_.power_kw) &&
+                    enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
                     (now - enable_requested_at_) > MAXWELL_START_TIMEOUT) {
                     fault = true;
                 }
@@ -1600,7 +1609,9 @@ private:
                 last_status_update_ = now;
                 const bool module_off = (val & (1u << 25)) != 0;
                 bool fault = (val & RECTIFIER_STATUS_FAULT_MASK) != 0;
-                if (!fault && desired_.enable && enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
+                if (!fault && desired_.enable &&
+                    startup_load_requested(desired_.current_a, desired_.power_kw) &&
+                    enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
                     (now - enable_requested_at_) > RECTIFIER_START_TIMEOUT) {
                     fault = true;
                 }
@@ -1779,7 +1790,9 @@ private:
                      (last_ext_fault_bits_ & TONHE_EXT_FAULT_SEVERE_MASK) != 0 ||
                      (last_state_ == TONHE_STATE_FAULT_OFF);
         const bool module_off = last_state_ != TONHE_STATE_ON;
-        if (!fault && desired_.enable && enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
+        if (!fault && desired_.enable &&
+            startup_load_requested(desired_.current_a, desired_.power_kw) &&
+            enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
             (now - enable_requested_at_) > TONHE_START_TIMEOUT) {
             fault = true;
         }
