@@ -762,6 +762,38 @@ std::string load_and_patch_ocpp_config(const ChargerConfig& cfg) {
         json["Custom"]["AutochargeEnabled"] = true;
     }
 
+    if (!json.contains("Internal") || !json["Internal"].is_object()) {
+        json["Internal"] = nlohmann::json::object();
+    }
+    // Prevent libocpp fallback defaults (48A / 33.12kW) from unintentionally capping DC sessions
+    // when no charging profile is installed. User-configured keys still win via merged user_config.
+    double derived_limit_a = 0.0;
+    double derived_limit_w = 0.0;
+    const double fallback_v = cfg.default_voltage_v > 0.0 ? cfg.default_voltage_v : 0.0;
+    for (const auto& c : cfg.connectors) {
+        if (c.max_current_a > derived_limit_a) {
+            derived_limit_a = c.max_current_a;
+        }
+        if (c.max_power_w > derived_limit_w) {
+            derived_limit_w = c.max_power_w;
+        }
+        if (c.max_power_w <= 0.0 && fallback_v > 0.0 && c.max_current_a > 0.0) {
+            derived_limit_w = std::max(derived_limit_w, c.max_current_a * fallback_v);
+        }
+    }
+    if (derived_limit_w <= 0.0 && cfg.grid_limit_kw > 0.0) {
+        derived_limit_w = cfg.grid_limit_kw * 1000.0;
+    }
+    if (derived_limit_a <= 0.0 && derived_limit_w > 0.0 && fallback_v > 0.0) {
+        derived_limit_a = derived_limit_w / fallback_v;
+    }
+    if (derived_limit_a > 0.0 && !json["Internal"].contains("CompositeScheduleDefaultLimitAmps")) {
+        json["Internal"]["CompositeScheduleDefaultLimitAmps"] = derived_limit_a;
+    }
+    if (derived_limit_w > 0.0 && !json["Internal"].contains("CompositeScheduleDefaultLimitWatts")) {
+        json["Internal"]["CompositeScheduleDefaultLimitWatts"] = derived_limit_w;
+    }
+
     // Merge persisted user config (ChangeConfiguration) as overrides.
     if (!cfg.user_config.empty() && fs::exists(cfg.user_config)) {
         try {

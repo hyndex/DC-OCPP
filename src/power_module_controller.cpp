@@ -58,9 +58,14 @@ constexpr uint32_t MAXWELL_ALARM_SEVERE_MASK =
     (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14) |
     (1u << 16) | (1u << 17) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
 constexpr uint8_t MAXWELL_ALARM_ONOFF_BIT = 22; // 0=On, 1=Off per V1.50 table.
-constexpr auto MAXWELL_START_TIMEOUT = std::chrono::seconds(2);
-constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(3);
-constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(3);
+// Maxwell V1.50 (Table 1 + response format) reports read/write failures via non-F0 status,
+// while actionable module fault semantics are exposed through the 0x0040 alarm/status bits.
+// Use a wider confirmation window so transient response errors do not immediately trip modules.
+constexpr int MAXWELL_STATUS_ERROR_DEBOUNCE_COUNT = 12;
+constexpr auto MAXWELL_STATUS_ERROR_DEBOUNCE_TIME = std::chrono::milliseconds(3000);
+constexpr auto MAXWELL_START_TIMEOUT = std::chrono::seconds(8);
+constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(8);
+constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(8);
 constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
 constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
 
@@ -1190,21 +1195,35 @@ private:
         if (frame.can_dlc < 8) {
             return;
         }
+        const auto now = std::chrono::steady_clock::now();
         const uint8_t type = frame.data[0];
         const uint8_t status = frame.data[1];
         const uint16_t reg = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
         if (status != MAXWELL_OK) {
-            const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
-                                    ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
-                                    : 0x00;
-            telemetry_.fault = true;
-            telemetry_.healthy = false;
-            telemetry_.fault_mask = bit;
-            telemetry_.healthy_mask = 0;
-            telemetry_.last_update = std::chrono::steady_clock::now();
+            if (status_error_since_.time_since_epoch().count() == 0) {
+                status_error_since_ = now;
+            }
+            status_error_count_++;
+            const bool persistent_status_error =
+                status_error_count_ >= MAXWELL_STATUS_ERROR_DEBOUNCE_COUNT &&
+                (now - status_error_since_) >= MAXWELL_STATUS_ERROR_DEBOUNCE_TIME;
+            if (persistent_status_error && !status_error_latched_) {
+                EVLOG_warning << "MXR module " << spec_.id
+                              << " persistent non-F0 responses (status=0x"
+                              << std::hex << static_cast<int>(status) << std::dec
+                              << ", reg=0x" << std::hex << reg << std::dec
+                              << ", count=" << status_error_count_
+                              << "); waiting for stable 0x0040 alarm evidence before faulting";
+                status_error_latched_ = true;
+            }
             return;
         }
-        const auto now = std::chrono::steady_clock::now();
+        if (status_error_latched_) {
+            EVLOG_info << "MXR module " << spec_.id << " response status recovered to F0";
+            status_error_latched_ = false;
+        }
+        status_error_since_ = std::chrono::steady_clock::time_point{};
+        status_error_count_ = 0;
         if (type == MAXWELL_TYPE_FLOAT) {
             const float val = decode_float_be(&frame.data[4]);
             if (!std::isfinite(val)) {
@@ -1318,8 +1337,11 @@ private:
     std::optional<uint8_t> resolved_group_{};
     std::chrono::steady_clock::time_point last_probe_tx_{};
     std::chrono::steady_clock::time_point last_missing_rated_current_log_{};
+    std::chrono::steady_clock::time_point status_error_since_{};
     double last_limit_fraction_{0.0};
     int limit_mismatch_count_{0};
+    int status_error_count_{0};
+    bool status_error_latched_{false};
 };
 
 class RectifierModuleDriver : public ModuleDriver {

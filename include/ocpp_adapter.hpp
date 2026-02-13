@@ -325,8 +325,10 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> gc_switch_ready_since_;
     std::map<int, bool> gc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> gc_open_request_time_;
+    std::map<int, std::chrono::steady_clock::time_point> gc_open_timeout_exceeded_since_;
     std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
+    std::map<int, std::chrono::steady_clock::time_point> power_request_lost_since_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_arm_ready_since_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_ramp_since_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_voltage_stable_since_;
@@ -343,6 +345,7 @@ private:
     std::map<int, double> last_meter_sent_wh_;
     std::map<int, std::chrono::steady_clock::time_point> last_meter_sent_time_;
     std::map<int, std::chrono::steady_clock::time_point> cp_fault_since_;
+    std::map<int, std::chrono::steady_clock::time_point> charging_request_lost_since_;
     std::map<int, uint64_t> last_present_stale_counts_;
     std::map<int, uint64_t> last_limit_stale_counts_;
     std::map<int, uint64_t> limit_ack_stale_events_;

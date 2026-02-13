@@ -27,7 +27,7 @@ namespace charger {
 namespace {
 
 constexpr int kPollMs = 200;
-constexpr int kTxPresentActiveMs = 300;
+constexpr int kTxPresentActiveMs = 100;
 constexpr int kTxPresentIdleMs = 500;
 constexpr int kTxLimitsMs = 1500;
 constexpr int kMinTxLimitsMs = 200;
@@ -730,7 +730,11 @@ void PlcCanHardware::handle_frame(const std::string& iface, uint32_t can_id, con
 
         st->ev_target_voltage_v = tlm.ev_target_voltage_v;
         st->ev_target_current_a = tlm.ev_target_current_a;
-        st->last_ev_targets_rx = now;
+        const bool precharge_stage =
+            tlm.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) && !tlm.charge_complete;
+        if (cp_allows_power(tlm.cp_state) || precharge_stage) {
+            st->last_ev_targets_rx = now;
+        }
 
         // In protocol v3, EVSE limit ACKs are conveyed by the low-byte of the PLC's received-limits counter.
         bool ack_advanced = false;
@@ -1852,6 +1856,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.present_voltage_v = pv;
     gs.present_current_a = pc;
     gs.present_power_w = pp_kw * 1000.0;
+    gs.last_target_update = st.last_ev_targets_rx;
     if (ev_targets_fresh) {
         gs.target_voltage_v = st.ev_target_voltage_v;
         gs.target_current_a = st.ev_target_current_a;

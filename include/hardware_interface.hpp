@@ -56,6 +56,7 @@ struct GunStatus {
     double pilot_duty_pct{0.0};
     std::optional<double> target_voltage_v;
     std::optional<double> target_current_a;
+    std::chrono::steady_clock::time_point last_target_update{};
     std::optional<double> present_voltage_v;
     std::optional<double> present_current_a;
     std::optional<double> present_power_w;

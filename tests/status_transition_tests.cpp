@@ -39,8 +39,33 @@ int main() {
     auto hw = std::make_shared<TestHardware>(cfg);
     OcppAdapter adapter(cfg, hw);
 
-    // Case 1: constrained but relay closed should remain Charging (avoid false SuspendedEVSE).
+    // Case 0: CP=B noise without plug/session evidence should stay Available.
     GunStatus st = base_status();
+    st.plugged_in = false;
+    st.cp_state = 'B';
+    st.relay_closed = false;
+    st.authorization_granted = false;
+    st.hlc_stage = 0;
+    st.hlc_power_ready = false;
+    st.hlc_precharge_active = false;
+    OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
+                                                  false, // has_session
+                                                  false, // tx_started
+                                                  false, // authorized
+                                                  false, // fault_active
+                                                  false, // disabled
+                                                  false, // post_stop_plugged
+                                                  false, // seamless_retry_active
+                                                  false  // suppress_available_event
+    );
+    auto state = OcppAdapter::TestHook::connector_state(adapter, 1);
+    if (state != ConnectorState::Available) {
+        std::cerr << "status_transition_tests failed: expected Available for CP=B noise without plug/session evidence\n";
+        return 1;
+    }
+
+    // Case 1: constrained but relay closed should remain Charging (avoid false SuspendedEVSE).
+    st = base_status();
     OcppAdapter::TestHook::power_constrained(adapter)[1] = true;
     OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
                                                   true,  // has_session
@@ -52,7 +77,7 @@ int main() {
                                                   false, // seamless_retry_active
                                                   false  // suppress_available_event
     );
-    auto state = OcppAdapter::TestHook::connector_state(adapter, 1);
+    state = OcppAdapter::TestHook::connector_state(adapter, 1);
     if (state != ConnectorState::Charging) {
         std::cerr << "status_transition_tests failed: expected Charging under constraint with relay closed\n";
         return 1;

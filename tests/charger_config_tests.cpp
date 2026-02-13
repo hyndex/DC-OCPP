@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 using namespace charger;
 namespace fs = std::filesystem;
 
@@ -314,6 +316,46 @@ int main() {
         assert(cfg.can_traffic.bits_per_frame_estimate == 140);
         assert(cfg.can_traffic.over_cap_debounce_ms == 2500);
         assert(cfg.can_traffic.enforce);
+    }
+
+    // Composite schedule defaults should follow connector capability when no explicit key is configured.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0, "maxCurrentA": 200, "maxPowerW": 60000 } ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        const auto patched = nlohmann::json::parse(load_and_patch_ocpp_config(cfg));
+        assert(patched.contains("Internal"));
+        assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitAmps"].get<double>() - 200.0) < 1e-9);
+        assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitWatts"].get<double>() - 60000.0) < 1e-9);
+    }
+
+    // User-configured values must override derived defaults.
+    {
+        const auto dir = make_temp_dir();
+        (void)write_file(dir, "user_config.json",
+                         R"JSON({ "Internal": { "CompositeScheduleDefaultLimitAmps": 123, "CompositeScheduleDefaultLimitWatts": 45000 } })JSON");
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0, "maxCurrentA": 200, "maxPowerW": 60000 } ],
+  "userConfig": "user_config.json"
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        const auto patched = nlohmann::json::parse(load_and_patch_ocpp_config(cfg));
+        assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitAmps"].get<double>() - 123.0) < 1e-9);
+        assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitWatts"].get<double>() - 45000.0) < 1e-9);
     }
 
     std::cout << "charger_config_tests passed\n";
