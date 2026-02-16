@@ -61,6 +61,7 @@ int main() {
   "plc": {
     "relayMode": "ties",
     "moduleRelaysEnabled": true,
+    "relay3Enabled": false,
     "gunRelayOwnedByPlc": false,
     "relayFeedbackAvailable": false
   },
@@ -81,6 +82,7 @@ int main() {
 
         const auto cfg = load_charger_config(path);
         assert(cfg.plc_relay_mode == PlcRelayMode::Ties);
+        assert(!cfg.plc_relay3_enabled);
         assert(cfg.tie_close_max_delta_v == 15.0);
         assert(cfg.switch_max_current_a == 1.5);
         assert(cfg.switch_stable_time_ms == 100);

@@ -15,7 +15,7 @@
   - `include/charger_config.hpp` (`CanTrafficConfig`)
   - `src/charger_config.cpp` (`canTraffic` parsing and validation)
 - Policy propagation:
-  - `src/ocpp_adapter.cpp` (`ModuleCanTrafficPolicy` setup + PLC reserve per interface)
+  - `src/ocpp_adapter.cpp` (`ModuleCanTrafficPolicy` setup)
 - Runtime governance:
   - `src/power_module_controller.cpp`
     - Rolling-window monitor and governor per CAN interface

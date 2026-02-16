@@ -3,6 +3,7 @@
 #include "test_config_helpers.hpp"
 #include "test_hardware.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -71,6 +72,7 @@ int main() {
     seed_session(adapter, 1);
     auto st = make_status(355.0, 355.0, 30.0);
     st.relay_closed = true; // simulate contactor closed but no current flow
+    st.last_target_update = std::chrono::steady_clock::now();
     hw->set_status_override(1, st);
     OcppAdapter::TestHook::apply_power_plan(adapter);
     {
@@ -83,12 +85,14 @@ int main() {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
     st.last_telemetry = std::chrono::steady_clock::now();
+    st.last_target_update = std::chrono::steady_clock::now();
     hw->set_status_override(1, st);
     OcppAdapter::TestHook::apply_power_plan(adapter);
     {
         std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter));
-        if (OcppAdapter::TestHook::sessions(adapter).find(1) != OcppAdapter::TestHook::sessions(adapter).end()) {
-            std::cerr << "Power delivery stall test failed: session not cleared\n";
+        if (OcppAdapter::TestHook::sessions(adapter).find(1) ==
+            OcppAdapter::TestHook::sessions(adapter).end()) {
+            std::cerr << "Power delivery stall test failed: session cleared despite active module current telemetry\n";
             return 1;
         }
     }
@@ -101,10 +105,12 @@ int main() {
     seed_session(low_offer_adapter, 1);
     auto low_offer_st = make_status(355.0, 355.0, 30.0);
     low_offer_st.relay_closed = true;
+    low_offer_st.last_target_update = std::chrono::steady_clock::now();
     low_offer_hw->set_status_override(1, low_offer_st);
     OcppAdapter::TestHook::apply_power_plan(low_offer_adapter);
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
     low_offer_st.last_telemetry = std::chrono::steady_clock::now();
+    low_offer_st.last_target_update = std::chrono::steady_clock::now();
     low_offer_hw->set_status_override(1, low_offer_st);
     OcppAdapter::TestHook::apply_power_plan(low_offer_adapter);
     {
@@ -112,6 +118,92 @@ int main() {
         if (OcppAdapter::TestHook::sessions(low_offer_adapter).find(1) ==
             OcppAdapter::TestHook::sessions(low_offer_adapter).end()) {
             std::cerr << "Power delivery stall test failed: session cleared while EVSE current offer was low\n";
+            return 1;
+        }
+    }
+
+    // Repeated short current dips (real-world noise/transients) must not latch stall faults.
+    auto transient_cfg = make_cfg();
+    auto transient_hw = std::make_shared<TestHardware>(transient_cfg);
+    OcppAdapter transient_adapter(transient_cfg, transient_hw);
+    seed_session(transient_adapter, 1);
+    auto transient_st = make_status(370.0, 384.0, 35.0);
+    transient_st.relay_closed = true;
+    transient_st.present_current_a = 35.0;
+    transient_st.last_target_update = std::chrono::steady_clock::now();
+    transient_hw->set_status_override(1, transient_st);
+    OcppAdapter::TestHook::apply_power_plan(transient_adapter);
+    for (int i = 0; i < 3; ++i) {
+        transient_st.present_current_a = 0.0;
+        transient_st.last_telemetry = std::chrono::steady_clock::now();
+        transient_st.last_target_update = std::chrono::steady_clock::now();
+        transient_hw->set_status_override(1, transient_st);
+        OcppAdapter::TestHook::apply_power_plan(transient_adapter);
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        transient_st.present_current_a = 33.0;
+        transient_st.last_telemetry = std::chrono::steady_clock::now();
+        transient_st.last_target_update = std::chrono::steady_clock::now();
+        transient_hw->set_status_override(1, transient_st);
+        OcppAdapter::TestHook::apply_power_plan(transient_adapter);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(transient_adapter));
+        if (OcppAdapter::TestHook::sessions(transient_adapter).find(1) ==
+            OcppAdapter::TestHook::sessions(transient_adapter).end()) {
+            std::cerr << "Power delivery stall test failed: transient current dips triggered session fault\n";
+            return 1;
+        }
+    }
+
+    // Persistent low measured current must not silently clamp commanded current.
+    auto no_cap_cfg = make_cfg();
+    auto no_cap_hw = std::make_shared<TestHardware>(no_cap_cfg);
+    OcppAdapter no_cap_adapter(no_cap_cfg, no_cap_hw);
+    seed_session(no_cap_adapter, 1);
+    auto no_cap_st = make_status(370.0, 384.0, 51.0);
+    no_cap_st.relay_closed = true;
+    no_cap_st.present_current_a = 7.0;
+    no_cap_st.last_target_update = std::chrono::steady_clock::now();
+    no_cap_hw->set_status_override(1, no_cap_st);
+    for (int i = 0; i < 4; ++i) {
+        no_cap_st.last_telemetry = std::chrono::steady_clock::now();
+        no_cap_st.last_target_update = std::chrono::steady_clock::now();
+        no_cap_hw->set_status_override(1, no_cap_st);
+        OcppAdapter::TestHook::apply_power_plan(no_cap_adapter);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(no_cap_adapter));
+        if (OcppAdapter::TestHook::sessions(no_cap_adapter).find(1) ==
+            OcppAdapter::TestHook::sessions(no_cap_adapter).end()) {
+            std::cerr << "Power delivery stall test failed: short underdelivery window incorrectly faulted session\n";
+            return 1;
+        }
+    }
+
+    // Stale CurrentDemand target metadata must not trigger stall-fault escalation.
+    auto stale_cfg = make_cfg();
+    auto stale_hw = std::make_shared<TestHardware>(stale_cfg);
+    OcppAdapter stale_adapter(stale_cfg, stale_hw);
+    seed_session(stale_adapter, 1);
+    auto stale_st = make_status(370.0, 384.0, 25.0);
+    stale_st.relay_closed = true;
+    stale_st.present_current_a = 0.0;
+    stale_st.last_target_update = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+    stale_hw->set_status_override(1, stale_st);
+    OcppAdapter::TestHook::apply_power_plan(stale_adapter);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    stale_st.last_telemetry = std::chrono::steady_clock::now();
+    stale_st.last_target_update = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+    stale_hw->set_status_override(1, stale_st);
+    OcppAdapter::TestHook::apply_power_plan(stale_adapter);
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(stale_adapter));
+        if (OcppAdapter::TestHook::sessions(stale_adapter).find(1) ==
+            OcppAdapter::TestHook::sessions(stale_adapter).end()) {
+            std::cerr << "Power delivery stall test failed: stale target metadata triggered stall fault\n";
             return 1;
         }
     }
@@ -262,6 +354,56 @@ int main() {
     if (!fresh_target_mreq_after.has_value() || fresh_target_mreq_after->current_a > 1e-6) {
         std::cerr << "Power delivery stall test failed: module current did not gate after stale targets\n";
         return 1;
+    }
+
+    // Stress case: repeated short CP=U blips with fresh targets must not collapse current command.
+    auto blip_cfg = make_cfg();
+    auto blip_hw = std::make_shared<TestHardware>(blip_cfg);
+    OcppAdapter blip_adapter(blip_cfg, blip_hw);
+    seed_session(blip_adapter, 1);
+
+    auto blip_st = make_status(372.0, 384.0, 45.0);
+    blip_st.relay_closed = true;
+    blip_st.last_target_update = std::chrono::steady_clock::now();
+    blip_hw->set_status_override(1, blip_st);
+    OcppAdapter::TestHook::apply_power_plan(blip_adapter);
+    const auto blip_before = OcppAdapter::TestHook::last_module_command_for_slot(blip_adapter, 1);
+    if (!blip_before.has_value() || blip_before->current_a < 0.5) {
+        std::cerr << "Power delivery stall test failed: expected non-zero module current before CP blip stress\n";
+        return 1;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        blip_st.cp_state = 'U';
+        blip_st.last_telemetry = std::chrono::steady_clock::now();
+        blip_st.last_target_update = std::chrono::steady_clock::now();
+        blip_hw->set_status_override(1, blip_st);
+        OcppAdapter::TestHook::apply_power_plan(blip_adapter);
+        const auto blip_cmd_u = blip_hw->last_power_command(1);
+        if (!blip_cmd_u.has_value() || blip_cmd_u->current_limit_a < 0.5) {
+            std::cerr << "Power delivery stall test failed: current collapsed during short CP=U stress blip\n";
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        blip_st.cp_state = 'C';
+        blip_st.last_telemetry = std::chrono::steady_clock::now();
+        blip_st.last_target_update = std::chrono::steady_clock::now();
+        blip_hw->set_status_override(1, blip_st);
+        OcppAdapter::TestHook::apply_power_plan(blip_adapter);
+        const auto blip_cmd_c = blip_hw->last_power_command(1);
+        if (!blip_cmd_c.has_value() || blip_cmd_c->current_limit_a < 0.5) {
+            std::cerr << "Power delivery stall test failed: current failed to recover after CP=U stress blip\n";
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(blip_adapter));
+        if (OcppAdapter::TestHook::sessions(blip_adapter).find(1) == OcppAdapter::TestHook::sessions(blip_adapter).end()) {
+            std::cerr << "Power delivery stall test failed: stress blips unexpectedly faulted the session\n";
+            return 1;
+        }
     }
 
     // Sustained CP=B must not keep power active indefinitely, even if target timestamps keep refreshing.

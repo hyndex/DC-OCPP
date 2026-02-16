@@ -76,14 +76,14 @@ int main() {
         OcppAdapter::TestHook::sessions(adapter)[1] = session;
     }
 
-    // Case 1: stale EVSE limit ACK should constrain power.
+    // Case 1: stale EVSE limit ACK is diagnostic-only; do not constrain power by ACK age alone.
     // Default evse_limit_ack_timeout_ms=5000 -> warn threshold is 2500ms (timeout/2).
     GunStatus stale = make_ready_status(now, true, std::chrono::milliseconds(3000));
     hw->set_status_override(1, stale);
     OcppAdapter::TestHook::apply_power_plan(adapter);
-    assert(OcppAdapter::TestHook::power_constrained(adapter)[1] == true);
+    assert(OcppAdapter::TestHook::power_constrained(adapter)[1] == false);
 
-    // Case 2: fresh EVSE limit ACK clears constraint.
+    // Case 2: fresh EVSE limit ACK remains unconstrained.
     GunStatus fresh = make_ready_status(now, true, std::chrono::milliseconds(10));
     hw->set_status_override(1, fresh);
     OcppAdapter::TestHook::apply_power_plan(adapter);

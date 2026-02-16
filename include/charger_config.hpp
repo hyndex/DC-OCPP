@@ -116,6 +116,7 @@ struct ChargerConfig {
     bool plc_use_crc8{true};
     bool plc_owns_gun_relay{false}; // When true, controller will not command GC relay; PLC owns it
     bool plc_module_relays_enabled{true}; // Drive PLC auxiliary relays as tie contactors
+    bool plc_relay3_enabled{true}; // When false, Relay3 is never driven by controller
     PlcRelayMode plc_relay_mode{PlcRelayMode::Ties}; // Split charging: relay bits [1..2] drive tie contactors
     bool plc_relay_feedback{true}; // When false, assume relay commands succeed (no relay feedback available)
     std::string autocharge_id_source{"evmac"}; // "evmac", "evccid", or "emaid"

@@ -37,6 +37,37 @@ int main() {
     assert(out.desired_digital == true);
     assert(out.desired_pnc_blocked == true);
 
+    // Once digital comm is enabled, a short telemetry/CP unknown blip must not flap it OFF.
+    OcppAdapter::TestHook::set_autocharge_enabled(adapter, true);
+    GunStatus present{};
+    present.plugged_in = true;
+    present.cp_state = 'B';
+    const auto t_present = now + std::chrono::seconds(2);
+    auto digital_on = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, present, false, sess, false,
+                                                               std::nullopt, false, t_present);
+    assert(digital_on.desired_digital == true);
+
+    GunStatus blip{};
+    blip.plugged_in = false;
+    blip.cp_state = 'U';
+    auto digital_blip = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, blip, false, sess, false,
+                                                                 std::nullopt, false,
+                                                                 t_present + std::chrono::milliseconds(200));
+    assert(digital_blip.desired_digital == true);
+
+    // Disable only after explicit unplug (CP=A + unplugged) is sustained past debounce.
+    GunStatus explicit_absent{};
+    explicit_absent.plugged_in = false;
+    explicit_absent.cp_state = 'A';
+    auto absent_short = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, explicit_absent, false, sess, false,
+                                                                 std::nullopt, false,
+                                                                 t_present + std::chrono::milliseconds(500));
+    assert(absent_short.desired_digital == true);
+    auto absent_long = OcppAdapter::TestHook::apply_hlc_control(adapter, 1, explicit_absent, false, sess, false,
+                                                                std::nullopt, false,
+                                                                t_present + std::chrono::seconds(4));
+    assert(absent_long.desired_digital == false);
+
     // Autocharge auth timeout while CSMS is offline should not force fallback.
     OcppAdapter::TestHook::set_autocharge_enabled(adapter, true);
     OcppAdapter::TestHook::set_csms_connected(adapter, false);

@@ -91,6 +91,7 @@ private:
         std::chrono::steady_clock::time_point block_expires{};
         std::chrono::steady_clock::time_point auth_pending_since{};
         std::chrono::steady_clock::time_point last_presence_hint{};
+        std::chrono::steady_clock::time_point absent_since{};
         std::optional<std::string> last_autocharge_id{};
     };
 

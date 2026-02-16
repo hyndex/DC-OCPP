@@ -44,7 +44,8 @@
     },
     "Security": {
         "AuthorizationKey": "DEADBEEFDEADBEEF",
-        "SecurityProfile": 2
+        "SecurityProfile": 2,
+        "DisableSecurityEventNotifications": true
     },
     "CostAndPrice": {
         "CustomDisplayCostAndPrice": false

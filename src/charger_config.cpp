@@ -202,6 +202,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
+    cfg.plc_relay3_enabled = plc_cfg.value("relay3Enabled", true);
     cfg.plc_relay_mode = parse_plc_relay_mode(plc_cfg.value("relayMode", "ties"));
     cfg.plc_relay_feedback = plc_cfg.value("relayFeedbackAvailable", true);
     cfg.autocharge_id_source = normalize_autocharge_source(
@@ -333,7 +334,7 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (!cfg.plc_module_relays_enabled) {
         throw std::runtime_error(
-            "Split charging requires plc.moduleRelaysEnabled=true (relay bits 1..2 drive tie contactors)");
+            "Split charging requires plc.moduleRelaysEnabled=true (relay bits drive module-side contactors)");
     }
     if (cfg.plc_owns_gun_relay) {
         throw std::runtime_error(

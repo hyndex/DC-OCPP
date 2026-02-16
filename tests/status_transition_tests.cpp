@@ -83,7 +83,7 @@ int main() {
         return 1;
     }
 
-    // Case 2: CP unknown, no target current: treat as SuspendedEV (not EVSE).
+    // Case 2: CP unknown, no power-stage evidence: keep Preparing (avoid false SuspendedEV).
     st = base_status();
     st.relay_closed = false;
     st.cp_state = 'U';
@@ -94,8 +94,8 @@ int main() {
     OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
                                                   true, true, true, false, false, false, false, false);
     state = OcppAdapter::TestHook::connector_state(adapter, 1);
-    if (state != ConnectorState::SuspendedEV) {
-        std::cerr << "status_transition_tests failed: expected SuspendedEV when CP unknown and no request\n";
+    if (state != ConnectorState::Preparing) {
+        std::cerr << "status_transition_tests failed: expected Preparing when CP unknown and no power-stage evidence\n";
         return 1;
     }
 

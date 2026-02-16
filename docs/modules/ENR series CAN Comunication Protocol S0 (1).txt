@@ -1,0 +1,3872 @@
+石家庄麦克斯韦新能源科技有限公司
+Shijiazhuang Maxwell Technology Co., Ltd
+
+Communication Protocol
+
+Communication Protocol
+version
+
+S0
+
+Release date
+
+2023/9/18
+
+CAN C ommunication Protocol
+
+1 / 24
+
+Release history
+
+Version
+
+S0
+
+1.
+2.
+3.
+4.
+5.
+6.
+
+Revision information
+The protocol modified to SA04-EA/S based on SA03 protocol
+Add get battery votage command
+Add get hardversion command
+Add get fanrpmpct command
+Add commandsup
+Add automatic mode in set the high and low voltage mode
+
+Author
+
+Date
+
+2023-9-18
+
+2 / 24
+
+Directoty
+Preface..........................................................................................................................................................................................4
+1. CAN protocol specification ............................................................................................................................................ 5
+1.1 ID field...........................................................................................................................................................................5
+1.2 Data Fields .................................................................................................................................................................... 5
+1.2.1 Byte 0 data............................................................................................................................................................7
+1.2.2 Bytes 1 data..........................................................................................................................................................7
+1.2.3 Bytes 2~3 data .................................................................................................................................................... 8
+1.2.4 Bytes 4~7 data .................................................................................................................................................... 8
+1.2.5 The format of message type AllSetData and AllSetDataResponse ................................................ 11
+2. Examples of common commands.............................................................................................................................12
+2.1 Set output voltage for all modules .................................................................................................................... 12
+2.2 Set output voltage of module 1 (module 1 address is 0x01) .................................................................... 12
+2.3 Set limit current for all modules..........................................................................................................................13
+2.4 Set limit current for module 1 (module 1 address is 0x01) ........................................................................13
+2.5 Read output voltage of all modules .................................................................................................................. 14
+2.6 Read output voltage of module 1 (module 1 address is 0x01)................................................................ 15
+2.7 Read output current of all modules ...................................................................................................................15
+2.8 Read output current of module 1 (module 1 address is 0x01) .................................................................16
+2.9 Power on all modules .............................................................................................................................................16
+2.10 Power on module 1 (Module 1 address is 0x01) ........................................................................................ 17
+2.11 Shut down all modules ........................................................................................................................................ 17
+2.12 Shut down module 1 (Module 1 address is 0x01) ...................................................................................... 18
+2.13 Read Module Status for all modules ...............................................................................................................18
+2.14 Read Module Status of module 1 (Module 1 address is 0x01) .............................................................. 19
+2.15 Set high or low output mode for module 1 (Module 1 address is 0x01) ........................................... 20
+2.16 Read high or low output mode status of Module 1 (Module 1 address is 0x01) ............................ 20
+2.17 Read serial number of module 1 (Module 1 address is 0x01) ................................................................21
+2.18 The AllSetData to turn on and off of module 1 (module 1 address is 0x01) .....................................22
+2.19 Set group address of module 1(module 1 address is 0x02) ................................................................... 22
+3 Appendix.............................................................................................................................................................................23
+3.1 The definition of module status bit....................................................................................................................23
+3.2 The definition of module serial number ...........................................................................................................24
+3 / 24
+
+Preface
+Overview
+This document describes in detail the protocol for communication between the rectifier
+module and the monitoring unit.
+
+Audience
+Applicable to monitoring software developers of partners, used to monitor our company's
+rectifier module.
+
+4/ 24
+
+1. CAN protocol specification
+The rectifier module of our company supports Controller Area Network (CAN) protocol. This protocol
+adopts CAN 2.0B with extended frames and 29bits identifier. The monitoring unit can control, configure and
+query the rectifier module through the CAN bus protocol. The baud rate is 125kbs, the unit of all voltages is mV,
+and the unit of all currents is mA.
+The format of CAN message is as follows:
+ID Field：29Bits
+
+Data Field：8Bytes
+
+1.1 ID field
+The formats of ID field are defined as follows:
+28:25
+
+24:21
+
+20:14
+
+13:9
+
+8:0
+
+Protocol
+
+Monitor Address
+
+Module Address
+
+Production Day
+
+Serial Number Low Part
+
+0x01
+
+Monitor - (0x01~0x0F)
+BroadCast - 0
+
+Module - (0x01~0x7F) 1~31 (optional)
+BroadCast - 0
+
+0 (optional)
+
+Protocol：（4 bits）
+0x01：Communication protocol number between the rectifier module and the monitoring unit.
+Monitor Address：（4bits）
+bit21～bit24 indicates the address of the monitoring unit. The address is set from 0x01 to 0x0F, and the
+default monitor address is 0x01.
+0x00: broadcast.
+Module Address：（7bits）
+bit14～bit20 is the address of the rectifier module. The module address range is 0x01~0x1F.
+0x00: broadcast.
+Production Day：（5bits）
+Date of production (1-31)。
+Serial Number Low Part：（9bits）
+The lower part of product serial number, which indicates the product development stage (' P 'represents PT
+stage,' E 'represents EVT stage, and' D 'represents DVT stage,and’0’represents MP stage）。
+
+1.2 Data Fields
+The formats of Data field are defined as follows:
+5 / 24
+
+Byte0
+7:4
+3:0
+Group Address Message Type
+Group Address Set Data - 0
+
+Byte1
+7:0
+Command Type
+Vout, - 0
+
+Byte2 Byte3
+7:0
+7:0
+Reserved
+0
+
+(0x01~0x0F)
+
+Set Data Response-1
+
+Iout_slow, - 1
+
+BroadCast - 0
+
+Read Data -2
+
+Vout Reference, -2
+
+Byte4 Byte5
+7:0
+7:0
+Command Data
+
+Byte6
+7:0
+
+Byte7
+7:0
+
+Read Data Response-3 Iout Limit, -3
+Read Serial Number
+
+Shut Down DC-DC,
+
+Resp onse-4
+
+-4 Read SN,-5
+
+All Set Data-11
+
+ModuleS tatus, -8
+All Set Data Response Vab,
+-20
+-12
+Vbc,
+-21
+Vca,
+
+-22
+
+Tin,
+
+-30
+
+Iout_fastest, -47
+Iout_fast,
+
+-48
+
+Vbat,
+
+-61
+
+Group Address, -89
+HiMode_LoMode
+_Selection,
+
+-95
+
+HiMode_LoMode_
+Status,
+
+- 96
+
+Vout_fast,
+
+-98
+
+TrueHiLo_Status,
+-101
+Current Capability,
+-104
+Dc Run In Boot
+Mode,-107
+Current And Capabili
+ty, – 114
+Fan Speed1
+
+-120
+
+Fan Speed2
+
+-121
+
+Fan Speed3
+
+-122
+
+Temp Margin -123
+Hardware Version, 125
+FanRPMPCT, -126
+6 / 24
+
+Fan RPMPCT, -126
+Command Ex,
+-127
+
+Sleep Time,-23
+Work Time,-24
+
+1.2.1 Byte 0 data
+
+Byte 0 data consists of two parts, the high 4 bits is the group address, the low 4 bits is the message type;
+1.Group address
+The group address range is 0x01 to 0x0F. 0x00 indicates broadcast communication. The default group
+address is 1；
+2.Message type
+
+Message type
+
+Description
+
+0x00
+
+Set Data
+
+0x01
+
+Set Data Response
+
+0x02
+
+Read Data
+
+0x03
+
+Read Data Response
+
+0x04
+
+Read Serial Number Response
+
+1.2.2 Bytes 1 data
+
+The command type indicates the command corresponding to the data information.
+Command
+type
+0
+
+Description
+
+R/W
+
+Save to EEPROM
+
+Read output voltage
+
+R
+
+N
+
+1
+
+Read output current
+
+R
+
+N
+
+2
+
+Set output voltage reference
+
+R/W
+
+N
+
+3
+
+Set output limiting current point
+
+R/W
+
+N
+
+4
+
+Power on/Shut down
+
+W
+
+N
+
+5
+
+Read module serial number
+
+R
+
+Y
+
+8
+
+Read module status
+
+R
+
+N
+
+20
+
+Line voltage AB
+
+R
+
+N
+
+21
+
+Line voltage BC
+
+R
+
+N
+
+22
+
+Line voltage CA
+
+R
+
+N
+
+30
+
+Inlet air temperature
+
+R
+
+N
+
+61
+
+Battery Voltage
+
+R
+
+N
+
+7 / 24
+
+89
+
+Group address
+
+R/W
+
+Y
+
+95
+
+Set high or low voltage mode
+
+W
+
+Y
+
+96
+
+Read high or low voltage mode status
+
+R
+
+N
+
+101
+
+Read the actual high or low voltage mode
+status
+
+R
+
+N
+
+104
+
+Read output current capability
+
+R
+
+N
+
+107
+
+Read DCDC is run in APP or BOOT
+
+R
+
+N
+
+114
+
+Read output current and output current
+capability
+
+R
+
+N
+
+120
+
+Fan 1 speed
+
+R
+
+N
+
+121
+
+Fan 2 speed
+
+R
+
+N
+
+122
+
+Fan 3 speed
+
+R
+
+N
+
+123
+
+Temperature margin
+
+R
+
+N
+
+125
+
+Read hardware version
+
+R
+
+Y
+
+126
+
+Read maximum fan speed percentage
+
+R
+
+N
+
+127
+
+Extend type commands
+
+R/W
+
+Y/N
+
+1.2.3 Bytes 2~3 data
+
+（1）If it is the module's read serial number response, byte 2 and byte 3 data are the upper 16 bits of the
+module's serial number, as defined below：
+
+Bits
+
+Definition
+
+Description
+
+7:0
+
+ProductionWeek
+
+Production Week（1~54）
+
+15:8
+
+ProductionYear
+
+Production Year（0~127, 0 is year 2000）
+
+（2）If CommandType is 127 (CommandEx), byte 2 and byte 3 is Expand subcommands (CommandSup)：
+
+CommandSup
+
+Description
+
+R/W
+
+Save to EEPROM
+
+23
+
+SleepTime
+
+R
+
+Y
+
+24
+
+WorkTime
+
+R
+
+Y
+
+（3）Byte 2 and byte 3 data are reserved.
+1.2.4 Bytes 4~7 data
+
+Byte 4 to byte 7 are the command data part, total 4 bytes.
+The Byte1(CommandType) and Byte4~Byte7(CommandData) are defined as follows：
+
+8 / 24
+
+Command type
+
+Description
+
+0
+
+Module output voltage (mV)
+
+1
+
+Module output current (mA)
+
+2
+
+Module output voltage reference (mV)
+
+3
+
+Module output limit current (mA)
+
+4
+
+Power on/Shut down (0 on, 1 off)
+
+5
+
+The higher 48 bits parts of the module serial number
+
+8
+
+Module status
+
+20
+
+Line voltage AB (mV)
+
+21
+
+Line voltage BC (mV)
+
+22
+
+Line voltage CA (mV)
+
+30
+
+Inlet temperature (m℃)
+
+61
+
+Battery Voltage (mV)
+
+95
+
+Set the module high or low voltage mode （1：High Voltage Mode 2：Low Voltage Mode
+3：Automatic Mode）
+
+（Can be set successfully only in the shutdown state）
+（Mode 1,2 not save in EEPROM，Mode 3 save in EEPROM）
+96
+
+Read module high or low voltage mode（1：High Voltage Mode 2：Low Voltage Mode
+
+101
+
+Read the actual high or low voltage mode status （1：High Voltage Mode 2：Low
+
+3：Automatic Mode）
+
+Voltage Mode 3：Automatic Mode）
+
+104
+
+Read module output current capability (mA)
+
+107
+
+Read DCDC is run in APP or BOOT
+（1.BOOT，2.APP（or normal work））
+
+114
+
+Read output current and output current capability (0.1A)
+
+120
+
+（高十六位：模块的实际输出电流，
+Fan 1 speed unit：1rpm
+
+121
+
+Fan 2 speed unit：1rpm
+
+122
+
+Fan 3 speed unit：1rpm
+
+123
+
+Temperature margin (m℃)
+
+125
+
+Hardware Version
+
+126
+
+Maximum fan speed percentage（1000 is 100%）
+9/ 24
+
+CommandSup
+
+127
+
+SleepTime-23 (h)
+WorkTime-24 (h)
+The definition of module status bits is as follows: (The detailed definition of module status bits is attached in
+the appendix):
+Bits
+Bit0
+
+Definition
+
+Description
+
+Ac over voltage
+
+1: Abnormal. 0: Normal
+
+Ac under voltage
+
+1: Abnormal. 0: Normal
+
+Module protection
+
+AC overvoltage disconnected (AC
+overvoltage shutdown)
+
+1: Abnormal. 0: Normal
+
+Bit3
+
+PFC bus overvoltage
+
+PFC bus over voltage
+
+1: Abnormal. 0: Normal
+
+Bit4
+
+PFC bus undervoltage
+
+PFC bus under voltage
+
+1: Abnormal. 0: Normal
+
+Bit5
+
+The PFC bus is unbalanced
+
+The PFC bus is unbalanced
+
+1: Abnormal. 0: Normal
+
+Bit6
+
+Dc output overvoltage
+
+Dc output overvoltage
+
+1: Abnormal. 0: Normal
+
+Bit7
+
+Module protection
+
+Dc overvoltage shutdown
+
+1: Abnormal. 0: Normal
+
+Bit8
+
+Dc output undervoltage
+
+Dc output undervoltage
+
+1: Abnormal. 0: Normal
+
+Bit9
+
+Fan failure
+
+Fan is not running
+
+1: Abnormal. 0: Normal
+
+Bit10
+
+Reserve
+
+Reserve
+
+Reserve
+
+Bit11
+
+The fan drive circuit is
+damaged
+
+The fan drive circuit is damaged
+
+1: Abnormal. 0: Normal
+
+Bit12
+
+Over temperature protection
+
+Ambient overtemperature
+
+1: Abnormal. 0: Normal
+
+Bit13
+
+Under temperature protection
+
+Ambient under temperature
+
+1: Abnormal. 0: Normal
+
+PFC overtemperature protection 1
+
+1: Abnormal. 0: Normal
+
+Output relay fault
+
+1: Abnormal. 0: Normal
+
+Bit16
+
+DC overtemperature protection 1
+
+1: Abnormal. 0: Normal
+
+Bit17
+
+Reserve
+
+Reserve
+
+Module failure
+
+Internal communication fail (The
+communication between the PFC
+and the DCDC fails)
+
+1: Abnormal. 0: Normal
+
+Bit19
+
+Reserve
+
+Reserve
+
+Reserve
+
+Bit20
+
+Module failure
+
+PFC fail
+
+1: Abnormal. 0: Normal
+
+Bit1
+Bit2
+
+AC input fault
+
+Bit14
+Bit15
+
+Bit18
+
+Over temperature protection
+
+10/ 24
+
+Bit21
+
+DCDC fail
+
+1: Abnormal. 0: Normal
+
+Bit22
+
+AC Volume reduction
+
+AC voltage leads to capacitance
+reduction
+
+1: Abnormal. 0: Normal
+
+Bit23
+
+Temperature Volume
+reduction
+
+Temperature leads to capacitance
+reduction
+
+1: Abnormal. 0: Normal
+
+Bit24
+
+Reserve
+
+Reserve
+
+Reserve
+
+Bit25
+
+Module status
+
+The DCDC is not running
+
+1: Power off 0: Power on
+
+Output loop state
+
+3: reserved 2: current loop
+
+Bit26
+
+Output loop state
+
+Bit27
+
+1: reserved 0: voltage loop
+
+Bit28
+
+The DC output voltage is
+unbalanced
+
+The DC output voltage is
+unbalanced
+
+1: Abnormal. 0: Normal
+
+Bit29
+
+Modules with the same
+serial number were found
+
+Modules with the same serial
+number were found
+
+1: Abnormal. 0: Normal
+
+Bit30
+
+Reserve
+
+Reserve
+
+Reserve
+
+Bit31
+
+Module failure
+
+The discharge circuit is abnormal
+
+1: Abnormal. 0: Normal
+
+1.2.5 The format of message type AllSetData and AllSetDataResponse
+
+When the message type is AllSetData, AllSetDataResponse, the data field format is defined as follows：
+Byte0
+Byte1
+Byte2
+Byte3
+Byte4
+Byte5
+Byte6
+Byte7
+7:4
+3:0
+7:0
+7:0
+7:0
+7:0
+7:0
+7:0
+7:0
+Group Address Message Type
+On Off_and_HiLoMode
+Iout Limit
+Vbattery
+Vout Reference
+Group Address AllSetData-11
+Output current
+Battery voltage Output voltage
+limit
+point
+reference
+(0x01~0x0F)
+AllSetDataRespo
+(Unit: 0.1V)
+(unit: 0.1A)
+(Unit: 0.1V)
+BroadCast - 0 nse-12
+
+7:6
+
+5:2
+
+Hi LoMode Selection
+
+reserved
+
+No Selection
+
+- 0
+
+HiMode
+
+-
+
+2
+
+LoMode
+
+-
+
+3
+
+(When you select LoMode or HiMode, if
+the module is not running on the right
+mode, The Module will shutdown
+automatically and configure to the right
+mode you need, then restart. )
+
+0
+
+1:0
+OnOff
+Turn On- 0
+Shut Down(DC,not PFC) – 1
+Turn On(DC, PFC)-2
+Shut Down(DC,PFC) -3
+
+11 / 24
+
+2. Examples of common commands
+
+2.1 Set output voltage for all modules
+Monitor Sends Broadcast Message to set the output voltage of all rectifier modules to 475.55V. The
+following is an example of the CAN communication frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1(Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x00
+
+Optional
+
+Optional
+
+The following is an example of a CAN communication frame data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+Optional
+
+0x00
+
+0x07
+
+0x41
+
+0x9E
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+0x01
+
+0x00
+
+0x02
+
+Optional
+
+0x7419E
+Note: Since the voltage unit is mV, 475.55V is converted to 475550 mV, which is converted to hex number
+0x7419E. The rectifier module receives the broadcast setting command and does not respond to the monitor.
+
+2.2 Set output voltage of module 1 (module 1 address is 0x01)
+Monitor sends the output voltage reference of module1 to 475.55V. The following is an example of the
+CAN communication frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+Module Addres
+
+1
+
+1(Optional)
+
+0x01
+
+13:9
+
+8:0
+
+Production Day Serial Number Low Part
+Optional
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x07
+
+0x41
+
+0x9E
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x02
+
+0x7419E
+
+12/ 24
+
+The rectifier module receives the setting command and responds the data. An example of the CAN
+communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+1 (Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Serial number
+Serial number
+1
+0x01
+information
+information
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x07
+
+0x41
+
+0x9E
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x01
+
+0x02
+
+0x7419E
+
+2.3 Set limit current for all modules
+Monitor sends broadcast message to set the limit current of all rectifier modules to 10.5A. The following
+is an example of the CAN communication frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1(Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Optional
+Optional
+0x00
+
+The following is an example of the CAN communication frame data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+7:0
+Optional Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x29
+
+0x04
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x03
+
+0x2904
+Note: Since the unit of current is mA, 10.5A is converted to 10500 mA, which is converted to hexadecimal
+number 0x2904. The rectifier module receives the broadcast setting command and does not respond to the
+monitor.
+
+2.4 Set limit current for module 1 (module 1 address is 0x01)
+Monitor sends the limit current of module1 to 10.5A. The following is an example of the CAN
+communication frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+Module Address
+
+1 (Optional)
+
+1
+
+0x01
+
+13:9
+
+8:0
+
+Production Day Serial Number Low Part
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x00
+
+0x03
+
+Optional
+
+Optional
+
+0x00
+
+0x00
+
+0x29
+
+0x04
+
+13/ 24
+
+0x2904
+The rectifier module receives the setting command and responds the data. An example of the CAN
+communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+Serial number
+information
+
+0x01
+
+Serial number
+information
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x29
+
+0x04
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x01
+
+0x03
+
+0x2904
+
+2.5 Read output voltage of all modules
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1(Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x00
+
+Optional
+
+Optional
+
+The following is an example of a data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x00
+
+Byte7
+
+After receiving the broadcast command to read the module voltage, the rectifier module sends back the
+information respectively. The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1(Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0xXX(address) Serial Number
+SerialNumber
+
+The following is an example of a data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x03
+
+0x00
+
+Get the current module voltage value
+
+14/ 24
+
+2.6 Read output voltage of module 1 (module 1 address is 0x01)
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1 (Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Optional
+Optional
+0x01
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x00
+
+Byte7
+
+After the rectifier module receives the command of read the module voltage, it sends back the
+information. An example of the CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+Serial number
+information
+
+0x01
+
+Serial number
+information
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x03
+
+0x00
+
+Get the current module voltage value
+
+2.7 Read output current of all modules
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1(Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x00
+
+Optional
+
+Optional
+
+The following is an example of a data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x01
+
+Byte7
+
+After receiving the broadcast command to read the module current, the rectifier module sends back the
+information respectively. The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+15/ 24
+
+1(Optional)
+
+1
+
+0xXX(address)
+
+Serial Number
+
+Serial Number
+
+The following is an example of a data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x03
+
+0x01
+
+Get the current module current value
+
+2.8 Read output current of module 1 (module 1 address is 0x01)
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+Optional
+
+0x01
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x01
+
+Byte7
+
+After the rectifier module receives the command of read the module current, it sends back the
+information. An example of the CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+Serial number
+
+0x01
+
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x03
+
+0x01
+
+Get the current current value of the module
+
+2.9 Power on all modules
+Monitor sends broadcast messages to power on all modules. The following is an example of the CAN
+frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+Module Address
+
+1
+
+1(Optional)
+
+0x00
+
+13:9
+
+8:0
+
+Production Day Serial Number Low Part
+Optional
+
+Optional
+
+The following is an example of a data field：
+16 / 24
+
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x00
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x04
+
+0x00
+The rectifier module receives the broadcast command and does not respond to the monitor.
+
+2.10 Power on module 1 (Module 1 address is 0x01)
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Serial Number Low Part
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x00
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x04
+
+0x00
+
+After the rectifier module receives the command, it sends back the information. An example of the CAN
+communication frame ID field is as follows：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1 (Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x01
+
+Serial number
+
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x00
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x01
+
+0x04
+
+0x00
+
+2.11 Shut down all modules
+Monitor sends broadcast messages to shut down all modules. The following is an example of the CAN
+frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1(Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Optional
+Optional
+0x00
+
+The following is an example of a data field：
+17 / 24
+
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+7:0
+OptionalOptional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x01
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x04
+
+0x01
+The rectifier module receives the broadcast command and does not respond to data.
+
+2.12 Shut down module 1 (Module 1 address is 0x01)
+An example of the CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1 (optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x01
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x04
+
+0x01
+
+After the rectifier module receives the command, it sends back the information. An example of the CAN
+communication frame ID field is as follows：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1 (Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Serial number
+Serial number
+0x01
+
+数据域示例如下：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x01
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x01
+
+0x04
+
+0x01
+
+2.13 Read Module Status for all modules
+An example of a CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1 (optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Optional
+Optional
+0x00
+
+18/ 24
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+7:0
+7:0
+7:0
+7:0
+OptionalOptional Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x08
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+7:0
+Optional Optional
+
+After receiving the broadcast command to read the module status bits, the rectifier module sends back
+the information respectively. The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+Protocol
+
+Monitor Address
+1 (Optional)
+
+1
+
+20:14
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0xXX
+Serial number
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x03
+
+0x08
+
+Optional
+
+Optional
+Get the current state of the module
+
+2.14 Read Module Status of module 1 (Module 1 address is 0x01)
+An example of a CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x08
+
+Byte7
+
+After the rectifier module receives the command to read the module status, it sends back the
+information. An example of a CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Serial number
+
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x03
+
+0x08
+
+Optional
+
+Optional
+Get the current state of the module
+
+1 9 / 24
+
+2.15 Set high or low output mode for module 1 (Module 1 address is
+0x01)
+The following is an example of the CAN frame ID field. If the maximum output voltage is 1000V, the
+value in the data field is 0x01
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x01
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x00
+
+0x5F
+
+0x01
+
+2.16 Read high or low output mode status of Module 1 (Module 1
+address is 0x01)
+An example of a CAN communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1 (optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:0
+Optional
+
+7:0
+7:0
+Optional Optional
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x02
+
+0x60
+
+Byte7
+
+After receiving the broadcast command to read the module high or low voltage mode, the rectifier
+module sends back the information. The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Serial number
+
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+Optional
+
+7:0
+Optional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+0x01
+
+0x03
+
+0x60
+
+Get the module high and low voltage mode
+status
+20 / 24
+
+2.17 Read serial number of module 1 (Module 1 address is 0x01)
+The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1(Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Optional
+
+0x00
+
+Optional
+
+The following is an example of a data field：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+0x01
+
+0x02
+
+0x05
+
+Optional
+
+Optional Optional
+
+Optional
+
+Optional Optional
+
+After receiving the command to read the module serial number, the rectifier module sends back the
+information. The following is an example of the CAN frame ID field：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+1
+
+1(Optional)
+
+13:9
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+Serial Number
+
+0x01
+
+Serial Number
+
+The following is an example of a data field：
+Byte0
+7:4
+
+3:0
+
+0x01
+
+0x04
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+0x05
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+Get module serial number
+The CAN ID of the return serial number of the rectifier module is 0x02240144，The following is an
+example of a data field： 14 05 17 08 0C 30 07 57
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x04
+
+0x05
+
+0x17
+
+0x08
+
+0x0C
+
+0x30
+
+0x07
+
+0x57
+
+The 14 bits SN code is composed of the low 9 bits of CAN communication frame ID and the
+byte2~byte7 of data domain.
+Year：0x17 23
+Week：0x08 8
+Serial number：0x0C*1000+0x30*10+0x07 12487
+Place of production：0x57
+‘W’
+Stage of production：0x44 ‘D’
+
+21 / 24
+
+2.18 The AllSetData to turn on and off of module 1 (module 1 address is
+0x01)
+Monitor sends the AllSetData to turn on module 1. CommandType is 0 (on DC), and the
+corresponding parameters: output current limit point is 10.5A, battery voltage is 470.5V, output voltage is
+475.5V. The CAN communication frame ID field example is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x0B
+
+0x00
+
+0x00
+
+0x69
+
+0x12
+
+0x61
+
+0x12
+
+0x93
+
+0x0069
+
+0x1261
+
+0x1293
+
+Note: Because the current unit is 0.1A, 10.5A is multiplied by 10 to convert to 105, converted to a
+hexadecimal number to 0x0069, and the voltage unit is 0.1V, so 470.5V is multiplied by 10 to convert to
+4705, converted to a hexadecimal number to 0x1261, 475.5V is multiplied by 10 to convert to 4755, and
+converted to a hexadecimal number is 0x1293.
+The rectifier responds the data, and the example of the CAN communication frame ID field is as
+follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Serial number
+
+Serial number
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:4
+
+3:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x01
+
+0x0C
+
+0x00
+
+0x00
+
+0x69
+
+0x12
+
+0x61
+
+0x12
+
+0x93
+
+0x0069
+
+0x1261
+
+0x1293
+
+2.19 Set group address of module 1(module 1 address is 0x02)
+The monitor set the group address of module1 to 0x02, and the CAN communication frame ID field is
+as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Optional
+
+Optional
+
+Examples of data fields are as follows：
+Byte0
+7:4
+
+3:0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+22 / 24
+
+可选
+
+0x00
+
+0x59
+
+Optional
+
+Optional
+
+0x00
+
+0x00
+
+0x00
+
+0x02
+
+0x00000002
+The rectifier module receives the setting command and responds the data. An example of a CAN
+communication frame ID field is as follows：
+28:25
+
+24:21
+
+20:14
+
+Protocol
+
+Monitor Address
+
+8:0
+
+Module Address Production Day Serial Number Low Part
+
+1 (Optional)
+
+1
+
+13:9
+
+0x01
+
+Serial number
+information
+
+Serial number
+information
+
+Examples of data fields are as follows：
+Byte0
+
+Byte1
+
+Byte2
+
+Byte3
+
+Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+7:0
+7:0
+OptionalOptional
+
+7:0
+
+7:0
+
+7:0
+
+7:0
+
+0x00
+
+0x00
+
+0x00
+
+0x02
+
+7:4
+
+3:0
+
+7:0
+
+0x02
+
+0x01
+
+0x59
+
+0x00000002
+
+3 Appendix
+3.1 The definition of module status bit
+Module status bit specific definition：
+
+struct MODULE_STATUS_BITS {
+uint32_t AcOV
+uint32_t AcUV
+uint32_t AcOVDisconnected
+uint32_t PfcOV
+uint32_t PfcUV
+uint32_t PfcUnbalance
+uint32_t DcOV
+uint32_t DcOVShutDown
+uint32_t DcUV
+uint32_t FanNotRun
+uint32_t Reserved_10
+uint32_t FanDriverFail
+uint32_t AmbientOT
+uint32_t AmbientUT
+uint32_t Pfc1_OT
+uint32_t OutputRelayFault
+uint32_t Dcdc1_OT
+uint32_t Reserved_17
+uint32_t SciIsNotOK
+
+:1; // 0 AC overvoltage
+:1; // 1 AC undervoltage
+:1; // 2 AC overvoltage disconnected
+:1; // 3 PFC bus over voltage
+:1; // 4 PFC bus under voltage
+:1; // 5 PFC bus is unbalanced
+:1; // 6 Dc output overvoltage
+:1; // 7 Dc overvoltage shutdown
+:1; // 8 Dc output undervoltage
+:1; // 9 Fan failure
+:1; // 10
+:1; // 11 Fan drive circuit damaged
+:1; // 12 Ambient overtemperature
+:1; // 13 Ambient undertemperature
+:1; //14 PFC overtemperature protection 1
+:1; // 15 Output relay fault
+:1; // 16 DC overtemperature protection 1
+:1; // 17
+:1; // 18 Internal communication fail
+
+23 / 24
+
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+uint32_t
+
+Reserved_19
+PfcFail
+DcdcFail
+PoDeratedByAC
+PoDeratedByT
+Reserved_24
+DcdcNotRun
+OutputLoopMode
+DcVoltageUnbalance
+GetSameSN
+Reserved_30
+BleederNotWork
+
+};
+union MODULE_STATUS_REG
+{
+uint32_t
+struct MODULE_STATUS_BITS
+
+:1; // 19
+:1; // 20 PFC fail
+:1; // 21 DCDC fail
+:1; // 22 AC Volume reduction
+:1; // 23 Temperature Volume reduction
+:1; // 24
+:1; // 25 DCDC is not running
+:2; // 26:27 Output loop state
+:1; // 28 DC output voltage is unbalanced
+:1; // 29 Modules with same serial number
+:1; // 30
+:1; // 31 Discharge circuit abnormal
+
+all;
+bit;
+
+};
+
+3.2 The definition of module serial number
+The company’s module serial number consist of Year+Week+Serial number+Place of production+Stage of
+production，take module serial number 230812487WD as an example, the SN takes up 7 bytes（56bit），
+the high 48 bits are in the byte2~byte7 of data domain, and the low 8 bits are in the bit8:bit0 of ID.
+CAN communication frame ID field example
+28:25
+
+24:21
+
+20:14
+
+13:9
+
+Protocol
+
+Monitor Address
+
+Module Address
+
+1
+
+1(option)
+
+0x01
+
+8:0
+
+Production Day Serial Number Low Part
+The low 9 bits of SN
+
+Examples of data fields are as follows:
+Byte0
+7:4
+
+3:0
+
+0x01
+
+0x04
+
+23
+Year
+(0~127, 0 is
+2000 )
+
+08
+Week
+(1~5 4)
+
+Byte1
+
+Byte2
+
+Byte3
+
+7:0
+0x05
+
+7:0
+
+7:0
+
+12487
+Module serial
+number(1~99999)
+
+Byte4
+
+7:0
+7:0
+The high 48 bits of SN
+
+0x17
+
+Byte7
+
+7:0
+
+7:0
+
+D
+Stage of production
+(‘P’is PT stage，’E’ is EVT stage，’D’
+is DVT stage，’0’ is MP stage)
+
+Byte 3 Byte4
+
+Byte5
+
+Byte6
+
+Byte7
+
+ID[7:0]
+
+0x0C
+
+0x30
+
+0x07
+
+0x57
+
+0x44
+
+0x08
+
+Byte6
+
+W
+Place
+of
+production
+(S: Shanghai,
+W:Wujiang)
+
+Byte2
+
+Byte5
+
+24 / 24
+
+

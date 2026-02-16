@@ -3,7 +3,6 @@
 
 #include <array>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -68,7 +67,6 @@ struct ModuleCanTrafficPolicy {
     int bits_per_frame_estimate{150};
     int over_cap_debounce_ms{5000};
     bool enforce{true};
-    std::map<std::string, double> plc_reserve_kbps_by_interface;
 };
 
 /// \brief Externalized power-module controller with pluggable module drivers (e.g. Maxwell MXR).

@@ -62,6 +62,17 @@ constexpr int kTxLoopIdleMs = 50;
 constexpr auto kCanStatsLogInterval = std::chrono::seconds(30);
 constexpr int kCanStatsBitsPerFrameEst = 150; // extended ID, 8-byte payload; excludes bit-stuff worst-case
 
+uint8_t module_relay_enable_mask(const ChargerConfig& cfg) {
+    if (!cfg.plc_module_relays_enabled) {
+        return 0u;
+    }
+    uint8_t mask = kRelayModule0Mask;
+    if (cfg.plc_relay3_enabled) {
+        mask = static_cast<uint8_t>(mask | kRelayModule1Mask);
+    }
+    return mask;
+}
+
 bool is_printable_ascii(const std::vector<uint8_t>& bytes) {
     if (bytes.empty()) return false;
     for (auto b : bytes) {
@@ -321,9 +332,7 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         if (!cfg_.plc_owns_gun_relay) {
             enable_mask |= kRelayGunMask;
         }
-        if (cfg_.plc_module_relays_enabled) {
-            enable_mask |= static_cast<uint8_t>(kRelayModule0Mask | kRelayModule1Mask);
-        }
+        enable_mask |= module_relay_enable_mask(cfg_);
         st.desired_sys_enable = true;
         st.sys_enable = true;
         st.desired_relay_enable_mask = enable_mask;
@@ -868,12 +877,13 @@ bool PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module
             cmd_mask |= kRelayGunMask;
         }
     }
-    if (cfg_.plc_module_relays_enabled) {
-        enable_mask |= static_cast<uint8_t>(kRelayModule0Mask | kRelayModule1Mask);
+    const uint8_t module_enable_mask = module_relay_enable_mask(cfg_);
+    if (module_enable_mask != 0u) {
+        enable_mask |= module_enable_mask;
         if (module_mask & 0x01u) {
             cmd_mask |= kRelayModule0Mask;
         }
-        if (module_mask & 0x02u) {
+        if ((module_enable_mask & kRelayModule1Mask) != 0u && (module_mask & 0x02u)) {
             cmd_mask |= kRelayModule1Mask;
         }
     }

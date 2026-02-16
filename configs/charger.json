@@ -51,7 +51,7 @@
   "ocppConfig": "ocpp/v16/config.json",
   "planner": {
     "allowCrossSlotIslands": true,
-    "maxModulesPerGun": 2,
+    "maxModulesPerGun": 1,
     "minModulesPerActiveGun": 1,
     "requireAuthForPrecharge": false,
     "prechargeMaxCurrentA": 2,
@@ -68,6 +68,7 @@
   "plc": {
     "gunRelayOwnedByPlc": false,
     "moduleRelaysEnabled": true,
+    "relay3Enabled": false,
     "relayFeedbackAvailable": false,
     "relayMode": "ties",
     "autochargeIdSource": "evmac"
@@ -102,8 +103,8 @@
           "sendOutputCurrent": true,
           "readbackLimits": true,
           "type": "maxwell-mxr",
-          "pollMs": 1000,
-          "cmdIntervalMs": 1000,
+          "pollMs": 250,
+          "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
       ]
@@ -126,8 +127,8 @@
           "sendOutputCurrent": true,
           "readbackLimits": true,
           "type": "maxwell-mxr",
-          "pollMs": 1000,
-          "cmdIntervalMs": 1000,
+          "pollMs": 250,
+          "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
       ]
@@ -145,7 +146,7 @@
     "windowMs": 10000,
     "bitsPerFrameEstimate": 150,
     "overCapDebounceMs": 5000,
-    "enforce": true
+    "enforce": false
   },
   "userConfig": "../data/user_config.json"
 }

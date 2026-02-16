@@ -777,6 +777,19 @@ if(BUILD_APP_TESTS)
   target_link_libraries(power_delivery_stall_tests PRIVATE ${_OCPP_APP_LIBS})
   target_compile_definitions(power_delivery_stall_tests PRIVATE CHARGER_UNIT_TESTS)
 
+  add_executable(e2e_long_cycle_tests
+    tests/e2e_long_cycle_tests.cpp
+    src/ocpp_adapter.cpp
+    src/power_manager.cpp
+    src/charger_config.cpp
+    src/evse_security_file.cpp
+    src/maintenance_manager.cpp
+    src/power_module_controller.cpp
+  )
+  target_include_directories(e2e_long_cycle_tests PRIVATE include libocpp/include tests)
+  target_link_libraries(e2e_long_cycle_tests PRIVATE ${_OCPP_APP_LIBS})
+  target_compile_definitions(e2e_long_cycle_tests PRIVATE CHARGER_UNIT_TESTS)
+
   add_executable(hlc_fallback_tests
     tests/hlc_fallback_tests.cpp
     src/ocpp_adapter.cpp
@@ -878,6 +891,7 @@ if(BUILD_APP_TESTS)
     cable_check_no_hv_tests
     post_precharge_hold_tests
     power_delivery_stall_tests
+    e2e_long_cycle_tests
     hlc_fallback_tests
     island_manager_tests
     tie_gating_tests
@@ -919,6 +933,7 @@ if(BUILD_APP_TESTS)
   add_test(NAME cable_check_no_hv_tests COMMAND cable_check_no_hv_tests)
   add_test(NAME post_precharge_hold_tests COMMAND post_precharge_hold_tests)
   add_test(NAME power_delivery_stall_tests COMMAND power_delivery_stall_tests)
+  add_test(NAME e2e_long_cycle_tests COMMAND e2e_long_cycle_tests)
   add_test(NAME hlc_fallback_tests COMMAND hlc_fallback_tests)
   add_test(NAME island_manager_tests COMMAND island_manager_tests)
   add_test(NAME tie_gating_tests COMMAND tie_gating_tests)
@@ -953,6 +968,7 @@ if(BUILD_APP_TESTS)
       cable_check_no_hv_tests
       post_precharge_hold_tests
       power_delivery_stall_tests
+      e2e_long_cycle_tests
       hlc_fallback_tests
       island_manager_tests
       tie_gating_tests

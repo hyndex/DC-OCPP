@@ -70,8 +70,8 @@ PLC should map these into ISO/DIN ResponseCode + DC_EVSEStatusCode.
 - This repo enforces a production module traffic budget in addition to PLC protocol cadence:
   - Target: `<20 kbps` total CAN load per interface in active steady-state.
   - Rolling window defaults: `windowMs=10000`, `bitsPerFrameEstimate=150`, `overCapDebounceMs=5000`.
-  - Per-interface module budget is computed from configured cap minus PLC reserve:
-    - `module_budget_kbps = maxTotalKbpsPerInterface - (1.5 * plc_count_on_iface)`.
+  - Per-interface module budget equals configured cap (no static PLC reserve subtraction):
+    - `module_budget_kbps = maxTotalKbpsPerInterface`.
 - Traffic classes:
   - `SafetyUrgent`: allowed even during cap events (fail-safe shutdown path).
   - `Control`: subject to bandwidth governor.
