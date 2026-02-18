@@ -53,6 +53,7 @@ private:
         double meter_start_wh{0.0};
         std::chrono::steady_clock::time_point connected_at;
         std::optional<std::chrono::steady_clock::time_point> authorized_at;
+        std::optional<std::chrono::steady_clock::time_point> power_wait_started_at;
         std::optional<std::chrono::steady_clock::time_point> power_requested_at;
         std::chrono::steady_clock::time_point pending_started;
         std::chrono::steady_clock::time_point last_seen_plugged;

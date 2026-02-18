@@ -103,6 +103,7 @@
           "sendOutputCurrent": true,
           "readbackLimits": true,
           "type": "maxwell-mxr",
+          "inputMode": 3,
           "pollMs": 250,
           "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
@@ -127,6 +128,7 @@
           "sendOutputCurrent": true,
           "readbackLimits": true,
           "type": "maxwell-mxr",
+          "inputMode": 3,
           "pollMs": 250,
           "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000

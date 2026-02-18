@@ -1823,6 +1823,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                 s.authorized = true;
                                 s.id_token = tag;
                                 s.authorized_at = now;
+                                s.power_wait_started_at = now;
                                 s.token_source = AuthTokenSource::Autocharge;
                                 auto_auth_granted = true;
                                 have_token = true;
@@ -2537,6 +2538,28 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             // During pre-power HLC stages (e.g. WAIT_CHARGE_PARAMS) some vehicles can legitimately pause.
             const bool power_request_watchdog_eligible =
                 (cp_power_requesting || status.relay_closed || hlc_power_phase) && !hlc_waiting_pre_power;
+            std::optional<std::chrono::milliseconds> power_wait_elapsed{};
+            if (had_session && session.authorized) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                auto it = sessions_.find(connector);
+                if (it != sessions_.end()) {
+                    if (power_ready) {
+                        it->second.power_requested_at = now;
+                        it->second.power_wait_started_at = std::nullopt;
+                    } else if (power_request_watchdog_eligible && !constrained && !paused &&
+                               !it->second.transaction_started) {
+                        if (!it->second.power_wait_started_at) {
+                            it->second.power_wait_started_at = now;
+                        }
+                        power_wait_elapsed =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - *it->second.power_wait_started_at);
+                    } else {
+                        it->second.power_wait_started_at = std::nullopt;
+                    }
+                    session = it->second;
+                }
+            }
             if (had_session && status.cp_state != 'U' && !status.plugged_in) {
                 const auto last_plug = session.last_seen_plugged;
                 if (last_plug.time_since_epoch().count() != 0 &&
@@ -2556,16 +2579,15 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
                 disable_local("auth_timeout");
                 had_session = false;
-            } else if (had_session && session.authorized && !power_ready && session.authorized_at &&
-                       power_request_timeout_enabled && power_request_watchdog_eligible &&
-                       !constrained && !paused &&
-                       (now - *session.authorized_at) > power_request_timeout) {
-                const auto elapsed_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(now - *session.authorized_at).count();
+            } else if (had_session && session.authorized && !session.transaction_started && !power_ready &&
+                       power_request_timeout_enabled && power_wait_elapsed.has_value() &&
+                       *power_wait_elapsed >
+                           std::chrono::duration_cast<std::chrono::milliseconds>(power_request_timeout)) {
                 EVLOG_warning << "Session on connector " << connector
                               << " timed out waiting for EV power request after authorization"
-                              << " elapsed_ms=" << elapsed_ms
-                              << " timeout_ms=" << power_request_timeout.count()
+                              << " elapsed_ms=" << power_wait_elapsed->count()
+                              << " timeout_ms="
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(power_request_timeout).count()
                               << " cp=" << status.cp_state
                               << " relay=" << (status.relay_closed ? 1 : 0)
                               << " hlc_stage=" << static_cast<int>(status.hlc_stage);
@@ -2592,6 +2614,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                                               std::nullopt, ocpp::DateTime(), std::nullopt);
                         it->second.transaction_started = true;
                         it->second.transaction_started_at = now;
+                        it->second.power_wait_started_at = std::nullopt;
                         it->second.power_requested_at = now;
                         session = it->second;
                     }
@@ -3060,6 +3083,7 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
         session.authorized = true;
         session.id_token = trimmed;
         session.authorized_at = std::chrono::steady_clock::now();
+        session.power_wait_started_at = session.authorized_at;
         session.token_source = pending.token.source;
         set_auth_state(connector, AuthorizationState::Granted);
         persist_pending_tokens();
@@ -3194,6 +3218,7 @@ AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connecto
                     it->second.authorized = true;
                     it->second.id_token = trimmed;
                     it->second.authorized_at = now;
+                    it->second.power_wait_started_at = now;
                     it->second.token_source = pending.token.source;
                 }
             }
@@ -5332,9 +5357,7 @@ void OcppAdapter::apply_power_plan() {
         if (hlc_power_phase && !hlc_precharge_phase && !ev_requesting) {
             const bool explicit_unplug = cp_known && status.cp_state == 'A' && !status.plugged_in;
             const bool explicit_ev_stop = cp_known && status.cp_state == 'B';
-            if (explicit_unplug || explicit_ev_stop) {
-                // CP=B is an explicit EV stop request. Do not hold stale current offers here:
-                // we still keep the GC open-guard path below, but with zero current command.
+            if (explicit_unplug) {
                 power_request_lost_since_.erase(c.id);
                 power_request_active = false;
             } else {
@@ -5345,10 +5368,16 @@ void OcppAdapter::apply_power_plan() {
                 // Ignore brief CP/PLC telemetry blips (including cp_state='U');
                 // sustained loss means EV is no longer requesting power.
                 constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(900);
+                // CP=B can briefly blip during HLC transitions on some vehicles.
+                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(1200);
+                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(2200);
                 // If CurrentDemand targets are still arriving, allow a slightly longer hold but keep it bounded.
                 // This avoids false drops on CP noise while preventing indefinite power offer on stale CP=B.
                 constexpr auto kCpTargetOnlyMaxHold = std::chrono::milliseconds(1500);
-                const auto hold_window = ev_target_active ? kCpTargetOnlyMaxHold : kCpRequestDropDebounce;
+                std::chrono::milliseconds hold_window = ev_target_active ? kCpTargetOnlyMaxHold : kCpRequestDropDebounce;
+                if (explicit_ev_stop) {
+                    hold_window = ev_target_active ? kCpEvStopTargetHold : kCpEvStopDebounce;
+                }
                 if ((now - lost_since) < hold_window) {
                     power_request_active = true;
                 } else {
@@ -6679,7 +6708,7 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
                 if (since.time_since_epoch().count() == 0) {
                     since = now;
                 }
-                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(900);
+                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(1500);
                 request_lost = (now - since) >= kChargingStateCpDropDebounce;
             } else {
                 std::lock_guard<std::mutex> lock(state_mutex_);

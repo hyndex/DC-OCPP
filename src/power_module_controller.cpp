@@ -985,23 +985,27 @@ public:
         const bool need_input_mode = spec_.input_mode >= 0;
         if (need_input_mode) {
             const auto input_mode_matches = [&](uint32_t reported) {
+                if (spec_.input_mode == 3) {
+                    return reported == 3;
+                }
                 if (spec_.input_mode == 2) {
                     return reported == 2;
                 }
-                // Maxwell readback reports AC as 1 (single-phase) or 3 (three-phase).
-                return reported == 1 || reported == 3;
+                return reported == 1;
             };
-            const uint32_t commanded_input_mode = (spec_.input_mode == 2) ? 2U : 1U;
-            const auto mode_interval = std::chrono::milliseconds(std::max(200, spec_.cmd_interval_ms));
+            const uint32_t commanded_input_mode =
+                (spec_.input_mode == 2) ? 2U : ((spec_.input_mode == 3) ? 3U : 1U);
+            const auto mode_interval =
+                std::chrono::milliseconds(std::max<int64_t>(5000, std::max(200, spec_.cmd_interval_ms) * 5));
             const bool mode_stale = (now - last_input_mode_tx_) >= mode_interval;
-            if (mode_stale) {
-                const bool mismatch = input_mode_reported_ && !input_mode_matches(telemetry_.input_mode);
-                if (!input_mode_reported_ || mismatch) {
-                    attempted_control = true;
-                    if (send_set_int(0x0046, commanded_input_mode)) {
-                        last_input_mode_tx_ = now;
-                        sent_control = true;
-                    }
+            const bool mismatch = input_mode_reported_ && !input_mode_matches(telemetry_.input_mode);
+            // Avoid pushing mode writes before the first readback is available. This prevents noisy
+            // startup retries; once readback is known, enforce configured mode with bounded retries.
+            if (mode_stale && mismatch) {
+                attempted_control = true;
+                if (send_set_int(0x0046, commanded_input_mode)) {
+                    last_input_mode_tx_ = now;
+                    sent_control = true;
                 }
             }
         }
@@ -1037,7 +1041,10 @@ public:
                     last_missing_rated_current_log_ = now;
                 }
             }
-            if (enable_edge_on || (control_retry_due && (current_changed || periodic_refresh))) {
+            // For MXR, avoid driving both 0x0022 (limit ratio) and 0x001B (absolute current)
+            // in the same cycle; mixed current-control paths can cause unstable low-current behavior.
+            const bool use_limit_ratio = !spec_.send_output_current;
+            if (use_limit_ratio && (enable_edge_on || (control_retry_due && (current_changed || periodic_refresh)))) {
                 attempted_control = true;
                 if (send_set_float(0x0022, frac)) {
                     last_limit_fraction_ = frac;
@@ -1561,12 +1568,16 @@ private:
                 }
                 const bool input_mode_match =
                     (spec_.input_mode < 0) ||
-                    (spec_.input_mode == 2 ? (telemetry_.input_mode == 2)
-                                           : (telemetry_.input_mode == 1 || telemetry_.input_mode == 3));
+                    (spec_.input_mode == 2
+                         ? (telemetry_.input_mode == 2)
+                         : (spec_.input_mode == 3 ? (telemetry_.input_mode == 3) : (telemetry_.input_mode == 1)));
                 if (!input_mode_match) {
                     EVLOG_warning << "MXR module " << spec_.id << " input mode mismatch (reported "
                                   << telemetry_.input_mode << ", expected "
-                                  << (spec_.input_mode == 2 ? "2(DC)" : "1/3(AC)") << ")";
+                                  << (spec_.input_mode == 2 ? "2(DC)"
+                                                            : (spec_.input_mode == 3 ? "3(3-phase AC)"
+                                                                                     : "1(AC)"))
+                                  << ")";
                 }
                 input_mode_reported_ = true;
             }
