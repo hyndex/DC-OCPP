@@ -984,14 +984,21 @@ public:
 
         const bool need_input_mode = spec_.input_mode >= 0;
         if (need_input_mode) {
+            const auto input_mode_matches = [&](uint32_t reported) {
+                if (spec_.input_mode == 2) {
+                    return reported == 2;
+                }
+                // Maxwell readback reports AC as 1 (single-phase) or 3 (three-phase).
+                return reported == 1 || reported == 3;
+            };
+            const uint32_t commanded_input_mode = (spec_.input_mode == 2) ? 2U : 1U;
             const auto mode_interval = std::chrono::milliseconds(std::max(200, spec_.cmd_interval_ms));
             const bool mode_stale = (now - last_input_mode_tx_) >= mode_interval;
             if (mode_stale) {
-                const bool mismatch = (input_mode_reported_ && telemetry_.input_mode !=
-                                                          static_cast<uint32_t>(spec_.input_mode));
+                const bool mismatch = input_mode_reported_ && !input_mode_matches(telemetry_.input_mode);
                 if (!input_mode_reported_ || mismatch) {
                     attempted_control = true;
-                    if (send_set_int(0x0046, static_cast<uint32_t>(spec_.input_mode))) {
+                    if (send_set_int(0x0046, commanded_input_mode)) {
                         last_input_mode_tx_ = now;
                         sent_control = true;
                     }
@@ -1060,8 +1067,32 @@ public:
             }
             if (spec_.send_output_power &&
                 (enable_edge_on || (control_retry_due && (power_changed || periodic_refresh)))) {
+                const double rated_power_kw = spec_.rated_power_kw > 0.0
+                                                  ? spec_.rated_power_kw
+                                                  : (spec_.rated_current_a > 0.0 && voltage_v > 1.0
+                                                         ? (spec_.rated_current_a * voltage_v) / 1000.0
+                                                         : 0.0);
+                double power_ratio = 0.0;
+                if (sp.power_kw > 0.0 && rated_power_kw > 0.0) {
+                    power_ratio = std::clamp(sp.power_kw / rated_power_kw, 0.0, 1.0);
+                    if ((power_ratio <= 0.0 || power_ratio >= 1.0) &&
+                        (last_power_ratio_clamp_log_.time_since_epoch().count() == 0 ||
+                         (now - last_power_ratio_clamp_log_) >= std::chrono::seconds(2))) {
+                        EVLOG_warning << "MXR module " << spec_.id
+                                      << " output power command clamped (req_kW=" << sp.power_kw
+                                      << " rated_kW=" << rated_power_kw
+                                      << " ratio=" << power_ratio << ")";
+                        last_power_ratio_clamp_log_ = now;
+                    }
+                } else if (sp.power_kw > 0.0 &&
+                           (last_missing_rated_power_log_.time_since_epoch().count() == 0 ||
+                            (now - last_missing_rated_power_log_) >= std::chrono::seconds(2))) {
+                    EVLOG_error << "MXR module " << spec_.id
+                                << " missing rated power/current for 0x0020 scaling; forcing power ratio=0";
+                    last_missing_rated_power_log_ = now;
+                }
                 attempted_control = true;
-                if (send_set_float(0x0020, static_cast<float>(std::max(0.0, sp.power_kw)))) {
+                if (send_set_float(0x0020, static_cast<float>(power_ratio))) {
                     last_sent_.power_kw = sp.power_kw;
                     sent_control = true;
                 }
@@ -1528,10 +1559,14 @@ private:
                 if (!input_mode_reported_) {
                     EVLOG_info << "MXR module " << spec_.id << " input mode=" << telemetry_.input_mode;
                 }
-                if (spec_.input_mode >= 0 &&
-                    telemetry_.input_mode != static_cast<uint32_t>(spec_.input_mode)) {
+                const bool input_mode_match =
+                    (spec_.input_mode < 0) ||
+                    (spec_.input_mode == 2 ? (telemetry_.input_mode == 2)
+                                           : (telemetry_.input_mode == 1 || telemetry_.input_mode == 3));
+                if (!input_mode_match) {
                     EVLOG_warning << "MXR module " << spec_.id << " input mode mismatch (reported "
-                                  << telemetry_.input_mode << ", expected " << spec_.input_mode << ")";
+                                  << telemetry_.input_mode << ", expected "
+                                  << (spec_.input_mode == 2 ? "2(DC)" : "1/3(AC)") << ")";
                 }
                 input_mode_reported_ = true;
             }
@@ -1566,6 +1601,8 @@ private:
     std::optional<uint8_t> resolved_group_{};
     std::chrono::steady_clock::time_point last_probe_tx_{};
     std::chrono::steady_clock::time_point last_missing_rated_current_log_{};
+    std::chrono::steady_clock::time_point last_missing_rated_power_log_{};
+    std::chrono::steady_clock::time_point last_power_ratio_clamp_log_{};
     std::chrono::steady_clock::time_point last_current_recheck_tx_{};
     std::chrono::steady_clock::time_point last_current_dip_log_{};
     std::chrono::steady_clock::time_point last_current_dip_warn_{};

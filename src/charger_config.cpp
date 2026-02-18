@@ -618,6 +618,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
                 if (m.input_mode < -1 || (m.input_mode > 0 && m.input_mode != 1 && m.input_mode != 2 && m.input_mode != 3)) {
                     m.input_mode = -1;
                 }
+                if (is_maxwell_mxr_family && m.input_mode == 3) {
+                    // Maxwell 0x0046 accepts AC(1)/DC(2); treat 3-phase AC request as AC command.
+                    m.input_mode = 1;
+                }
                 if (is_tonhe && m.input_mode == 3) {
                     // Tonhe supports only AC/DC; map 3-phase to AC.
                     m.input_mode = 1;

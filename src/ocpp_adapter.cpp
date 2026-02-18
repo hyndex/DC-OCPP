@@ -5331,7 +5331,10 @@ void OcppAdapter::apply_power_plan() {
             (ev_requesting && hlc_power_phase) || (!hlc_known && ev_target_active) || (hlc_power_phase && ev_target_active);
         if (hlc_power_phase && !hlc_precharge_phase && !ev_requesting) {
             const bool explicit_unplug = cp_known && status.cp_state == 'A' && !status.plugged_in;
-            if (explicit_unplug) {
+            const bool explicit_ev_stop = cp_known && status.cp_state == 'B';
+            if (explicit_unplug || explicit_ev_stop) {
+                // CP=B is an explicit EV stop request. Do not hold stale current offers here:
+                // we still keep the GC open-guard path below, but with zero current command.
                 power_request_lost_since_.erase(c.id);
                 power_request_active = false;
             } else {
@@ -6084,11 +6087,16 @@ void OcppAdapter::apply_power_plan() {
                                      !warmup_post_stop_plugged && !info.disabled_by_csms && !local_fault &&
                                      !warmup_status.cp_fault && warmup_state.safety_ok &&
                                      !warmup_status.gc_welded && !warmup_status.mc_welded;
+            const bool cp_power_requesting = warmup_status.cp_state == 'C' || warmup_status.cp_state == 'D';
+            // Keep warmup active during true precharge (CP can still be B there), but require CP power request for
+            // post-precharge phases. This prevents stale HLC stage=power-delivery with CP=B from re-driving modules
+            // after EV stop/unplug transitions.
             const bool warmup_phase =
                 is_hlc_precharge_phase(warmup_status) ||
-                warmup_status.hlc_power_ready ||
-                (warmup_status.hlc_stage >= HLC_MIN_POWER_STAGE && !warmup_status.hlc_charge_complete) ||
-                warmup_status.relay_closed;
+                (cp_power_requesting &&
+                 (warmup_status.hlc_power_ready ||
+                  (warmup_status.hlc_stage >= HLC_MIN_POWER_STAGE && !warmup_status.hlc_charge_complete) ||
+                  warmup_status.relay_closed));
             bool warmup = warmup_safe && !drive_modules && warmup_phase;
             uint8_t warmup_mask = warmup ? slot_cfg_mask : 0u;
             const auto precharge_slot_it = precharge_home_slot_for_gun.find(warmup_owner_id);
