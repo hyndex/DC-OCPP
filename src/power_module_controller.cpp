@@ -141,6 +141,8 @@ struct ModuleTelemetryState {
     uint32_t input_mode{0};
     uint8_t healthy_mask{0};
     uint8_t fault_mask{0};
+    std::chrono::steady_clock::time_point last_voltage_update{};
+    std::chrono::steady_clock::time_point last_current_update{};
     std::chrono::steady_clock::time_point last_update{};
 };
 
@@ -853,6 +855,8 @@ public:
         telemetry_.alarms = 0;
         telemetry_.healthy_mask = bit;
         telemetry_.fault_mask = 0;
+        telemetry_.last_voltage_update = now;
+        telemetry_.last_current_update = now;
         telemetry_.last_update = now;
         telemetry_.reported_group = static_cast<uint16_t>(std::max(0, spec_.group));
         telemetry_.reported_address = static_cast<uint16_t>(std::max(0, spec_.address));
@@ -872,12 +876,17 @@ public:
         telemetry_.voltage_v = sp.enable ? std::max(0.0, sp.voltage_v) : 0.0;
         telemetry_.current_a = sp.enable ? std::max(0.0, sp.current_a) : 0.0;
         telemetry_.current_limit_point = telemetry_.current_a;
+        telemetry_.last_voltage_update = now;
+        telemetry_.last_current_update = now;
         telemetry_.last_update = now;
     }
 
     void poll() override {
         // Keep telemetry fresh even if setpoints are not changing.
-        telemetry_.last_update = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        telemetry_.last_voltage_update = now;
+        telemetry_.last_current_update = now;
+        telemetry_.last_update = now;
     }
 
 private:
@@ -937,6 +946,10 @@ public:
             telemetry_.healthy = false;
             telemetry_.fault_mask = bit;
             telemetry_.healthy_mask = 0;
+            telemetry_.voltage_v = 0.0;
+            telemetry_.current_a = 0.0;
+            telemetry_.last_voltage_update = now;
+            telemetry_.last_current_update = now;
             telemetry_.last_update = now;
             const bool sent = send_set_int(0x0030, 0x00010000, TxClass::SafetyUrgent); // shutdown (fail-safe)
             if (sent) {
@@ -1013,7 +1026,10 @@ public:
         if (sp.enable) {
             last_off_retry_tx_ = std::chrono::steady_clock::time_point{};
             // Start once when transitioning to enable, and retry during periodic updates if the module still reports OFF.
-            if (enable_edge_on || (periodic_refresh && module_off)) {
+            // Keep retrying startup while status is still OFF or status readback is not yet available.
+            // This closes the gap where one startup command is lost on CAN and no retry is sent.
+            const bool startup_retry = periodic_refresh && (!have_recent_status || module_off);
+            if (enable_edge_on || startup_retry) {
                 attempted_control = true;
                 if (send_set_int(0x0030, 0x00000000)) { // startup
                     last_sent_.enable = true;
@@ -1158,34 +1174,76 @@ public:
             return last.time_since_epoch().count() == 0 || (now - last) >= interval;
         };
 
-        // Rolling poll schedule: send at most one read per tick to reduce bursts on a shared bus.
-        if (direct) {
-            if (due(last_poll_status_, run_context ? poll_interval : idle_status_interval)) {
-                send_read(0x0040); // alarm/status
-                last_poll_status_ = now;
-            } else if (run_context && due(last_poll_voltage_, poll_interval)) {
-                send_read(0x0001); // voltage
-                last_poll_voltage_ = now;
-            } else if (run_context && due(last_poll_current_, poll_interval)) {
-                send_read(0x0002); // current
+        // Fair poll schedule: send at most one successful read per tick while rotating priority
+        // so voltage/current cannot starve when status is due at the same cadence.
+        bool sent_priority_current = false;
+        if (run_context) {
+            // Guarantee periodic current-register polls even under heavy status/voltage polling.
+            // This prevents stale 0A telemetry from persisting during active charging.
+            const auto current_overdue_interval =
+                std::chrono::milliseconds(std::max<int64_t>(250, poll_interval.count() * 2));
+            if (due(last_poll_current_, current_overdue_interval) && send_read(0x0002)) {
                 last_poll_current_ = now;
-            } else if (due(last_poll_temp_, run_context ? slow_interval : idle_telemetry_interval)) {
-                send_read(0x0004); // DC board temperature
-                last_poll_temp_ = now;
-            } else if (run_context && spec_.readback_limits && due(last_poll_limit_point_, slow_interval)) {
-                send_read(0x0003); // current limit point
-                last_poll_limit_point_ = now;
-            } else if (spec_.probe_on_startup && !addr_reported_) {
-                const auto probe_interval = std::chrono::milliseconds(1000);
-                if ((now - last_probe_tx_) >= probe_interval) {
-                    send_read(0x0043); // group/address
-                    last_probe_tx_ = now;
+                poll_rr_cursor_ = 3; // continue RR after the "current" task
+                sent_priority_current = true;
+            }
+        }
+        if (direct && !sent_priority_current) {
+            constexpr int kPollTaskCount = 7;
+            const auto probe_interval = std::chrono::milliseconds(1000);
+            const auto input_interval = std::chrono::milliseconds(1000);
+            for (int step = 0; step < kPollTaskCount; ++step) {
+                const int task = (static_cast<int>(poll_rr_cursor_) + step) % kPollTaskCount;
+                bool sent = false;
+                switch (task) {
+                case 0: // alarm/status
+                    if (due(last_poll_status_, run_context ? poll_interval : idle_status_interval)) {
+                        sent = send_read(0x0040);
+                        if (sent) last_poll_status_ = now;
+                    }
+                    break;
+                case 1: // voltage
+                    if (run_context && due(last_poll_voltage_, poll_interval)) {
+                        sent = send_read(0x0001);
+                        if (sent) last_poll_voltage_ = now;
+                    }
+                    break;
+                case 2: // current
+                    if (run_context && due(last_poll_current_, poll_interval)) {
+                        sent = send_read(0x0002);
+                        if (sent) last_poll_current_ = now;
+                    }
+                    break;
+                case 3: // temperature
+                    if (due(last_poll_temp_, run_context ? slow_interval : idle_telemetry_interval)) {
+                        sent = send_read(0x0004);
+                        if (sent) last_poll_temp_ = now;
+                    }
+                    break;
+                case 4: // current limit point
+                    if (run_context && spec_.readback_limits && due(last_poll_limit_point_, slow_interval)) {
+                        sent = send_read(0x0003);
+                        if (sent) last_poll_limit_point_ = now;
+                    }
+                    break;
+                case 5: // group/address probe
+                    if (spec_.probe_on_startup && !addr_reported_ && due(last_probe_tx_, probe_interval)) {
+                        sent = send_read(0x0043);
+                        if (sent) last_probe_tx_ = now;
+                    }
+                    break;
+                case 6: // input mode
+                    if (spec_.input_mode >= 0 && !input_mode_reported_ && due(last_poll_input_mode_, input_interval)) {
+                        sent = send_read(0x004B);
+                        if (sent) last_poll_input_mode_ = now;
+                    }
+                    break;
+                default:
+                    break;
                 }
-            } else if (spec_.input_mode >= 0 && !input_mode_reported_) {
-                const auto input_interval = std::chrono::milliseconds(1000);
-                if (due(last_poll_input_mode_, input_interval)) {
-                    send_read(0x004B); // input mode
-                    last_poll_input_mode_ = now;
+                if (sent) {
+                    poll_rr_cursor_ = static_cast<uint8_t>((task + 1) % kPollTaskCount);
+                    break;
                 }
             }
         }
@@ -1277,7 +1335,7 @@ private:
         return channel_->send(frame, tx_class, expected_rx);
     }
 
-    void send_read(uint16_t reg) {
+    bool send_read(uint16_t reg) {
         can_frame frame{};
         frame.can_id = build_can_id();
         frame.can_dlc = 8;
@@ -1289,7 +1347,7 @@ private:
         frame.data[5] = 0x00;
         frame.data[6] = 0x00;
         frame.data[7] = 0x00;
-        channel_->send(frame, TxClass::Telemetry, 1);
+        return channel_->send(frame, TxClass::Telemetry, 1);
     }
 
     void handle_frame(const can_frame& frame) {
@@ -1365,10 +1423,12 @@ private:
             if (reg == 0x0001) {
                 if (val >= -0.1f && val <= 2000.0f) {
                     telemetry_.voltage_v = std::max(0.0, static_cast<double>(val));
+                    telemetry_.last_voltage_update = now;
                 }
             } else if (reg == 0x0002) {
                 if (val >= -0.1f && val <= 500.0f) {
                     const double measured_current_a = std::max(0.0, static_cast<double>(val));
+                    telemetry_.last_current_update = now;
                     const double expected_current_a = std::max(0.0, desired_.current_a);
                     const bool severe_alarm_active = (telemetry_.alarms & MAXWELL_ALARM_SEVERE_MASK) != 0;
                     const bool startup_complete =
@@ -1605,6 +1665,7 @@ private:
     std::chrono::steady_clock::time_point last_poll_limit_point_{};
     std::chrono::steady_clock::time_point last_poll_input_mode_{};
     std::chrono::steady_clock::time_point last_input_mode_tx_{};
+    uint8_t poll_rr_cursor_{0};
     std::shared_ptr<CanChannel> channel_;
     bool addr_reported_{false};
     bool input_mode_reported_{false};
@@ -1679,6 +1740,10 @@ public:
             telemetry_.healthy = false;
             telemetry_.fault_mask = bit;
             telemetry_.healthy_mask = 0;
+            telemetry_.voltage_v = 0.0;
+            telemetry_.current_a = 0.0;
+            telemetry_.last_voltage_update = now;
+            telemetry_.last_current_update = now;
             telemetry_.last_update = now;
             const bool sent = send_set(4, 1, TxClass::SafetyUrgent); // shutdown
             if (sent) {
@@ -1715,7 +1780,9 @@ public:
         bool sent_control = false;
 
         if (sp.enable) {
-            if (enable_edge_on || (periodic_refresh && module_off)) {
+            // Retry startup until status becomes available and ON.
+            const bool startup_retry = periodic_refresh && (!have_recent_status || module_off);
+            if (enable_edge_on || startup_retry) {
                 if (send_set(4, 0)) { // power on
                     last_sent_.enable = true;
                     sent_control = true;
@@ -1775,30 +1842,71 @@ public:
             return last.time_since_epoch().count() == 0 || (now - last) >= interval;
         };
 
-        if (direct) {
-            if (due(last_poll_status_, run_context ? poll_interval : idle_status_interval)) {
-                send_read(8); // status
-                last_poll_status_ = now;
-            } else if (run_context && due(last_poll_voltage_, poll_interval)) {
-                send_read(0); // output voltage
-                last_poll_voltage_ = now;
-            } else if (run_context && due(last_poll_current_, poll_interval)) {
-                send_read(1); // output current
+        bool sent_priority_current = false;
+        if (run_context) {
+            const auto current_overdue_interval =
+                std::chrono::milliseconds(std::max<int64_t>(250, poll_interval.count() * 2));
+            if (due(last_poll_current_, current_overdue_interval) && send_read(1)) {
                 last_poll_current_ = now;
-            } else if (due(last_poll_temp_, run_context ? slow_interval : idle_telemetry_interval)) {
-                send_read(30); // inlet temperature
-                last_poll_temp_ = now;
-            } else if (spec_.hi_lo_mode >= 0 && !mode_known_ && due(last_poll_mode_, slow_interval)) {
-                send_read(101); // actual hi/lo mode
-                last_poll_mode_ = now;
-            } else if (spec_.silent_mode >= 0 && !silent_known_ && due(last_poll_silent_, slow_interval)) {
-                send_read(62); // silent mode
-                last_poll_silent_ = now;
-            } else if (spec_.probe_on_startup && !group_known_) {
-                const auto probe_interval = std::chrono::milliseconds(1000);
-                if (due(last_poll_group_, probe_interval)) {
-                    send_read(89); // group address (best-effort)
-                    last_poll_group_ = now;
+                poll_rr_cursor_ = 3; // continue RR after the "current" task
+                sent_priority_current = true;
+            }
+        }
+        if (direct && !sent_priority_current) {
+            constexpr int kPollTaskCount = 7;
+            const auto probe_interval = std::chrono::milliseconds(1000);
+            for (int step = 0; step < kPollTaskCount; ++step) {
+                const int task = (static_cast<int>(poll_rr_cursor_) + step) % kPollTaskCount;
+                bool sent = false;
+                switch (task) {
+                case 0: // status
+                    if (due(last_poll_status_, run_context ? poll_interval : idle_status_interval)) {
+                        sent = send_read(8);
+                        if (sent) last_poll_status_ = now;
+                    }
+                    break;
+                case 1: // output voltage
+                    if (run_context && due(last_poll_voltage_, poll_interval)) {
+                        sent = send_read(0);
+                        if (sent) last_poll_voltage_ = now;
+                    }
+                    break;
+                case 2: // output current
+                    if (run_context && due(last_poll_current_, poll_interval)) {
+                        sent = send_read(1);
+                        if (sent) last_poll_current_ = now;
+                    }
+                    break;
+                case 3: // inlet temperature
+                    if (due(last_poll_temp_, run_context ? slow_interval : idle_telemetry_interval)) {
+                        sent = send_read(30);
+                        if (sent) last_poll_temp_ = now;
+                    }
+                    break;
+                case 4: // hi/lo mode
+                    if (spec_.hi_lo_mode >= 0 && !mode_known_ && due(last_poll_mode_, slow_interval)) {
+                        sent = send_read(101);
+                        if (sent) last_poll_mode_ = now;
+                    }
+                    break;
+                case 5: // silent mode
+                    if (spec_.silent_mode >= 0 && !silent_known_ && due(last_poll_silent_, slow_interval)) {
+                        sent = send_read(62);
+                        if (sent) last_poll_silent_ = now;
+                    }
+                    break;
+                case 6: // group address probe
+                    if (spec_.probe_on_startup && !group_known_ && due(last_poll_group_, probe_interval)) {
+                        sent = send_read(89);
+                        if (sent) last_poll_group_ = now;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                if (sent) {
+                    poll_rr_cursor_ = static_cast<uint8_t>((task + 1) % kPollTaskCount);
+                    break;
                 }
             }
         }
@@ -1927,8 +2035,10 @@ private:
             msg_type == RECTIFIER_MSG_READ_SN) {
             if (cmd == 0) {
                 telemetry_.voltage_v = static_cast<double>(val) / 1000.0;
+                telemetry_.last_voltage_update = now;
             } else if (cmd == 1) {
                 telemetry_.current_a = static_cast<double>(val) / 1000.0;
+                telemetry_.last_current_update = now;
             } else if (cmd == 30) {
                 telemetry_.temperature_c = static_cast<double>(val) / 1000.0;
             } else if (cmd == 8) {
@@ -1980,6 +2090,7 @@ private:
     std::chrono::steady_clock::time_point last_poll_mode_{};
     std::chrono::steady_clock::time_point last_poll_silent_{};
     std::chrono::steady_clock::time_point last_poll_group_{};
+    uint8_t poll_rr_cursor_{0};
     std::shared_ptr<CanChannel> channel_;
     std::optional<uint8_t> resolved_addr_{};
     uint32_t last_status_bits_{0};
@@ -2035,6 +2146,10 @@ public:
             telemetry_.healthy = false;
             telemetry_.fault_mask = bit;
             telemetry_.healthy_mask = 0;
+            telemetry_.voltage_v = 0.0;
+            telemetry_.current_a = 0.0;
+            telemetry_.last_voltage_update = now;
+            telemetry_.last_current_update = now;
             telemetry_.last_update = now;
             const bool sent = send_startstop(false, 0.0, 0.0, TxClass::SafetyUrgent);
             if (sent) {
@@ -2181,6 +2296,8 @@ private:
             last_pfc_fault_ = frame.data[7];
             telemetry_.voltage_v = static_cast<double>(v_raw) * 0.1;
             telemetry_.current_a = static_cast<double>(i_raw) * 0.01;
+            telemetry_.last_voltage_update = now;
+            telemetry_.last_current_update = now;
             update_fault_state(now, true);
         } else if (pgn == TONHE_PGN_AC_INFO) {
             const uint16_t temp_raw = decode_u16_le(&frame.data[6]);
@@ -2328,6 +2445,8 @@ public:
         double voltage_sum = 0.0;
         int voltage_count = 0;
         double current_sum = 0.0;
+        int current_expected_count = 0;
+        int current_fresh_count = 0;
         bool any_telem = false;
         bool any_fresh = false;
         for (auto idx : it->second) {
@@ -2340,8 +2459,13 @@ public:
             snap.can_budget_limited = snap.can_budget_limited || iface_status.budget_limited;
             snap.can_overload_latched = snap.can_overload_latched || iface_status.overload_latched;
             const auto& telem = mod.driver ? mod.driver->telemetry() : ModuleTelemetryState{};
+            const auto stale_interval = telemetry_stale_interval(mod.spec);
             const bool fresh = telem.last_update.time_since_epoch().count() > 0 &&
-                               (now - telem.last_update) <= telemetry_stale_interval(mod.spec);
+                               (now - telem.last_update) <= stale_interval;
+            const bool voltage_fresh = telem.last_voltage_update.time_since_epoch().count() > 0 &&
+                                       (now - telem.last_voltage_update) <= stale_interval;
+            const bool current_fresh = telem.last_current_update.time_since_epoch().count() > 0 &&
+                                       (now - telem.last_current_update) <= stale_interval;
             if (fresh) {
                 any_fresh = true;
             }
@@ -2372,16 +2496,23 @@ public:
             if (mod.spec.slot_index >= 0 && mod.spec.slot_index < static_cast<int>(snap.temperatures_c.size())) {
                 snap.temperatures_c[mod.spec.slot_index] = telem.temperature_c;
             }
-            if (fresh) {
+            if (voltage_fresh) {
                 any_telem = true;
                 voltage_sum += telem.voltage_v;
                 voltage_count++;
-                current_sum += telem.current_a;
+                current_expected_count++;
+                if (current_fresh) {
+                    current_sum += telem.current_a;
+                    current_fresh_count++;
+                }
             }
         }
         if (any_telem && voltage_count > 0) {
             snap.telemetry_valid = true;
             snap.voltage_v = voltage_sum / static_cast<double>(voltage_count);
+        }
+        if (snap.telemetry_valid && current_expected_count > 0 && current_fresh_count == current_expected_count) {
+            snap.current_valid = true;
             snap.current_a = current_sum;
             snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
         }

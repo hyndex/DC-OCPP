@@ -3596,6 +3596,7 @@ void OcppAdapter::apply_power_plan() {
     struct IslandTelemetry {
         bool telemetry_valid{false};
         bool telemetry_complete{false};
+        bool current_valid{false};
         double voltage_v{0.0};
         double current_a{0.0};
         double power_kw{0.0};
@@ -3686,6 +3687,7 @@ void OcppAdapter::apply_power_plan() {
             const auto& slot_ids = kv.second;
             bool any_telem = false;
             bool complete = true;
+            bool current_complete = true;
             double v_sum = 0.0;
             int v_count = 0;
             double i_sum = 0.0;
@@ -3720,22 +3722,30 @@ void OcppAdapter::apply_power_plan() {
                 }
                 if (slot_has_modules && !have_slot_telem && !used_gun_telem) {
                     complete = false;
+                    current_complete = false;
                 }
                 if (have_slot_telem && !used_gun_telem) {
                     any_telem = true;
                     v_sum += snap_it->second.voltage_v;
                     v_count++;
-                    i_sum += snap_it->second.current_a;
-                    p_sum += snap_it->second.power_kw;
+                    if (snap_it->second.current_valid) {
+                        i_sum += snap_it->second.current_a;
+                        p_sum += snap_it->second.power_kw;
+                    } else {
+                        current_complete = false;
+                    }
                 }
             }
             IslandTelemetry telem{};
             telem.telemetry_valid = any_telem && v_count > 0;
-            telem.telemetry_complete = complete && telem.telemetry_valid;
+            telem.current_valid = telem.telemetry_valid && current_complete;
+            telem.telemetry_complete = complete && telem.telemetry_valid && telem.current_valid;
             if (telem.telemetry_valid) {
                 telem.voltage_v = v_sum / static_cast<double>(v_count);
-                telem.current_a = i_sum;
-                telem.power_kw = p_sum > 0.0 ? p_sum : (telem.voltage_v * telem.current_a) / 1000.0;
+                if (telem.current_valid) {
+                    telem.current_a = i_sum;
+                    telem.power_kw = p_sum > 0.0 ? p_sum : (telem.voltage_v * telem.current_a) / 1000.0;
+                }
             }
             telemetry_by_island[island_id] = telem;
         }
@@ -3781,6 +3791,7 @@ void OcppAdapter::apply_power_plan() {
         double island_current_a{0.0};
         double island_power_kw{0.0};
         bool module_telem_valid{false};
+        bool module_current_valid{false};
         double module_voltage_v{0.0};
         double module_current_a{0.0};
         double module_power_kw{0.0};
@@ -3824,6 +3835,7 @@ void OcppAdapter::apply_power_plan() {
         }
         const Slot* slot_for_conn = find_slot_for_gun(c.id);
         bool module_telem_valid = false;
+        bool module_current_valid = false;
         double module_voltage_v = 0.0;
         double module_current_a = 0.0;
         double module_power_kw = 0.0;
@@ -3838,6 +3850,8 @@ void OcppAdapter::apply_power_plan() {
             std::array<double, 2> temps{{0.0, 0.0}};
             double v_sum = 0.0;
             int v_count = 0;
+            int current_expected_count = 0;
+            int current_valid_count = 0;
             double i_sum = 0.0;
             double p_sum = 0.0;
 
@@ -3865,8 +3879,12 @@ void OcppAdapter::apply_power_plan() {
                         module_telem_valid = true;
                         v_sum += snap.voltage_v;
                         v_count++;
-                        i_sum += snap.current_a;
-                        p_sum += snap.power_kw;
+                        current_expected_count++;
+                        if (snap.current_valid) {
+                            current_valid_count++;
+                            i_sum += snap.current_a;
+                            p_sum += snap.power_kw;
+                        }
                     }
                 }
             } else if (slot_for_conn) {
@@ -3887,8 +3905,12 @@ void OcppAdapter::apply_power_plan() {
                         module_telem_valid = true;
                         v_sum = snap.voltage_v;
                         v_count = 1;
-                        i_sum = snap.current_a;
-                        p_sum = snap.power_kw;
+                        current_expected_count = 1;
+                        if (snap.current_valid) {
+                            current_valid_count = 1;
+                            i_sum = snap.current_a;
+                            p_sum = snap.power_kw;
+                        }
                     }
                 }
             }
@@ -3903,8 +3925,12 @@ void OcppAdapter::apply_power_plan() {
             }
             if (module_telem_valid && v_count > 0) {
                 module_voltage_v = v_sum / static_cast<double>(v_count);
-                module_current_a = i_sum;
-                module_power_kw = p_sum > 0.0 ? p_sum : (module_voltage_v * module_current_a) / 1000.0;
+                module_current_valid =
+                    current_expected_count > 0 && current_valid_count == current_expected_count;
+                if (module_current_valid) {
+                    module_current_a = i_sum;
+                    module_power_kw = p_sum > 0.0 ? p_sum : (module_voltage_v * module_current_a) / 1000.0;
+                }
             }
         }
         const bool have_telemetry = st.last_telemetry.time_since_epoch().count() != 0;
@@ -4081,11 +4107,18 @@ void OcppAdapter::apply_power_plan() {
         const bool missing_present = !st.present_voltage_v || !st.present_current_a;
         if (module_telem_valid && (prefer_module_meter || missing_present)) {
             measured_v = module_voltage_v;
-            measured_i = module_current_a;
-            measured_power_kw = module_power_kw;
             st.present_voltage_v = measured_v;
-            st.present_current_a = measured_i;
-            st.present_power_w = measured_power_kw * 1000.0;
+            if (module_current_valid) {
+                measured_i = module_current_a;
+                measured_power_kw = module_power_kw;
+                st.present_current_a = measured_i;
+                st.present_power_w = measured_power_kw * 1000.0;
+            } else if (prefer_module_meter) {
+                // On module-meter connectors, do not retain stale non-module current/power when
+                // module current telemetry is temporarily incomplete.
+                st.present_current_a.reset();
+                st.present_power_w.reset();
+            }
         } else if (!st.relay_closed) {
             // Do not keep publishing stale current/power values when the gun contactor is open.
             measured_i = 0.0;
@@ -4098,6 +4131,7 @@ void OcppAdapter::apply_power_plan() {
         // logic reflect the total current delivered across all contributing slots.
         bool island_telem_valid = false;
         bool island_telem_complete = false;
+        bool island_current_valid = false;
         double island_voltage_v = 0.0;
         double island_current_a = 0.0;
         double island_power_kw = 0.0;
@@ -4109,10 +4143,11 @@ void OcppAdapter::apply_power_plan() {
                 if (telem_it != telemetry_by_island.end()) {
                     island_telem_valid = telem_it->second.telemetry_valid;
                     island_telem_complete = telem_it->second.telemetry_complete;
+                    island_current_valid = telem_it->second.current_valid;
                     island_voltage_v = telem_it->second.voltage_v;
                     island_current_a = telem_it->second.current_a;
                     island_power_kw = telem_it->second.power_kw;
-                    if (st.relay_closed && island_telem_valid) {
+                    if (st.relay_closed && island_telem_valid && island_current_valid) {
                         measured_v = island_voltage_v;
                         measured_i = island_current_a;
                         measured_power_kw = island_power_kw;
@@ -4128,7 +4163,7 @@ void OcppAdapter::apply_power_plan() {
         }
         if (st.present_power_w) {
             last_power_w_[c.id] = st.present_power_w.value();
-        } else if (module_telem_valid) {
+        } else if (module_current_valid) {
             last_power_w_[c.id] = measured_power_kw * 1000.0;
         }
 
@@ -4415,6 +4450,7 @@ void OcppAdapter::apply_power_plan() {
         snap.island_current_a = island_current_a;
         snap.island_power_kw = island_power_kw;
         snap.module_telem_valid = module_telem_valid;
+        snap.module_current_valid = module_current_valid;
         snap.module_voltage_v = module_voltage_v;
         snap.module_current_a = module_current_a;
         snap.module_power_kw = module_power_kw;
@@ -4505,6 +4541,7 @@ void OcppAdapter::apply_power_plan() {
         bool module_unavailable_fault{false};
         bool module_can_overload{false};
         bool module_telem_valid{false};
+        bool module_current_valid{false};
         double module_voltage_v{0.0};
         double module_current_a{0.0};
         double module_power_kw{0.0};
@@ -4553,6 +4590,7 @@ void OcppAdapter::apply_power_plan() {
             info.module_unavailable_fault = snap_it->second.module_unavailable_fault;
             info.module_can_overload = snap_it->second.module_can_overload;
             info.module_telem_valid = snap_it->second.module_telem_valid;
+            info.module_current_valid = snap_it->second.module_current_valid;
             info.module_voltage_v = snap_it->second.module_voltage_v;
             info.module_current_a = snap_it->second.module_current_a;
             info.module_power_kw = snap_it->second.module_power_kw;
@@ -4566,6 +4604,7 @@ void OcppAdapter::apply_power_plan() {
                 info.module_health_valid = ms.health_valid;
                 info.module_can_overload = ms.can_overload_latched;
                 info.module_telem_valid = ms.telemetry_valid;
+                info.module_current_valid = ms.current_valid;
                 info.module_voltage_v = ms.voltage_v;
                 info.module_current_a = ms.current_a;
                 info.module_power_kw = ms.power_kw;
@@ -4573,6 +4612,7 @@ void OcppAdapter::apply_power_plan() {
             } else {
                 info.module_health_valid = false;
                 info.module_telem_valid = false;
+                info.module_current_valid = false;
                 info.module_voltage_v = 0.0;
                 info.module_current_a = 0.0;
                 info.module_power_kw = 0.0;
@@ -5378,6 +5418,7 @@ void OcppAdapter::apply_power_plan() {
         const auto snap_it = snapshots.find(c.id);
         const GunStatus status = snap_it != snapshots.end() ? snap_it->second.status : GunStatus{};
         const double meas_i = snap_it != snapshots.end() ? snap_it->second.measured_current_a : 0.0;
+        const bool connector_prefers_module_meter = (c.meter_source == "module");
         const GunState g = gun_lookup.count(c.id) ? gun_lookup.at(c.id) : GunState{};
         const bool hold_no_current = hold_guns_no_current.count(c.id) > 0;
         bool local_fault = info.local_fault;
@@ -5488,25 +5529,24 @@ void OcppAdapter::apply_power_plan() {
                 }
                 // Ignore brief CP/PLC telemetry blips (including cp_state='U');
                 // sustained loss means EV is no longer requesting power.
-                constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(1200);
+                constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(900);
                 // CP=B can briefly blip during HLC transitions on some vehicles.
-                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(2500);
-                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(4500);
+                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(900);
+                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(1500);
                 // If CurrentDemand targets are still arriving, allow a slightly longer hold but keep it bounded.
                 // This avoids false drops on CP noise while preventing indefinite power offer on stale CP=B.
                 constexpr auto kCpTargetOnlyMaxHold = std::chrono::milliseconds(2500);
-                // If current is still flowing while CP reads B/U, treat it as telemetry skew and hold longer.
+                // If connector-side current is still flowing while CP reads B/U, treat it as telemetry skew and hold longer.
                 constexpr auto kCpFlowingCurrentHold = std::chrono::milliseconds(5000);
                 constexpr double kFlowingCurrentA = 0.8;
                 constexpr double kFlowingPowerW = 350.0;
                 const double meas_i_abs = std::fabs(meas_i);
                 const double present_i_abs =
                     status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
-                const double module_i_abs = info.module_telem_valid ? std::fabs(info.module_current_a) : 0.0;
                 const double present_p_abs = status.present_power_w ? std::fabs(status.present_power_w.value()) : 0.0;
                 const bool power_path_active_now =
                     meas_i_abs >= kFlowingCurrentA || present_i_abs >= kFlowingCurrentA ||
-                    module_i_abs >= kFlowingCurrentA || present_p_abs >= kFlowingPowerW;
+                    present_p_abs >= kFlowingPowerW;
                 std::chrono::milliseconds hold_window = ev_target_active ? kCpTargetOnlyMaxHold : kCpRequestDropDebounce;
                 if (explicit_ev_stop) {
                     hold_window = ev_target_active ? kCpEvStopTargetHold : kCpEvStopDebounce;
@@ -5564,7 +5604,10 @@ void OcppAdapter::apply_power_plan() {
                 last_cp_request_drop_reason_[c.id] = request_loss_reason;
             }
         }
-        bool gc_close_requested = is_home && (info.desired_gc_state == ContactorState::Closed) &&
+        const bool gc_debounce_hold = is_home && hlc_power_phase && !hlc_precharge_phase && !ev_requesting &&
+                                      power_request_active && gc_closed_effective;
+        bool gc_close_requested = is_home &&
+                                  (info.desired_gc_state == ContactorState::Closed || gc_debounce_hold) &&
                                   dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
         if (hlc_power_phase && !hlc_precharge_phase && !power_request_active) {
             gc_close_requested = false;
@@ -5774,12 +5817,16 @@ void OcppAdapter::apply_power_plan() {
         bool current_valid = false;
         if (snap_it != snapshots.end()) {
             current_valid = tie_mode && status.relay_closed ? snap_it->second.island_telem_complete
-                                                            : snap_it->second.module_telem_valid;
+                                                            : snap_it->second.module_current_valid;
         }
         const bool present_fresh = status.last_telemetry.time_since_epoch().count() != 0 &&
                                    (now - status.last_telemetry) <= telemetry_timeout(cfg_);
         if (!current_valid && present_fresh) {
-            current_valid = status.present_current_a.has_value();
+            // Module-meter connectors must rely on fresh module current telemetry for
+            // current-dependent faulting; avoid arming on fallback stale present current.
+            if (!connector_prefers_module_meter) {
+                current_valid = status.present_current_a.has_value();
+            }
         }
         if (!local_fault && is_home && hlc_precharge_only && gc_close_requested &&
             (gc_closed_cmd || gc_closed_effective)) {
@@ -5871,7 +5918,7 @@ void OcppAdapter::apply_power_plan() {
         // Cross-signal validation: if module telemetry is available and still reporting non-trivial current,
         // do not arm a delivery-stall fault from a single path alone.
         const bool stall_module_low_confirmed =
-            !info.module_telem_valid || std::fabs(info.module_current_a) < stall_no_current_thresh;
+            !info.module_current_valid || std::fabs(info.module_current_a) < stall_no_current_thresh;
         if (!local_fault && !hold_no_current && gc_close_requested && power_request_active && stall_cp_power_ready &&
             stall_current_requested && stall_target_recent && stall_module_low_confirmed && evse_current_offered &&
             current_valid && (gc_closed_cmd || gc_closed_effective)) {
@@ -5899,6 +5946,7 @@ void OcppAdapter::apply_power_plan() {
                                       << "A target_I=" << status.target_current_a.value_or(0.0)
                                       << "A module_I=" << info.module_current_a
                                       << "A module_telem_valid=" << (info.module_telem_valid ? "1" : "0")
+                                      << " module_current_valid=" << (info.module_current_valid ? "1" : "0")
                                       << " target_age_ms=" << target_age_ms
                                       << " I_thresh=" << stall_no_current_thresh << "A)";
                     }
@@ -6148,11 +6196,21 @@ void OcppAdapter::apply_power_plan() {
             const auto target_timeout = telemetry_timeout(cfg_);
             const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
                                        (now - status.last_target_update) <= target_timeout;
-            double measured_i_abs = status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
-            bool measured_i_valid = status.present_current_a.has_value();
-            if (!measured_i_valid && info.module_telem_valid) {
-                measured_i_abs = std::fabs(info.module_current_a);
-                measured_i_valid = true;
+            double measured_i_abs = 0.0;
+            bool measured_i_valid = false;
+            if (connector_prefers_module_meter) {
+                if (info.module_current_valid) {
+                    measured_i_abs = std::fabs(info.module_current_a);
+                    measured_i_valid = true;
+                }
+            } else {
+                if (status.present_current_a) {
+                    measured_i_abs = std::fabs(status.present_current_a.value());
+                    measured_i_valid = true;
+                } else if (info.module_current_valid) {
+                    measured_i_abs = std::fabs(info.module_current_a);
+                    measured_i_valid = true;
+                }
             }
             const double target_i = std::max(0.0, status.target_current_a.value_or(cmd.current_limit_a));
             const bool sustained_phase =

@@ -104,7 +104,7 @@
           "readbackLimits": true,
           "type": "maxwell-mxr",
           "inputMode": 3,
-          "pollMs": 250,
+          "pollMs": 100,
           "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
@@ -129,7 +129,7 @@
           "readbackLimits": true,
           "type": "maxwell-mxr",
           "inputMode": 3,
-          "pollMs": 250,
+          "pollMs": 100,
           "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
