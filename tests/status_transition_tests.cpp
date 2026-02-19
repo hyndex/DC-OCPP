@@ -4,7 +4,9 @@
 #include "test_hardware.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 using namespace charger;
 
@@ -123,6 +125,29 @@ int main() {
     state = OcppAdapter::TestHook::connector_state(adapter, 1);
     if (state != ConnectorState::Preparing) {
         std::cerr << "status_transition_tests failed: expected Preparing during precharge\n";
+        return 1;
+    }
+
+    // Case 5: CP=B in power phase should not immediately flip to SuspendedEV (debounced).
+    st = base_status();
+    OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
+                                                  true, true, true, false, false, false, false, false);
+    st.cp_state = 'B';
+    OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
+                                                  true, true, true, false, false, false, false, false);
+    state = OcppAdapter::TestHook::connector_state(adapter, 1);
+    if (state != ConnectorState::Charging) {
+        std::cerr << "status_transition_tests failed: expected Charging during CP=B debounce window\n";
+        return 1;
+    }
+
+    // Case 6: Sustained CP=B beyond debounce transitions to SuspendedEV.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2700));
+    OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
+                                                  true, true, true, false, false, false, false, false);
+    state = OcppAdapter::TestHook::connector_state(adapter, 1);
+    if (state != ConnectorState::SuspendedEV) {
+        std::cerr << "status_transition_tests failed: expected SuspendedEV after sustained CP=B\n";
         return 1;
     }
 

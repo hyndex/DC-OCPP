@@ -1448,6 +1448,10 @@ bool OcppAdapter::handle_disable_evse(std::int32_t connector) {
         evse_disabled_[connector] = true;
     }
     if (had_session) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            stop_origin_hint_[connector] = "ocpp_disable_evse";
+        }
         finish_transaction(connector, ocpp::v16::Reason::Other, std::nullopt);
     }
     return hardware_->disable(connector);
@@ -1488,6 +1492,8 @@ bool OcppAdapter::handle_stop_transaction(std::int32_t connector, ocpp::v16::Rea
 
     const bool ok = hardware_->stop_transaction(connector, reason);
     if (ok) {
+        EVLOG_info << "Received OCPP stop request connector=" << connector
+                   << " reason=" << ocpp::v16::conversions::reason_to_string(reason);
         const auto status = sanitize_status(hardware_->get_status(connector), cfg_.lab_bypass);
         const bool vehicle_present = infer_vehicle_present(status, true);
         {
@@ -1495,6 +1501,7 @@ bool OcppAdapter::handle_stop_transaction(std::int32_t connector, ocpp::v16::Rea
             post_stop_plugged_[connector] = vehicle_present;
             post_stop_time_[connector] =
                 vehicle_present ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            stop_origin_hint_[connector] = "ocpp_remote_stop";
         }
         finish_transaction(connector, reason, std::nullopt, vehicle_present);
     }
@@ -1520,6 +1527,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
     std::chrono::steady_clock::time_point evse_limit_ack_stale_since{};
     std::chrono::steady_clock::time_point module_degraded_since{};
     std::chrono::steady_clock::time_point module_degraded_clear_since{};
+    std::chrono::steady_clock::time_point suspended_no_power_since{};
     bool module_degraded_latched = false;
 
     while (running_) {
@@ -1617,6 +1625,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                         post_stop_plugged_[token.connector_hint] = vehicle_present;
                                         post_stop_time_[token.connector_hint] =
                                             vehicle_present ? now : std::chrono::steady_clock::time_point{};
+                                        stop_origin_hint_[token.connector_hint] = "local_rfid_stop";
                                     }
                                     finish_transaction(token.connector_hint, ocpp::v16::Reason::Local, id_tag_end,
                                                        vehicle_present);
@@ -1708,24 +1717,35 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 const bool v_ok = within(v_meas, v_stat, 0.05, 20.0);
                 const bool i_ok = within(i_meas, i_stat, 0.10, 2.0);
                 const bool p_ok = within(p_meas, p_stat, 0.10, 500.0);
+                const int mismatch_axes = (!v_ok ? 1 : 0) + (!i_ok ? 1 : 0) + (!p_ok ? 1 : 0);
+                const bool mismatch_under_load =
+                    status.relay_closed &&
+                    ((std::fabs(i_meas) >= 2.0) || (std::fabs(i_stat) >= 2.0) ||
+                     (std::fabs(p_meas) >= 800.0) || (std::fabs(p_stat) >= 800.0));
                 bool telemetry_mismatch_trip = false;
+                int mismatch_count = 0;
                 {
                     std::lock_guard<std::mutex> lock(telemetry_mutex_);
                     auto& count = telemetry_mismatch_count_[connector];
-                    if (!(v_ok && i_ok && p_ok)) {
+                    // Only arm mismatch trips when at least two channels disagree under real load.
+                    // This avoids false trips from transient/current-sensor skew at low power.
+                    if (mismatch_under_load && mismatch_axes >= 2) {
                         count++;
                     } else {
                         count = 0;
                     }
-                    if (count >= 5) {
+                    mismatch_count = count;
+                    if (count >= 15) {
                         telemetry_mismatch_trip = true;
                         count = 0;
                     }
                 }
-                    if (telemetry_mismatch_trip) {
-                        EVLOG_error << "Telemetry mismatch on connector " << connector
-                                    << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
-                                    << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")";
+                if (telemetry_mismatch_trip) {
+                    EVLOG_error << "Telemetry mismatch on connector " << connector
+                                << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
+                                << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")"
+                                << " mismatch_axes=" << mismatch_axes
+                                << " mismatch_count=" << mismatch_count;
                     finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
                     disable_local("telemetry_mismatch");
                     had_session = false;
@@ -2230,6 +2250,42 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 fault = true;
             }
+            // If a started transaction remains in CP=B with zero delivered power/current and no fresh EV targets,
+            // close it deterministically to avoid dangling OCPP transactions (SuspendedEV forever + MeterValues).
+            if (!fault && had_session && session.transaction_started && session.authorized &&
+                status.plugged_in && status.cp_state == 'B' && !status.hlc_charge_complete) {
+                const auto target_timeout = telemetry_timeout(cfg_);
+                const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
+                                           (now - status.last_target_update) <= target_timeout;
+                const double present_i_abs = std::fabs(status.present_current_a.value_or(0.0));
+                const double present_p_abs = std::fabs(status.present_power_w.value_or(0.0));
+                const bool no_output = !status.relay_closed && present_i_abs < 0.5 && present_p_abs < 250.0;
+                if (!target_recent && no_output) {
+                    if (suspended_no_power_since.time_since_epoch().count() == 0) {
+                        suspended_no_power_since = now;
+                    } else if ((now - suspended_no_power_since) >= std::chrono::seconds(20)) {
+                        EVLOG_info << "Connector " << connector
+                                   << " stopping transaction after sustained SuspendedEV with no output"
+                                   << " cp=" << status.cp_state
+                                   << " relay=" << (status.relay_closed ? "1" : "0")
+                                   << " present_I=" << present_i_abs
+                                   << " present_P=" << present_p_abs;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            stop_origin_hint_[connector] = "suspended_ev_no_output";
+                        }
+                        finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                        disable_local("suspended_ev_no_output");
+                        had_session = false;
+                        session = ActiveSession{};
+                        suspended_no_power_since = std::chrono::steady_clock::time_point{};
+                    }
+                } else {
+                    suspended_no_power_since = std::chrono::steady_clock::time_point{};
+                }
+            } else {
+                suspended_no_power_since = std::chrono::steady_clock::time_point{};
+            }
             if (push_meter_now) {
                 bool send_meter = false;
                 const auto keepalive = std::chrono::seconds(std::max(1, cfg_.meter_keepalive_s));
@@ -2656,6 +2712,11 @@ bool OcppAdapter::begin_transaction(std::int32_t connector, const std::string& i
 
 void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason reason,
                                      std::optional<ocpp::CiString<20>> id_tag_end, bool defer_session_stop) {
+    const auto stop_now = std::chrono::steady_clock::now();
+    GunStatus stop_status{};
+    if (hardware_) {
+        stop_status = sanitize_status(hardware_->get_status(connector), cfg_.lab_bypass);
+    }
     std::string session_id;
     std::optional<std::chrono::steady_clock::time_point> pending_started;
     std::optional<std::chrono::steady_clock::time_point> authorized_at;
@@ -2704,14 +2765,66 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
                                               energy_wh, id_tag_end, std::nullopt);
     }
 
-    if (pending_started && pending_started->time_since_epoch().count()) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto auth_elapsed = authorized_at ? (authorized_at.value() - *pending_started)
-                                                : std::chrono::steady_clock::duration::zero();
-        EVLOG_info << "Session " << session_id << " stop reason=" << static_cast<int>(reason)
-                   << " auth_wait_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(auth_elapsed).count()
-                   << " energy_Wh=" << energy_wh;
+    std::string stop_origin;
+    std::chrono::steady_clock::time_point cp_drop_time{};
+    std::string cp_drop_reason;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto origin_it = stop_origin_hint_.find(connector);
+        if (origin_it != stop_origin_hint_.end()) {
+            stop_origin = origin_it->second;
+            stop_origin_hint_.erase(origin_it);
+        }
+        auto cp_drop_it = last_cp_request_drop_.find(connector);
+        if (cp_drop_it != last_cp_request_drop_.end()) {
+            cp_drop_time = cp_drop_it->second;
+            last_cp_request_drop_.erase(cp_drop_it);
+        }
+        auto cp_reason_it = last_cp_request_drop_reason_.find(connector);
+        if (cp_reason_it != last_cp_request_drop_reason_.end()) {
+            cp_drop_reason = cp_reason_it->second;
+            last_cp_request_drop_reason_.erase(cp_reason_it);
+        }
     }
+    if (stop_origin.empty()) {
+        if (reason == ocpp::v16::Reason::EVDisconnected) {
+            stop_origin = "vehicle_disconnected";
+        } else if (reason == ocpp::v16::Reason::Local) {
+            stop_origin = "local_stop";
+        } else if (reason == ocpp::v16::Reason::Remote) {
+            stop_origin = "ocpp_remote_stop";
+        } else if (reason == ocpp::v16::Reason::EmergencyStop) {
+            stop_origin = "safety_estop";
+        } else {
+            stop_origin = "controller_or_fault_logic";
+        }
+    }
+    const auto auth_elapsed =
+        (pending_started && pending_started->time_since_epoch().count())
+            ? (authorized_at ? (authorized_at.value() - *pending_started)
+                             : std::chrono::steady_clock::duration::zero())
+            : std::chrono::steady_clock::duration::zero();
+    const auto auth_wait_ms = (pending_started && pending_started->time_since_epoch().count())
+                                  ? std::chrono::duration_cast<std::chrono::milliseconds>(auth_elapsed).count()
+                                  : -1;
+    const auto cp_drop_age_ms = cp_drop_time.time_since_epoch().count() != 0
+                                    ? std::chrono::duration_cast<std::chrono::milliseconds>(stop_now - cp_drop_time).count()
+                                    : -1;
+    EVLOG_info << "StopTransaction summary connector=" << connector
+               << " session=" << session_id
+               << " reason=" << ocpp::v16::conversions::reason_to_string(reason)
+               << " origin=" << stop_origin
+               << " auth_wait_ms=" << auth_wait_ms
+               << " energy_Wh=" << energy_wh
+               << " cp=" << stop_status.cp_state
+               << " plugged=" << (stop_status.plugged_in ? "1" : "0")
+               << " relay=" << (stop_status.relay_closed ? "1" : "0")
+               << " hlc_stage=" << static_cast<int>(stop_status.hlc_stage)
+               << " present_V=" << stop_status.present_voltage_v.value_or(0.0)
+               << " present_I=" << stop_status.present_current_a.value_or(0.0)
+               << " target_I=" << stop_status.target_current_a.value_or(0.0)
+               << " cp_drop_age_ms=" << cp_drop_age_ms
+               << " cp_drop_reason=" << (cp_drop_reason.empty() ? "none" : cp_drop_reason);
 
     bool pending_changed = false;
     {
@@ -3851,6 +3964,12 @@ void OcppAdapter::apply_power_plan() {
             gc_open_timeout_exceeded_since_.erase(connector_id);
             gc_close_request_time_.erase(connector_id);
             power_delivery_stall_since_.erase(connector_id);
+            power_request_lost_since_.erase(connector_id);
+            last_power_request_active_.erase(connector_id);
+            last_cp_request_drop_.erase(connector_id);
+            last_cp_request_drop_reason_.erase(connector_id);
+            current_underdelivery_since_.erase(connector_id);
+            current_underdelivery_log_.erase(connector_id);
             precharge_arm_ready_since_.erase(connector_id);
             precharge_ramp_since_.erase(connector_id);
             precharge_voltage_stable_since_.erase(connector_id);
@@ -5354,12 +5473,14 @@ void OcppAdapter::apply_power_plan() {
 
         bool power_request_active =
             (ev_requesting && hlc_power_phase) || (!hlc_known && ev_target_active) || (hlc_power_phase && ev_target_active);
+        std::string request_loss_reason;
         if (hlc_power_phase && !hlc_precharge_phase && !ev_requesting) {
             const bool explicit_unplug = cp_known && status.cp_state == 'A' && !status.plugged_in;
             const bool explicit_ev_stop = cp_known && status.cp_state == 'B';
             if (explicit_unplug) {
                 power_request_lost_since_.erase(c.id);
                 power_request_active = false;
+                request_loss_reason = "cp_a_unplugged";
             } else {
                 auto& lost_since = power_request_lost_since_[c.id];
                 if (lost_since.time_since_epoch().count() == 0) {
@@ -5367,25 +5488,81 @@ void OcppAdapter::apply_power_plan() {
                 }
                 // Ignore brief CP/PLC telemetry blips (including cp_state='U');
                 // sustained loss means EV is no longer requesting power.
-                constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(900);
+                constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(1200);
                 // CP=B can briefly blip during HLC transitions on some vehicles.
-                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(1200);
-                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(2200);
+                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(2500);
+                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(4500);
                 // If CurrentDemand targets are still arriving, allow a slightly longer hold but keep it bounded.
                 // This avoids false drops on CP noise while preventing indefinite power offer on stale CP=B.
-                constexpr auto kCpTargetOnlyMaxHold = std::chrono::milliseconds(1500);
+                constexpr auto kCpTargetOnlyMaxHold = std::chrono::milliseconds(2500);
+                // If current is still flowing while CP reads B/U, treat it as telemetry skew and hold longer.
+                constexpr auto kCpFlowingCurrentHold = std::chrono::milliseconds(5000);
+                constexpr double kFlowingCurrentA = 0.8;
+                constexpr double kFlowingPowerW = 350.0;
+                const double meas_i_abs = std::fabs(meas_i);
+                const double present_i_abs =
+                    status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
+                const double module_i_abs = info.module_telem_valid ? std::fabs(info.module_current_a) : 0.0;
+                const double present_p_abs = status.present_power_w ? std::fabs(status.present_power_w.value()) : 0.0;
+                const bool power_path_active_now =
+                    meas_i_abs >= kFlowingCurrentA || present_i_abs >= kFlowingCurrentA ||
+                    module_i_abs >= kFlowingCurrentA || present_p_abs >= kFlowingPowerW;
                 std::chrono::milliseconds hold_window = ev_target_active ? kCpTargetOnlyMaxHold : kCpRequestDropDebounce;
                 if (explicit_ev_stop) {
                     hold_window = ev_target_active ? kCpEvStopTargetHold : kCpEvStopDebounce;
+                }
+                if (power_path_active_now) {
+                    hold_window = std::max(hold_window, kCpFlowingCurrentHold);
                 }
                 if ((now - lost_since) < hold_window) {
                     power_request_active = true;
                 } else {
                     power_request_active = false;
+                    if (explicit_ev_stop) {
+                        request_loss_reason = "cp_b_sustained";
+                    } else if (!cp_known) {
+                        request_loss_reason = "cp_unknown_sustained";
+                    } else {
+                        request_loss_reason = "ev_not_requesting_sustained";
+                    }
                 }
             }
         } else {
             power_request_lost_since_.erase(c.id);
+        }
+        const auto prev_request_it = last_power_request_active_.find(c.id);
+        const bool prev_request_active =
+            (prev_request_it != last_power_request_active_.end()) ? prev_request_it->second : power_request_active;
+        if (prev_request_active != power_request_active) {
+            const auto lost_it = power_request_lost_since_.find(c.id);
+            const auto lost_ms = (lost_it != power_request_lost_since_.end() &&
+                                  lost_it->second.time_since_epoch().count() != 0)
+                                     ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lost_it->second).count()
+                                     : 0;
+            EVLOG_info << "Connector " << c.id << " EV power request "
+                       << (power_request_active ? "restored" : "lost")
+                       << " cp=" << status.cp_state
+                       << " hlc_stage=" << static_cast<int>(status.hlc_stage)
+                       << " hlc_ready=" << (status.hlc_power_ready ? "1" : "0")
+                       << " relay=" << (status.relay_closed ? "1" : "0")
+                       << " meas_I=" << meas_i
+                       << " present_I=" << status.present_current_a.value_or(0.0)
+                       << " target_I=" << status.target_current_a.value_or(0.0)
+                       << " target_recent=" << (ev_target_recent ? "1" : "0")
+                       << " drop_age_ms=" << lost_ms
+                       << " reason=" << (request_loss_reason.empty() ? "none" : request_loss_reason)
+                       << " session_active=" << (g.ev_session_active ? "1" : "0");
+        }
+        last_power_request_active_[c.id] = power_request_active;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (power_request_active) {
+                last_cp_request_drop_.erase(c.id);
+                last_cp_request_drop_reason_.erase(c.id);
+            } else if (!request_loss_reason.empty()) {
+                last_cp_request_drop_[c.id] = now;
+                last_cp_request_drop_reason_[c.id] = request_loss_reason;
+            }
         }
         bool gc_close_requested = is_home && (info.desired_gc_state == ContactorState::Closed) &&
                                   dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
@@ -5967,6 +6144,55 @@ void OcppAdapter::apply_power_plan() {
                 limits.max_power_kw = std::min(limits.max_power_kw.value(), cmd.power_kw);
             }
         }
+        if (allow_energy_home && limits.max_current_a && limits.max_current_a.value() > 0.0) {
+            const auto target_timeout = telemetry_timeout(cfg_);
+            const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
+                                       (now - status.last_target_update) <= target_timeout;
+            double measured_i_abs = status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
+            bool measured_i_valid = status.present_current_a.has_value();
+            if (!measured_i_valid && info.module_telem_valid) {
+                measured_i_abs = std::fabs(info.module_current_a);
+                measured_i_valid = true;
+            }
+            const double target_i = std::max(0.0, status.target_current_a.value_or(cmd.current_limit_a));
+            const bool sustained_phase =
+                status.relay_closed && (status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE) &&
+                !status.hlc_charge_complete;
+            const bool underdelivering_now =
+                sustained_phase && target_recent && measured_i_valid && target_i >= 2.0 &&
+                (measured_i_abs + std::max(0.6, target_i * 0.12)) < target_i;
+
+            if (underdelivering_now) {
+                auto& since = current_underdelivery_since_[c.id];
+                if (since.time_since_epoch().count() == 0) {
+                    since = now;
+                }
+            } else {
+                current_underdelivery_since_.erase(c.id);
+            }
+
+            const auto ud_it = current_underdelivery_since_.find(c.id);
+            if (ud_it != current_underdelivery_since_.end() &&
+                (now - ud_it->second) >= std::chrono::milliseconds(2500)) {
+                const double derated_max_i = std::clamp(measured_i_abs + std::max(0.3, target_i * 0.05), 1.0,
+                                                        limits.max_current_a.value());
+                if (derated_max_i + 0.05 < limits.max_current_a.value()) {
+                    limits.max_current_a = derated_max_i;
+                    auto& last_log = current_underdelivery_log_[c.id];
+                    if (last_log.time_since_epoch().count() == 0 ||
+                        (now - last_log) >= std::chrono::seconds(1)) {
+                        EVLOG_warning << "Connector " << c.id
+                                      << " adaptive EVSE current derate applied target_I=" << target_i
+                                      << "A measured_I=" << measured_i_abs
+                                      << "A offered_I=" << derated_max_i << "A";
+                        last_log = now;
+                    }
+                }
+            }
+        } else {
+            current_underdelivery_since_.erase(c.id);
+            current_underdelivery_log_.erase(c.id);
+        }
         hardware_->apply_power_command(cmd);
         hardware_->set_evse_limits(c.id, limits);
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
@@ -6000,6 +6226,11 @@ void OcppAdapter::apply_power_plan() {
         }
 
         if (local_fault && is_home && g.ev_session_active) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                stop_origin_hint_[c.id] = !info.fault_reason.empty() ? ("planner_" + info.fault_reason)
+                                                                      : "planner_local_fault";
+            }
             finish_transaction(c.id, ocpp::v16::Reason::PowerLoss, std::nullopt);
             mark_local_hw_disable(c.id, !info.fault_reason.empty() ? info.fault_reason : "LocalFault");
             hardware_->disable(c.id);
@@ -6708,7 +6939,9 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
                 if (since.time_since_epoch().count() == 0) {
                     since = now;
                 }
-                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(1500);
+                // Keep status in Charging through short CP=B/U jitter to avoid unnecessary
+                // Charging<->SuspendedEV churn while power is still flowing.
+                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(2500);
                 request_lost = (now - since) >= kChargingStateCpDropDebounce;
             } else {
                 std::lock_guard<std::mutex> lock(state_mutex_);

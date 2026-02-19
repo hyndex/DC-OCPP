@@ -331,6 +331,9 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
     std::map<int, std::chrono::steady_clock::time_point> power_request_lost_since_;
+    std::map<int, bool> last_power_request_active_;
+    std::map<int, std::chrono::steady_clock::time_point> last_cp_request_drop_;
+    std::map<int, std::string> last_cp_request_drop_reason_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_arm_ready_since_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_ramp_since_;
     std::map<int, std::chrono::steady_clock::time_point> precharge_voltage_stable_since_;
@@ -383,6 +386,9 @@ private:
     std::string pending_status_refresh_reason_{};
     std::mutex status_refresh_mutex_;
     std::map<int, uint64_t> status_event_seq_;
+    std::map<int, std::string> stop_origin_hint_;
+    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_since_;
+    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_log_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};
     std::chrono::steady_clock::time_point last_reservation_expiry_check_{};
