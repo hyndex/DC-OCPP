@@ -75,6 +75,7 @@ struct GunState {
     double gun_current_limit_a{0.0};
     int priority{0};
     double i_meas_a{0.0};
+    double v_meas_v{0.0};
     double i_set_a{0.0};
     double connector_temp_c{0.0};
     bool plugged_in{false};
@@ -112,6 +113,18 @@ struct PlannerConfig {
     int min_gc_hold_ms{500};
     double mc_open_current_a{1.0};
     double gc_open_current_a{1.0};
+    double voltage_margin_v{2.0};
+    double current_margin_a{0.2};
+    double voltage_guard_band_v{10.0};
+    double ramp_up_min_a_per_s{20.0};
+    double ramp_up_max_a_per_s{250.0};
+    double ramp_down_min_a_per_s{100.0};
+    double ramp_down_max_a_per_s{300.0};
+    double ramp_down_emergency_a_per_s{350.0};
+    double ramp_jerk_a_per_s2{2000.0};
+    double ramp_response_s{0.45};
+    double ramp_capture_current_a{0.2};
+    double ramp_capture_rate_a_per_s{1.5};
 };
 
 struct GunDispatch {
@@ -142,6 +155,13 @@ public:
     Plan compute_plan();
 
 private:
+    struct CurrentRampState {
+        double current_a{0.0};
+        double rate_a_per_s{0.0};
+        bool initialized{false};
+        std::chrono::steady_clock::time_point last_update{};
+    };
+
     PlannerConfig cfg_;
     std::vector<Slot> slots_;
     std::map<std::string, ModuleState> modules_;
@@ -151,6 +171,7 @@ private:
     std::map<int, int> last_modules_assigned_;
     std::map<int, std::vector<std::string>> last_module_ids_;
     std::map<int, std::chrono::steady_clock::time_point> last_alloc_change_;
+    std::map<int, CurrentRampState> ramp_state_by_gun_;
 
     std::vector<int> active_guns() const;
     Plan blank_plan() const;
@@ -175,7 +196,12 @@ private:
     Plan build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                     const std::map<int, int>& modules_per_gun,
                     const std::set<int>& reserved_slots,
-                    const std::set<int>& full_island_guns);
+                    const std::set<int>& full_island_guns,
+                    std::chrono::steady_clock::time_point now);
+    double apply_voltage_guard(const GunState& g, double i_target_a, double v_ceiling_v) const;
+    double apply_current_ramp(int gun_id, const GunState& g, double i_target_a, bool emergency_drop,
+                              std::chrono::steady_clock::time_point now);
+    void prune_inactive_ramp_state(const std::vector<int>& active);
     void apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_point now);
     bool validate_plan(const Plan& plan) const;
 };

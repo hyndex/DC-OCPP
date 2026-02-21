@@ -661,6 +661,18 @@ void OcppAdapter::initialize_slots() {
     pcfg.mc_open_current_a = cfg_.mc_open_current_a;
     pcfg.gc_open_current_a = cfg_.gc_open_current_a;
     pcfg.ramp_step_a = cfg_.ramp_step_a;
+    pcfg.voltage_margin_v = cfg_.planner_voltage_margin_v;
+    pcfg.current_margin_a = cfg_.planner_current_margin_a;
+    pcfg.voltage_guard_band_v = cfg_.planner_voltage_guard_band_v;
+    pcfg.ramp_up_min_a_per_s = cfg_.planner_ramp_up_min_a_per_s;
+    pcfg.ramp_up_max_a_per_s = cfg_.planner_ramp_up_max_a_per_s;
+    pcfg.ramp_down_min_a_per_s = cfg_.planner_ramp_down_min_a_per_s;
+    pcfg.ramp_down_max_a_per_s = cfg_.planner_ramp_down_max_a_per_s;
+    pcfg.ramp_down_emergency_a_per_s = cfg_.planner_ramp_down_emergency_a_per_s;
+    pcfg.ramp_jerk_a_per_s2 = cfg_.planner_ramp_jerk_a_per_s2;
+    pcfg.ramp_response_s = cfg_.planner_ramp_response_s;
+    pcfg.ramp_capture_current_a = cfg_.planner_capture_current_a;
+    pcfg.ramp_capture_rate_a_per_s = cfg_.planner_capture_rate_a_per_s;
     planner_cfg_ = pcfg;
     power_manager_ = PowerManager(planner_cfg_);
 
@@ -4663,6 +4675,7 @@ void OcppAdapter::apply_power_plan() {
         }
         g.ev_req_voltage_v = std::min(g.ev_req_voltage_v, max_voltage_v);
         g.i_meas_a = measured_i;
+        g.v_meas_v = measured_v;
 
         const bool blocked = !g.safety_ok || module_unavailable_fault || st.gc_welded || st.mc_welded || forced_fault;
         const bool post_precharge_hold = post_precharge_hold_candidate && !blocked;

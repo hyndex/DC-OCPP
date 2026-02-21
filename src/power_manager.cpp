@@ -381,10 +381,109 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
     return n_modules;
 }
 
+double PowerManager::apply_voltage_guard(const GunState& g, double i_target_a, double v_ceiling_v) const {
+    if (i_target_a <= 0.0) {
+        return 0.0;
+    }
+    const double guard_v = std::max(0.0, cfg_.voltage_guard_band_v);
+    if (guard_v <= 0.0 || g.v_meas_v <= 0.0 || v_ceiling_v <= 0.0) {
+        return std::max(0.0, i_target_a);
+    }
+    const double dv = v_ceiling_v - g.v_meas_v;
+    if (dv <= 0.0) {
+        return 0.0;
+    }
+    if (dv >= guard_v) {
+        return std::max(0.0, i_target_a);
+    }
+    return std::max(0.0, i_target_a * (dv / guard_v));
+}
+
+double PowerManager::apply_current_ramp(int gun_id, const GunState& g, double i_target_a, bool emergency_drop,
+                                        std::chrono::steady_clock::time_point now) {
+    auto& st = ramp_state_by_gun_[gun_id];
+    if (!st.initialized) {
+        st.current_a = std::max(0.0, g.i_set_a);
+        st.rate_a_per_s = 0.0;
+        st.initialized = true;
+        st.last_update = now;
+    }
+
+    double dt_s = std::chrono::duration_cast<std::chrono::duration<double>>(now - st.last_update).count();
+    st.last_update = now;
+    if (dt_s <= 0.0) {
+        dt_s = 0.05;
+    }
+    dt_s = std::clamp(dt_s, 0.01, 0.25);
+
+    i_target_a = std::max(0.0, i_target_a);
+    const double up_min = std::max(1e-3, cfg_.ramp_up_min_a_per_s);
+    const double up_max = std::max(up_min, cfg_.ramp_up_max_a_per_s);
+    const double down_min = std::max(1e-3, cfg_.ramp_down_min_a_per_s);
+    const double down_max_normal = std::max(down_min, cfg_.ramp_down_max_a_per_s);
+    const double down_max = emergency_drop
+                                ? std::max(down_max_normal, cfg_.ramp_down_emergency_a_per_s)
+                                : down_max_normal;
+    const double down_min_active = emergency_drop ? std::max(down_min, cfg_.ramp_down_emergency_a_per_s) : down_min;
+    const double response_s = std::max(0.05, cfg_.ramp_response_s);
+    const double jerk_limit = std::max(1.0, cfg_.ramp_jerk_a_per_s2);
+    const double capture_i = std::max(0.01, cfg_.ramp_capture_current_a);
+    const double capture_rate = std::max(0.01, cfg_.ramp_capture_rate_a_per_s);
+
+    const double err = i_target_a - st.current_a;
+    double desired_rate = std::clamp(err / response_s, -down_max, up_max);
+    if (std::fabs(err) > capture_i) {
+        if (desired_rate > 0.0) {
+            desired_rate = std::max(desired_rate, up_min);
+        } else if (desired_rate < 0.0) {
+            desired_rate = std::min(desired_rate, -down_min_active);
+        }
+    }
+
+    const double max_rate_delta = jerk_limit * dt_s;
+    st.rate_a_per_s += std::clamp(desired_rate - st.rate_a_per_s, -max_rate_delta, max_rate_delta);
+    const double prev_current = st.current_a;
+    st.current_a += st.rate_a_per_s * dt_s;
+
+    // Prevent crossing/oscillation around target due to integration + quantization.
+    const double prev_err = i_target_a - prev_current;
+    const double new_err = i_target_a - st.current_a;
+    if (prev_err == 0.0 || (prev_err > 0.0 && new_err < 0.0) || (prev_err < 0.0 && new_err > 0.0)) {
+        st.current_a = i_target_a;
+        st.rate_a_per_s = 0.0;
+    }
+
+    if (std::fabs(i_target_a - st.current_a) <= capture_i && std::fabs(st.rate_a_per_s) <= capture_rate) {
+        st.current_a = i_target_a;
+        st.rate_a_per_s = 0.0;
+    }
+
+    if (i_target_a <= 0.0 && st.current_a < capture_i) {
+        st.current_a = 0.0;
+        if (st.rate_a_per_s < 0.0) {
+            st.rate_a_per_s = 0.0;
+        }
+    }
+
+    return std::max(0.0, st.current_a);
+}
+
+void PowerManager::prune_inactive_ramp_state(const std::vector<int>& active) {
+    std::set<int> active_set(active.begin(), active.end());
+    for (auto it = ramp_state_by_gun_.begin(); it != ramp_state_by_gun_.end();) {
+        if (!active_set.count(it->first)) {
+            it = ramp_state_by_gun_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                               const std::map<int, int>& modules_per_gun,
                               const std::set<int>& reserved_slots,
-                              const std::set<int>& full_island_guns) {
+                              const std::set<int>& full_island_guns,
+                              std::chrono::steady_clock::time_point now) {
     Plan plan = blank_plan();
     next_island_id_ = 1;
 
@@ -486,11 +585,14 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
                                        g.gun_power_limit_kw > 0.0 ? g.gun_power_limit_kw : p_cap_modules});
         const double min_v = g.min_voltage_v > 0.0 ? g.min_voltage_v : cfg_.min_voltage_v_for_div;
         const double max_v = g.max_voltage_v > 0.0 ? g.max_voltage_v : std::numeric_limits<double>::max();
-        double target_v = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : cfg_.default_voltage_v;
-        if (target_v < min_v) target_v = min_v;
-        if (target_v > max_v) target_v = max_v;
+        double v_ceiling = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : cfg_.default_voltage_v;
+        if (v_ceiling < min_v) v_ceiling = min_v;
+        if (v_ceiling > max_v) v_ceiling = max_v;
+        const double v_margin = std::max(0.0, cfg_.voltage_margin_v);
+        double v_target = std::max(min_v, v_ceiling - v_margin);
+        if (v_target > max_v) v_target = max_v;
         island.p_set_kw = p_set;
-        island.v_set_v = std::max(target_v, cfg_.min_voltage_v_for_div);
+        island.v_set_v = std::max(v_target, cfg_.min_voltage_v_for_div);
 
         GunDispatch dispatch;
         dispatch.gun_id = gid;
@@ -503,13 +605,13 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         if (g.gun_current_limit_a > 0.0) {
             i_target = std::min(i_target, g.gun_current_limit_a);
         }
-        const double prev = g.i_set_a;
-        if (cfg_.ramp_step_a > 0.0) {
-            if (i_target > prev + cfg_.ramp_step_a) i_target = prev + cfg_.ramp_step_a;
-            if (i_target < prev - cfg_.ramp_step_a) i_target = prev - cfg_.ramp_step_a;
-        }
-        if (i_target < 0.0) i_target = 0.0;
+        i_target = std::max(0.0, i_target - std::max(0.0, cfg_.current_margin_a));
+        i_target = apply_voltage_guard(g, i_target, v_ceiling);
+        const bool emergency_drop = !g.safety_ok || g.gc_welded || g.mc_welded;
+        i_target = apply_current_ramp(gid, g, i_target, emergency_drop, now);
         dispatch.current_limit_a = i_target;
+        dispatch.p_set_kw = std::min(dispatch.p_set_kw, (dispatch.current_limit_a * v_safe) / 1000.0);
+        island.p_set_kw = dispatch.p_set_kw;
 
         plan.islands.push_back(std::move(island));
         plan.guns.push_back(dispatch);
@@ -523,8 +625,10 @@ Plan PowerManager::compute_plan() {
     const auto active = active_guns();
     next_island_id_ = 1;
     if (active.empty()) {
+        prune_inactive_ramp_state(active);
         return blank_plan();
     }
+    prune_inactive_ramp_state(active);
 
     std::set<int> reserved_slots;
     for (const auto& kv : guns_) {
@@ -590,7 +694,7 @@ Plan PowerManager::compute_plan() {
             full_island_guns.insert(gid);
         }
     }
-    auto plan = build_plan(active, budgets, modules_per_gun, reserved_slots, full_island_guns);
+    auto plan = build_plan(active, budgets, modules_per_gun, reserved_slots, full_island_guns, now);
     apply_hysteresis(plan, now);
     if (!validate_plan(plan)) {
         return blank_plan();
@@ -687,11 +791,15 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
                 if (g_state->gun_current_limit_a > 0.0) {
                     i_target = std::min(i_target, g_state->gun_current_limit_a);
                 }
-                if (i_target < 0.0) i_target = 0.0;
+                i_target = std::max(0.0, i_target - std::max(0.0, cfg_.current_margin_a));
+                i_target = apply_voltage_guard(*g_state, i_target, v_target + std::max(0.0, cfg_.voltage_margin_v));
+                const bool emergency_drop = !g_state->safety_ok || g_state->gc_welded || g_state->mc_welded;
+                i_target = apply_current_ramp(gid, *g_state, i_target, emergency_drop, now);
                 dispatch.p_set_kw = p_set;
                 dispatch.current_limit_a = i_target;
                 dispatch.voltage_set_v = v_target;
-                island_it->p_set_kw = p_set;
+                dispatch.p_set_kw = std::min(dispatch.p_set_kw, (dispatch.current_limit_a * v_safe) / 1000.0);
+                island_it->p_set_kw = dispatch.p_set_kw;
 
                 if (const auto* slot = find_slot(g_state->slot_id)) {
                     plan.gc_commands[slot->gc_id] = prev > 0 ? ContactorState::Closed : ContactorState::Open;

@@ -245,6 +245,19 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.mc_open_current_a = planner_value("mcOpenCurrentA", cfg.mc_open_current_a);
     cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
     cfg.ramp_step_a = planner_value("rampStepA", cfg.ramp_step_a);
+    cfg.planner_voltage_margin_v = planner_value("voltageMarginV", cfg.planner_voltage_margin_v);
+    cfg.planner_current_margin_a = planner_value("currentMarginA", cfg.planner_current_margin_a);
+    cfg.planner_voltage_guard_band_v = planner_value("voltageGuardBandV", cfg.planner_voltage_guard_band_v);
+    cfg.planner_ramp_up_min_a_per_s = planner_value("rampUpMinAps", cfg.planner_ramp_up_min_a_per_s);
+    cfg.planner_ramp_up_max_a_per_s = planner_value("rampUpMaxAps", cfg.planner_ramp_up_max_a_per_s);
+    cfg.planner_ramp_down_min_a_per_s = planner_value("rampDownMinAps", cfg.planner_ramp_down_min_a_per_s);
+    cfg.planner_ramp_down_max_a_per_s = planner_value("rampDownMaxAps", cfg.planner_ramp_down_max_a_per_s);
+    cfg.planner_ramp_down_emergency_a_per_s =
+        planner_value("rampDownEmergencyAps", cfg.planner_ramp_down_emergency_a_per_s);
+    cfg.planner_ramp_jerk_a_per_s2 = planner_value("rampJerkAps2", cfg.planner_ramp_jerk_a_per_s2);
+    cfg.planner_ramp_response_s = planner_value("rampResponseS", cfg.planner_ramp_response_s);
+    cfg.planner_capture_current_a = planner_value("captureCurrentA", cfg.planner_capture_current_a);
+    cfg.planner_capture_rate_a_per_s = planner_value("captureRateAps", cfg.planner_capture_rate_a_per_s);
     cfg.tie_close_max_delta_v = planner_value("tieCloseMaxDeltaV", cfg.tie_close_max_delta_v);
     cfg.switch_max_current_a = planner_value("switchMaxCurrentA", cfg.switch_max_current_a);
     cfg.switch_stable_time_ms = planner_value("switchStableTimeMs", cfg.switch_stable_time_ms);
@@ -307,6 +320,42 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.tie_close_max_delta_v < 0.0) {
         cfg.tie_close_max_delta_v = 0.0;
+    }
+    if (cfg.planner_voltage_margin_v < 0.0) {
+        cfg.planner_voltage_margin_v = 0.0;
+    }
+    if (cfg.planner_current_margin_a < 0.0) {
+        cfg.planner_current_margin_a = 0.0;
+    }
+    if (cfg.planner_voltage_guard_band_v < 0.0) {
+        cfg.planner_voltage_guard_band_v = 0.0;
+    }
+    if (cfg.planner_ramp_up_min_a_per_s <= 0.0) {
+        cfg.planner_ramp_up_min_a_per_s = 20.0;
+    }
+    if (cfg.planner_ramp_down_min_a_per_s <= 0.0) {
+        cfg.planner_ramp_down_min_a_per_s = 100.0;
+    }
+    if (cfg.planner_ramp_up_max_a_per_s < cfg.planner_ramp_up_min_a_per_s) {
+        cfg.planner_ramp_up_max_a_per_s = cfg.planner_ramp_up_min_a_per_s;
+    }
+    if (cfg.planner_ramp_down_max_a_per_s < cfg.planner_ramp_down_min_a_per_s) {
+        cfg.planner_ramp_down_max_a_per_s = cfg.planner_ramp_down_min_a_per_s;
+    }
+    if (cfg.planner_ramp_down_emergency_a_per_s < cfg.planner_ramp_down_max_a_per_s) {
+        cfg.planner_ramp_down_emergency_a_per_s = cfg.planner_ramp_down_max_a_per_s;
+    }
+    if (cfg.planner_ramp_jerk_a_per_s2 <= 0.0) {
+        cfg.planner_ramp_jerk_a_per_s2 = 2000.0;
+    }
+    if (cfg.planner_ramp_response_s <= 0.0) {
+        cfg.planner_ramp_response_s = 0.45;
+    }
+    if (cfg.planner_capture_current_a <= 0.0) {
+        cfg.planner_capture_current_a = 0.2;
+    }
+    if (cfg.planner_capture_rate_a_per_s <= 0.0) {
+        cfg.planner_capture_rate_a_per_s = 1.5;
     }
     if (cfg.switch_max_current_a < 0.0) {
         cfg.switch_max_current_a = 0.0;

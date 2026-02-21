@@ -134,6 +134,18 @@ struct ChargerConfig {
     double mc_open_current_a{1.0};
     double gc_open_current_a{1.0};
     double ramp_step_a{10.0};
+    double planner_voltage_margin_v{2.0};
+    double planner_current_margin_a{0.2};
+    double planner_voltage_guard_band_v{10.0};
+    double planner_ramp_up_min_a_per_s{20.0};
+    double planner_ramp_up_max_a_per_s{250.0};
+    double planner_ramp_down_min_a_per_s{100.0};
+    double planner_ramp_down_max_a_per_s{300.0};
+    double planner_ramp_down_emergency_a_per_s{350.0};
+    double planner_ramp_jerk_a_per_s2{2000.0};
+    double planner_ramp_response_s{0.45};
+    double planner_capture_current_a{0.2};
+    double planner_capture_rate_a_per_s{1.5};
     double tie_close_max_delta_v{20.0};
     double switch_max_current_a{2.0};
     int switch_stable_time_ms{200};
