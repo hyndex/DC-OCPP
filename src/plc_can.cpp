@@ -29,6 +29,8 @@ namespace {
 constexpr int kPollMs = 200;
 constexpr int kTxPresentActiveMs = 100;
 constexpr int kTxPresentIdleMs = 500;
+constexpr int kTxPresentChangeActiveMs = 60;
+constexpr int kTxPresentChangeIdleMs = 250;
 constexpr int kTxLimitsMs = 1500;
 constexpr int kMinTxLimitsMs = 200;
 constexpr int kMinTxPresentMs = 50;
@@ -41,6 +43,7 @@ constexpr int kCpFaultOnDebounceMs = 500;
 constexpr int kCpFaultOffDebounceMs = 1000;
 constexpr uint8_t kHlcMinPowerStage = 9;
 constexpr int kHlcTransitionGraceMs = 1500;
+constexpr double kEvTargetRequestThresholdA = 0.1;
 
 constexpr double kPresentVoltageEps = 1.0;
 constexpr double kPresentCurrentEps = 0.5;
@@ -282,6 +285,8 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         return std::min(max_ms, std::max(min_ms, value));
     };
     tx_present_base_ms_ = clamp_ms(kTxPresentActiveMs, kMinTxPresentMs, kPresentMaxIntervalMs);
+    tx_present_change_active_ms_ = clamp_ms(kTxPresentChangeActiveMs, kMinTxPresentMs, kPresentMaxIntervalMs);
+    tx_present_change_idle_ms_ = clamp_ms(kTxPresentChangeIdleMs, kMinTxPresentMs, kPresentMaxIntervalMs);
     tx_present_idle_ms_ = clamp_ms(kTxPresentIdleMs, kMinTxPresentMs, kPresentMaxIntervalMs);
     tx_limits_base_ms_ = clamp_ms(kTxLimitsMs, kMinTxLimitsMs, kLimitsMaxIntervalMs);
     if (cfg_.autocharge_id_source == "evccid") {
@@ -362,6 +367,8 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         tx_thread_ = std::thread(&PlcCanHardware::tx_loop, this);
         init_ok_ = true;
         EVLOG_info << "PLC CAN TX cadence: present_active=" << tx_present_base_ms_
+                   << "ms present_change_active=" << tx_present_change_active_ms_
+                   << "ms present_change_idle=" << tx_present_change_idle_ms_
                    << "ms present_idle=" << tx_present_idle_ms_
                    << "ms limits=" << tx_limits_base_ms_ << "ms relay=" << kTxRelayMs << "ms";
         EVLOG_info << "PLC CAN compact protocol enabled";
@@ -862,6 +869,12 @@ uint16_t PlcCanHardware::clamp_to_0p5k(double kw) {
     return static_cast<uint16_t>(kw * 2.0 + 0.5);
 }
 
+uint16_t PlcCanHardware::clamp_to_0p1_current(double a) {
+    if (a < 0.0) a = 0.0;
+    a = std::min(a, 204.7); // 11 bits at 0.1 A resolution
+    return static_cast<uint16_t>(a * 10.0 + 0.5);
+}
+
 uint16_t PlcCanHardware::clamp_to_0p2_current(double a) {
     if (a < 0.0) a = 0.0;
     a = std::min(a, 409.4); // 11 bits at 0.2 A resolution
@@ -1060,7 +1073,7 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
     }
 
     const uint16_t v = clamp_to_0p5(v_f);
-    const uint16_t i = clamp_to_0p2_current(i_f);
+    const uint16_t i = clamp_to_0p1_current(i_f);
     const uint16_t p = clamp_to_0p5k(p_kw_f);
     const uint8_t seq = st.seq.fetch_add(1);
     const auto payload = can_contract::build_evse_fast(v, i, p, st.output_enabled, st.regulating, st.fault_bits,
@@ -1076,9 +1089,12 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
     cmp[7] = 0;
     const bool payload_changed = !st.last_present_payload_valid || (cmp != st.last_present_payload);
     const bool active = st.hlc_stage > 0 || st.relay_state_dirty || st.relay_tx_urgent;
-    const int base_ms = active ? tx_present_base_ms_ : tx_present_idle_ms_;
-    const int keepalive_ms = compute_interval_ms(base_ms, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
-    const bool allow_change_tx = elapsed >= keepalive_ms;
+    const int keepalive_base_ms = active ? tx_present_base_ms_ : tx_present_idle_ms_;
+    const int change_base_ms = active ? tx_present_change_active_ms_ : tx_present_change_idle_ms_;
+    const int keepalive_ms =
+        compute_interval_ms(keepalive_base_ms, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
+    const int change_ms = compute_interval_ms(change_base_ms, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
+    const bool allow_change_tx = elapsed >= change_ms;
     const bool allow_keepalive_tx = elapsed >= keepalive_ms;
     if (st.tx_quiet_until.time_since_epoch().count() != 0 && now < st.tx_quiet_until && !st.relay_tx_urgent &&
         !st.relay_state_dirty) {
@@ -2034,7 +2050,8 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
         const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
         const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
-            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > kEvTargetRequestThresholdA &&
+            !st.hlc_charge_complete;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }
@@ -2090,10 +2107,18 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     if (any_relays && st.cfg.require_lock) {
         set_lock_command(st, true);
     }
-    EvseLimits limits{};
-    limits.max_voltage_v = cmd.voltage_set_v > 0.0 ? cmd.voltage_set_v : st.limits.max_voltage_v;
-    limits.max_current_a = cmd.current_limit_a > 0.0 ? cmd.current_limit_a : st.limits.max_current_a;
-    limits.max_power_kw = cmd.power_kw > 0.0 ? cmd.power_kw : st.limits.max_power_kw;
+    EvseLimits limits = st.limits;
+    // Keep EVSE limits stable here. apply_power_command() runs before set_evse_limits() and should not
+    // transiently down-advertise capability from momentary dispatch values.
+    if (!limits.max_voltage_v && cmd.voltage_set_v > 0.0) {
+        limits.max_voltage_v = cmd.voltage_set_v;
+    }
+    if (!limits.max_current_a && cmd.current_limit_a > 0.0) {
+        limits.max_current_a = cmd.current_limit_a;
+    }
+    if (!limits.max_power_kw && cmd.power_kw > 0.0) {
+        limits.max_power_kw = cmd.power_kw;
+    }
     if (!limits_equal(st.limits, limits)) {
         st.limits = limits;
     }
@@ -2154,7 +2179,8 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
         const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
         const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_requesting =
-            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > 0.5 && !st.hlc_charge_complete;
+            ev_targets_fresh && cp_power_ready && st.ev_target_current_a > kEvTargetRequestThresholdA &&
+            !st.hlc_charge_complete;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }

@@ -76,16 +76,34 @@ constexpr double MAXWELL_LIMIT_MISMATCH_ABS_DELTA = 0.25;
 constexpr double MAXWELL_LIMIT_MISMATCH_REL_DELTA = 0.35;
 constexpr auto MODULE_IDLE_STATUS_POLL_INTERVAL = std::chrono::milliseconds(800);
 constexpr auto MODULE_IDLE_TELEMETRY_POLL_INTERVAL = std::chrono::milliseconds(1500);
-constexpr auto MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL = std::chrono::milliseconds(2000);
-constexpr auto MODULE_OFF_STATE_RETRY_INTERVAL = std::chrono::milliseconds(800);
+// Keep OFF-command keepalive sparse in lab to avoid unnecessary command churn on inactive modules.
+constexpr auto MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL = std::chrono::milliseconds(10000);
+constexpr auto MODULE_OFF_STATE_RETRY_INTERVAL = std::chrono::milliseconds(2000);
 constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(8);
 constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(8);
 constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
 constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
+constexpr int MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS = 180;
+// Keep last valid current telemetry through short module/CAN jitter windows.
+constexpr int MODULE_CURRENT_VALID_HOLD_WINDOWS = 8;
+constexpr int MODULE_CURRENT_VALID_HOLD_MIN_MS = 800;
+constexpr int MODULE_CURRENT_VALID_HOLD_MAX_MS = 6000;
 
 inline bool startup_load_requested(double current_a, double power_kw) {
     return current_a > MODULE_START_FAULT_MIN_CURRENT_A ||
            power_kw > MODULE_START_FAULT_MIN_POWER_KW;
+}
+
+inline std::chrono::milliseconds current_priority_poll_interval(std::chrono::milliseconds poll_interval) {
+    return std::chrono::milliseconds(
+        std::max<int64_t>(MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS, poll_interval.count()));
+}
+
+inline std::chrono::milliseconds current_valid_hold_window(std::chrono::milliseconds poll_interval) {
+    const int64_t raw_ms = poll_interval.count() * MODULE_CURRENT_VALID_HOLD_WINDOWS;
+    const int hold_ms = static_cast<int>(
+        std::clamp<int64_t>(raw_ms, MODULE_CURRENT_VALID_HOLD_MIN_MS, MODULE_CURRENT_VALID_HOLD_MAX_MS));
+    return std::chrono::milliseconds(hold_ms);
 }
 
 constexpr uint32_t RECTIFIER_STATUS_IGNORE_MASK =
@@ -933,7 +951,8 @@ public:
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
-        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
+        // Keep command granularity aligned with the 0.1A EV/PLC contract.
+        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
         const bool power_changed = std::fabs(sp.power_kw - last_sent_.power_kw) > 0.1;
         const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
                                       (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
@@ -1180,8 +1199,7 @@ public:
         if (run_context) {
             // Guarantee periodic current-register polls even under heavy status/voltage polling.
             // This prevents stale 0A telemetry from persisting during active charging.
-            const auto current_overdue_interval =
-                std::chrono::milliseconds(std::max<int64_t>(250, poll_interval.count() * 2));
+            const auto current_overdue_interval = current_priority_poll_interval(poll_interval);
             if (due(last_poll_current_, current_overdue_interval) && send_read(0x0002)) {
                 last_poll_current_ = now;
                 poll_rr_cursor_ = 3; // continue RR after the "current" task
@@ -1729,7 +1747,8 @@ public:
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
-        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
+        // Keep command granularity aligned with the 0.1A EV/PLC contract.
+        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
         const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
                                       (!std::isfinite(sp.current_a) || sp.current_a < 0.0);
         if (invalid_setpoint) {
@@ -1844,8 +1863,7 @@ public:
 
         bool sent_priority_current = false;
         if (run_context) {
-            const auto current_overdue_interval =
-                std::chrono::milliseconds(std::max<int64_t>(250, poll_interval.count() * 2));
+            const auto current_overdue_interval = current_priority_poll_interval(poll_interval);
             if (due(last_poll_current_, current_overdue_interval) && send_read(1)) {
                 last_poll_current_ = now;
                 poll_rr_cursor_ = 3; // continue RR after the "current" task
@@ -2128,7 +2146,8 @@ public:
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
-        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.5;
+        // Keep command granularity aligned with the 0.1A EV/PLC contract.
+        const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
         const bool module_off = last_state_ != TONHE_STATE_ON;
         const bool off_keepalive_due =
             !sp.enable &&
@@ -2327,6 +2346,14 @@ private:
 
 class PowerModuleControllerImpl {
 public:
+    struct CurrentHoldState {
+        bool valid{false};
+        double current_a{0.0};
+        int expected_count{0};
+        std::chrono::steady_clock::time_point sampled_at{};
+        std::chrono::steady_clock::time_point hold_until{};
+    };
+
     PowerModuleControllerImpl() = default;
     explicit PowerModuleControllerImpl(std::vector<ModuleSpec> specs) { set_modules(std::move(specs)); }
 
@@ -2348,6 +2375,7 @@ public:
         modules_.clear();
         slot_index_.clear();
         poll_rr_cursor_by_iface_.clear();
+        current_hold_by_slot_.clear();
         std::set<std::string> ifaces;
         for (auto& spec : specs) {
             if (spec.type.empty()) {
@@ -2447,6 +2475,7 @@ public:
         double current_sum = 0.0;
         int current_expected_count = 0;
         int current_fresh_count = 0;
+        int max_poll_interval_ms = 100;
         bool any_telem = false;
         bool any_fresh = false;
         for (auto idx : it->second) {
@@ -2501,6 +2530,7 @@ public:
                 voltage_sum += telem.voltage_v;
                 voltage_count++;
                 current_expected_count++;
+                max_poll_interval_ms = std::max(max_poll_interval_ms, std::max(100, mod.spec.poll_interval_ms));
                 if (current_fresh) {
                     current_sum += telem.current_a;
                     current_fresh_count++;
@@ -2511,10 +2541,38 @@ public:
             snap.telemetry_valid = true;
             snap.voltage_v = voltage_sum / static_cast<double>(voltage_count);
         }
-        if (snap.telemetry_valid && current_expected_count > 0 && current_fresh_count == current_expected_count) {
-            snap.current_valid = true;
-            snap.current_a = current_sum;
-            snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
+        if (snap.telemetry_valid && current_expected_count > 0) {
+            auto& hold = current_hold_by_slot_[slot_id];
+            if (current_fresh_count == current_expected_count) {
+                snap.current_valid = true;
+                snap.current_a = current_sum;
+                snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
+                hold.valid = true;
+                hold.current_a = snap.current_a;
+                hold.expected_count = current_expected_count;
+                hold.sampled_at = now;
+                hold.hold_until = now + current_valid_hold_window(std::chrono::milliseconds(max_poll_interval_ms));
+            } else {
+                const int missing_count = current_expected_count - current_fresh_count;
+                const bool one_module_late = missing_count > 0 && missing_count <= 1;
+                const bool all_modules_late = missing_count == current_expected_count;
+                const bool expected_similar =
+                    hold.expected_count <= 0 || std::abs(hold.expected_count - current_expected_count) <= 1;
+                const bool hold_active = hold.valid && now <= hold.hold_until;
+                if (hold_active && expected_similar && ((one_module_late && current_fresh_count > 0) || all_modules_late)) {
+                    snap.current_valid = true;
+                    // Keep the last coherent current sample during short read gaps.
+                    snap.current_a = hold.current_a;
+                    snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
+                } else {
+                    hold.valid = false;
+                    hold.current_a = 0.0;
+                    hold.sampled_at = std::chrono::steady_clock::time_point{};
+                }
+                hold.expected_count = current_expected_count;
+            }
+        } else {
+            current_hold_by_slot_.erase(slot_id);
         }
         snap.health_valid = any_fresh;
         return snap;
@@ -2593,6 +2651,7 @@ private:
     std::vector<ModuleRuntime> modules_;
     std::map<int, std::vector<size_t>> slot_index_;
     std::map<std::string, size_t> poll_rr_cursor_by_iface_;
+    mutable std::unordered_map<int, CurrentHoldState> current_hold_by_slot_;
     ModuleCanTrafficPolicy policy_{};
 };
 } // namespace

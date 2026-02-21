@@ -181,7 +181,7 @@ inline std::array<uint8_t, 8> build_plc_tlm_v3(uint8_t cp_state_enum,
                                                bool charge_complete,
                                                uint8_t limits_rx_count_lsb,
                                                uint16_t ev_target_voltage_1v,
-                                               uint16_t ev_target_current_0p5a,
+                                               uint16_t ev_target_current_0p1a,
                                                bool use_crc8) {
     std::array<uint8_t, 8> data{};
     uint64_t packed = 0;
@@ -200,7 +200,7 @@ inline std::array<uint8_t, 8> build_plc_tlm_v3(uint8_t cp_state_enum,
     packed |= static_cast<uint64_t>(charge_complete ? 1u : 0u) << 26;
     packed |= static_cast<uint64_t>(limits_rx_count_lsb) << 27;
     packed |= static_cast<uint64_t>(ev_target_voltage_1v & 0x03FFu) << 35;
-    packed |= static_cast<uint64_t>(ev_target_current_0p5a & 0x03FFu) << 45;
+    packed |= static_cast<uint64_t>(ev_target_current_0p1a & 0x03FFu) << 45;
     for (int i = 0; i < 7; ++i) {
         data[i] = static_cast<uint8_t>((packed >> (i * 8)) & 0xFFu);
     }
@@ -241,14 +241,15 @@ inline PlcTlmV3 decode_plc_tlm_v3(const uint8_t in[8], bool use_crc8) {
     st.charge_complete = ((packed >> 26) & 0x01u) != 0;
     st.limits_rx_count_lsb = static_cast<uint8_t>((packed >> 27) & 0xFFu);
     const uint16_t v_1v = static_cast<uint16_t>((packed >> 35) & 0x03FFu);
-    const uint16_t i_0p5a = static_cast<uint16_t>((packed >> 45) & 0x03FFu);
+    // PLC telemetry encodes target current in 0.1A steps in a 10-bit field (0..102.3A).
+    const uint16_t i_0p1a = static_cast<uint16_t>((packed >> 45) & 0x03FFu);
     st.ev_target_voltage_v = static_cast<double>(v_1v);
-    st.ev_target_current_a = static_cast<double>(i_0p5a) * 0.5;
+    st.ev_target_current_a = static_cast<double>(i_0p1a) * 0.1;
     return st;
 }
 
 inline std::array<uint8_t, 8> build_evse_fast(uint16_t present_v_0p5,
-                                              uint16_t present_i_0p2,
+                                              uint16_t present_i_0p1,
                                               uint16_t present_p_0p5,
                                               bool output_enabled,
                                               bool regulating,
@@ -263,7 +264,7 @@ inline std::array<uint8_t, 8> build_evse_fast(uint16_t present_v_0p5,
     std::array<uint8_t, 8> data{};
     uint64_t packed = 0;
     packed |= static_cast<uint64_t>(present_v_0p5 & 0x07FFu) << 0;
-    packed |= static_cast<uint64_t>(present_i_0p2 & 0x07FFu) << 11;
+    packed |= static_cast<uint64_t>(present_i_0p1 & 0x07FFu) << 11;
     packed |= static_cast<uint64_t>(present_p_0p5 & 0x01FFu) << 22;
     packed |= static_cast<uint64_t>(fault_bits & 0x3Fu) << 31;
     packed |= static_cast<uint64_t>(output_enabled ? 1u : 0u) << 37;
@@ -372,4 +373,3 @@ inline IdentitySegment decode_identity_segment(const uint8_t in[8]) {
 }
 
 } // namespace charger::can_contract
-

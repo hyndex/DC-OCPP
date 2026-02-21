@@ -246,6 +246,8 @@ private:
     int connection_timeout_s_{0};
     int tx_limits_base_ms_{500};
     int tx_present_base_ms_{100};
+    int tx_present_change_active_ms_{60};
+    int tx_present_change_idle_ms_{250};
     int tx_present_idle_ms_{500};
     std::atomic<int> backpressure_level_{0};
     std::atomic<uint64_t> backpressure_until_ms_{0};
@@ -313,6 +315,7 @@ private:
                                       std::vector<uint8_t>& out);
     static uint16_t clamp_to_0p5(double v);
     static uint16_t clamp_to_0p5k(double kw);
+    static uint16_t clamp_to_0p1_current(double a);
     static uint16_t clamp_to_0p2_current(double a);
     int compute_interval_ms(int base_ms, int min_ms, int max_ms, int backoff_factor) const;
     int backpressure_factor(uint64_t now_ms);

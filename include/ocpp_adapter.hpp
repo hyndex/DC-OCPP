@@ -347,6 +347,8 @@ private:
     std::map<int, double> profile_current_limit_a_;
     std::map<int, double> profile_power_limit_kw_;
     std::map<int, double> last_energy_wh_;
+    std::map<int, double> fallback_energy_wh_;
+    std::map<int, std::chrono::steady_clock::time_point> fallback_energy_last_update_;
     std::map<int, double> last_meter_sent_wh_;
     std::map<int, std::chrono::steady_clock::time_point> last_meter_sent_time_;
     std::map<int, std::chrono::steady_clock::time_point> cp_fault_since_;
@@ -378,6 +380,8 @@ private:
     std::map<int, AuthorizationState> auth_state_cache_;
     std::map<int, std::chrono::steady_clock::time_point> auth_denied_since_;
     std::map<int, std::string> last_denied_token_;
+    std::map<int, std::chrono::steady_clock::time_point> autocharge_retry_not_before_;
+    std::map<int, int> autocharge_retry_fail_count_;
     std::atomic<bool> autocharge_enabled_{true};
     std::atomic<bool> boot_accepted_{false};
     std::atomic<bool> pending_status_refresh_{false};
@@ -405,6 +409,9 @@ private:
     bool handle_stop_transaction(std::int32_t connector, ocpp::v16::Reason reason);
     void start_metering_threads();
     void metering_loop(std::int32_t connector);
+    void apply_energy_fallback(std::int32_t connector, const GunStatus& status,
+                               ocpp::Measurement& measurement,
+                               const std::chrono::steady_clock::time_point& now);
     std::string make_session_id() const;
     void prepare_security_files() const;
     void seed_default_evse_limits();

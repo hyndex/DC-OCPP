@@ -57,6 +57,10 @@ constexpr std::chrono::milliseconds STATUS_REFRESH_MIN_GAP(2000);
 constexpr std::chrono::milliseconds POST_STOP_HOLD_MS(5000);
 constexpr std::chrono::milliseconds POST_STOP_MAX_HOLD_MS(30000);
 constexpr std::chrono::milliseconds RESERVATION_CHECK_INTERVAL(1000);
+// Safety-first power clamp when EV withdraws CP ready (C/D -> B/A).
+// Keep this short to tolerate brief CP jitter while avoiding sustained output
+// after the vehicle has de-asserted ready-to-charge.
+constexpr std::chrono::milliseconds CP_NOT_READY_POWER_CUT_DELAY_MS(500);
 
 template <typename TimePoint>
 std::chrono::steady_clock::time_point to_steady_from_utc(const TimePoint& t_utc) {
@@ -286,8 +290,9 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
     const bool hlc_power_phase =
         status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
     if (!hlc_power_phase) {
+        constexpr double kEvCurrentRequestThresholdA = 0.1;
         const bool ev_current_req =
-            status.target_current_a && status.target_current_a.value() > 0.5;
+            status.target_current_a && status.target_current_a.value() > kEvCurrentRequestThresholdA;
         const bool ev_voltage_req =
             status.target_voltage_v && status.target_voltage_v.value() > 10.0;
         return ev_current_req && ev_voltage_req;
@@ -313,11 +318,13 @@ bool is_hlc_precharge_phase(const GunStatus& status) {
 }
 
 bool evse_limit_ack_watchdog_relevant(const GunStatus& status, bool lock_required) {
+    constexpr double kEvCurrentRequestThresholdA = 0.1;
     const bool hlc_power_phase =
         status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
     const bool cp_power_requesting = status.cp_state == 'C' || status.cp_state == 'D';
     const bool power_requested = power_delivery_requested(status, lock_required);
-    const bool ev_current_requested = status.target_current_a && status.target_current_a.value() > 0.5;
+    const bool ev_current_requested =
+        status.target_current_a && status.target_current_a.value() > kEvCurrentRequestThresholdA;
     const bool ev_current_measured = status.present_current_a && std::fabs(status.present_current_a.value()) > 1.0;
     const bool ev_power_measured = status.present_power_w && std::fabs(status.present_power_w.value()) > 500.0;
     return status.relay_closed && cp_power_requesting && hlc_power_phase && power_requested &&
@@ -1514,6 +1521,61 @@ void OcppAdapter::start_metering_threads() {
     }
 }
 
+void OcppAdapter::apply_energy_fallback(std::int32_t connector, const GunStatus& status,
+                                        ocpp::Measurement& measurement,
+                                        const std::chrono::steady_clock::time_point& now) {
+    double measured_wh = measurement.power_meter.energy_Wh_import.total;
+    if (!std::isfinite(measured_wh) || measured_wh < 0.0) {
+        measured_wh = 0.0;
+    }
+
+    double power_w = extract_total_value(measurement.power_meter.power_W);
+    if (power_w <= 1.0) {
+        power_w = extract_dc_value(measurement.power_meter.power_W).value_or(power_w);
+    }
+    if ((!std::isfinite(power_w) || power_w <= 1.0) && status.present_power_w) {
+        power_w = std::max(power_w, status.present_power_w.value());
+    }
+    if ((!std::isfinite(power_w) || power_w <= 1.0) && status.present_voltage_v && status.present_current_a) {
+        power_w = status.present_voltage_v.value() * status.present_current_a.value();
+    }
+    if (!std::isfinite(power_w) || power_w < 0.0) {
+        power_w = 0.0;
+    }
+
+    std::lock_guard<std::mutex> lock(meter_mutex_);
+    auto& fallback_wh = fallback_energy_wh_[connector];
+    auto& last_ts = fallback_energy_last_update_[connector];
+    if (last_ts.time_since_epoch().count() == 0) {
+        last_ts = now;
+        fallback_wh = std::max(fallback_wh, measured_wh);
+    } else {
+        auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
+        if (dt_ms < 0) {
+            dt_ms = 0;
+        }
+        dt_ms = std::min<int64_t>(dt_ms, 2000);
+        last_ts = now;
+        const bool delivery_context =
+            status.relay_closed || status.hlc_power_ready ||
+            (status.target_current_a && status.target_current_a.value() > 0.5);
+        if (delivery_context && power_w > 1.0 && dt_ms > 0) {
+            fallback_wh += (power_w * static_cast<double>(dt_ms)) / 3600000.0;
+        }
+        fallback_wh = std::max(fallback_wh, measured_wh);
+    }
+
+    // Prefer hardware meter when it reports a sane non-zero value. Use fallback only
+    // when meter energy is absent/zero so OCPP meterStart/meterStop do not stick at 0.
+    if (measured_wh > 0.01) {
+        measurement.power_meter.energy_Wh_import.total = measured_wh;
+    } else if (fallback_wh > 0.01) {
+        measurement.power_meter.energy_Wh_import.total = fallback_wh;
+    } else {
+        measurement.power_meter.energy_Wh_import.total = 0.0;
+    }
+}
+
 void OcppAdapter::metering_loop(std::int32_t connector) {
     int current_interval_s = meter_interval_seconds_for_connector(connector);
     auto meter_period = std::chrono::seconds(std::max(1, current_interval_s));
@@ -1521,13 +1583,16 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
     auto next_meter_push = std::chrono::steady_clock::now();
     bool telemetry_stale_active = false;
     std::chrono::steady_clock::time_point telemetry_stale_log_ts{};
-    std::chrono::steady_clock::time_point telemetry_stale_disable_ts{};
+    std::chrono::steady_clock::time_point telemetry_stale_fail_since{};
     std::chrono::steady_clock::time_point telemetry_overdue_since{};
     std::chrono::steady_clock::time_point charge_complete_since{};
     std::chrono::steady_clock::time_point evse_limit_ack_stale_since{};
+    std::chrono::steady_clock::time_point evse_limit_ack_stale_log_ts{};
     std::chrono::steady_clock::time_point module_degraded_since{};
     std::chrono::steady_clock::time_point module_degraded_clear_since{};
+    std::chrono::steady_clock::time_point module_unavailable_since{};
     std::chrono::steady_clock::time_point suspended_no_power_since{};
+    std::chrono::steady_clock::time_point suspended_no_power_log_ts{};
     bool module_degraded_latched = false;
 
     while (running_) {
@@ -1684,6 +1749,7 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             bool fault = false;
 
             auto measurement = hardware_->sample_meter(connector);
+            apply_energy_fallback(connector, status, measurement, now);
             // Enrich metering with temperatures derived from PLC/module telemetry when available.
             auto add_temp = [&](double temp_c, const std::string& location) {
                 if (!std::isfinite(temp_c)) return;
@@ -1741,15 +1807,24 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     }
                 }
                 if (telemetry_mismatch_trip) {
-                    EVLOG_error << "Telemetry mismatch on connector " << connector
-                                << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
-                                << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")"
-                                << " mismatch_axes=" << mismatch_axes
-                                << " mismatch_count=" << mismatch_count;
-                    finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                    disable_local("telemetry_mismatch");
-                    had_session = false;
-                    fault = true;
+                    if (!cfg_.lab_bypass) {
+                        EVLOG_error << "Telemetry mismatch on connector " << connector
+                                    << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
+                                    << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")"
+                                    << " mismatch_axes=" << mismatch_axes
+                                    << " mismatch_count=" << mismatch_count;
+                        finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
+                        disable_local("telemetry_mismatch");
+                        had_session = false;
+                        fault = true;
+                    } else {
+                        EVLOG_warning << "Telemetry mismatch observed on connector " << connector
+                                      << " meas(V=" << v_meas << " I=" << i_meas << " P=" << p_meas << ")"
+                                      << " status(V=" << v_stat << " I=" << i_stat << " P=" << p_stat << ")"
+                                      << " mismatch_axes=" << mismatch_axes
+                                      << " mismatch_count=" << mismatch_count
+                                      << " -- lab_bypass=1, keeping session active";
+                    }
                 }
             } else {
                 std::lock_guard<std::mutex> lock(telemetry_mutex_);
@@ -1863,6 +1938,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         set_auth_state(connector, AuthorizationState::Pending);
                     } else {
                         sessions_[connector] = s;
+                        {
+                            std::lock_guard<std::mutex> meter_lock(meter_mutex_);
+                            fallback_energy_wh_[connector] = std::max(0.0, s.meter_start_wh);
+                            fallback_energy_last_update_[connector] = now;
+                        }
                         session_start_id = s.session_id;
                         session_start_reason = s.authorized ? ocpp::SessionStartedReason::Authorized
                                                             : ocpp::SessionStartedReason::EVConnected;
@@ -1914,6 +1994,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 }
                 if (!status.plugged_in && it == sessions_.end()) {
                     set_auth_state(connector, AuthorizationState::Unknown);
+                    autocharge_retry_not_before_.erase(connector);
+                    autocharge_retry_fail_count_.erase(connector);
                 }
                 if (pending_changed) {
                     persist_pending = true;
@@ -2220,20 +2302,34 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 module_missing_since_.erase(connector);
             }
             if (!fault && module_unavailable_fault) {
-                bool already_faulted = false;
-                {
-                    std::lock_guard<std::mutex> lock(state_mutex_);
-                    already_faulted = connector_faulted_[connector];
-                    connector_faulted_[connector] = true;
+                constexpr auto kModuleUnavailableGrace = std::chrono::seconds(30);
+                if (module_unavailable_since.time_since_epoch().count() == 0) {
+                    module_unavailable_since = now;
                 }
-                if (!already_faulted) {
+                if ((now - module_unavailable_since) >= kModuleUnavailableGrace) {
                     EVLOG_error << "No healthy power modules available on connector " << connector
-                                << " during precharge/power delivery; stopping session";
-                    finish_and_mark(ocpp::v16::Reason::Other, std::nullopt);
+                                << " for >" << std::chrono::duration_cast<std::chrono::seconds>(kModuleUnavailableGrace).count()
+                                << "s during precharge/power delivery; stopping session";
+                    finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
                     disable_local("modules_unavailable");
                     had_session = false;
+                    fault = true;
+                    module_unavailable_since = std::chrono::steady_clock::time_point{};
+                } else {
+                    static std::map<int, std::chrono::steady_clock::time_point> last_module_fault_log;
+                    auto& last_log = last_module_fault_log[connector];
+                    if (last_log.time_since_epoch().count() == 0 ||
+                        (now - last_log) > std::chrono::seconds(2)) {
+                        const auto age_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - module_unavailable_since).count();
+                        EVLOG_warning << "No healthy power modules available on connector " << connector
+                                      << " during precharge/power delivery; waiting for recovery (age_ms=" << age_ms
+                                      << ")";
+                        last_log = now;
+                    }
                 }
-                fault = true;
+            } else {
+                module_unavailable_since = std::chrono::steady_clock::time_point{};
             }
             // Lock fault: if lock disengaged while plug-in/session active, treat as fault
             if (!fault && lock_required && !status.lock_engaged && (status.plugged_in || had_session)) {
@@ -2263,9 +2359,9 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (!target_recent && no_output) {
                     if (suspended_no_power_since.time_since_epoch().count() == 0) {
                         suspended_no_power_since = now;
-                    } else if ((now - suspended_no_power_since) >= std::chrono::seconds(20)) {
+                    } else if ((now - suspended_no_power_since) >= std::chrono::seconds(90)) {
                         EVLOG_info << "Connector " << connector
-                                   << " stopping transaction after sustained SuspendedEV with no output"
+                                   << " stopping transaction after sustained SuspendedEV/no-output"
                                    << " cp=" << status.cp_state
                                    << " relay=" << (status.relay_closed ? "1" : "0")
                                    << " present_I=" << present_i_abs
@@ -2279,12 +2375,28 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                         had_session = false;
                         session = ActiveSession{};
                         suspended_no_power_since = std::chrono::steady_clock::time_point{};
+                        suspended_no_power_log_ts = std::chrono::steady_clock::time_point{};
+                    } else if (suspended_no_power_log_ts.time_since_epoch().count() == 0 ||
+                               (now - suspended_no_power_log_ts) >= std::chrono::seconds(10)) {
+                        const auto age_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - suspended_no_power_since).count();
+                        EVLOG_warning << "Connector " << connector
+                                      << " sustained SuspendedEV/no-output observed"
+                                      << " cp=" << status.cp_state
+                                      << " relay=" << (status.relay_closed ? "1" : "0")
+                                      << " present_I=" << present_i_abs
+                                      << " present_P=" << present_p_abs
+                                      << " age_ms=" << age_ms
+                                      << " -- waiting for recovery";
+                        suspended_no_power_log_ts = now;
                     }
                 } else {
                     suspended_no_power_since = std::chrono::steady_clock::time_point{};
+                    suspended_no_power_log_ts = std::chrono::steady_clock::time_point{};
                 }
             } else {
                 suspended_no_power_since = std::chrono::steady_clock::time_point{};
+                suspended_no_power_log_ts = std::chrono::steady_clock::time_point{};
             }
             if (push_meter_now) {
                 bool send_meter = false;
@@ -2495,83 +2607,110 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (stale) {
                     if (evse_limit_ack_stale_since.time_since_epoch().count() == 0) {
                         evse_limit_ack_stale_since = now;
+                        evse_limit_ack_stale_log_ts = std::chrono::steady_clock::time_point{};
                     }
                     const auto stale_span = now - evse_limit_ack_stale_since;
                     // Require a second full watchdog window before hard-stopping to avoid false trips from
                     // short PLC receive gaps while preserving fail-safe behavior on persistent loss of ACKs.
                     const bool stale_persistent = stale_span > ack_timeout;
                     if (stale_persistent) {
+                        constexpr auto kAckStaleStopDelay = std::chrono::seconds(45);
                         const auto stale_for_ms =
                             std::chrono::duration_cast<std::chrono::milliseconds>(stale_span).count();
-                        if (ack_after_tx_start) {
-                            EVLOG_error << "EVSE limit ACK stale on connector " << connector
-                                        << " age=" << age_ms
-                                        << "ms stale_for=" << stale_for_ms
-                                        << "ms ack_count=" << status.evse_limit_ack_count
-                                        << " -- stopping session for safety";
-                        } else {
-                            EVLOG_error << "EVSE limit ACK missing since transaction start on connector " << connector
-                                        << " age=" << age_ms
-                                        << "ms stale_for=" << stale_for_ms
-                                        << "ms ack_count=" << status.evse_limit_ack_count
-                                        << " -- stopping session for safety";
+                        if (evse_limit_ack_stale_log_ts.time_since_epoch().count() == 0 ||
+                            (now - evse_limit_ack_stale_log_ts) >= std::chrono::seconds(2)) {
+                            if (ack_after_tx_start) {
+                                EVLOG_warning << "EVSE limit ACK stale on connector " << connector
+                                              << " age=" << age_ms
+                                              << "ms stale_for=" << stale_for_ms
+                                              << "ms ack_count=" << status.evse_limit_ack_count
+                                              << " -- waiting for recovery";
+                            } else {
+                                EVLOG_warning << "EVSE limit ACK missing since transaction start on connector "
+                                              << connector
+                                              << " age=" << age_ms
+                                              << "ms stale_for=" << stale_for_ms
+                                              << "ms ack_count=" << status.evse_limit_ack_count
+                                              << " -- waiting for recovery";
+                            }
+                            evse_limit_ack_stale_log_ts = now;
                         }
                         {
                             std::lock_guard<std::mutex> lock(state_mutex_);
                             limit_ack_stale_events_[connector]++;
                         }
-                        finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                        disable_local("evse_limit_ack_stale");
-                        had_session = false;
-                        fault = true;
-                        evse_limit_ack_stale_since = std::chrono::steady_clock::time_point{};
+                        if (stale_span >= kAckStaleStopDelay) {
+                            EVLOG_error << "EVSE limit ACK stale too long on connector " << connector
+                                        << " stale_for_ms=" << stale_for_ms
+                                        << " -- stopping session";
+                            finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
+                            disable_local("evse_limit_ack_stale");
+                            had_session = false;
+                            fault = true;
+                            evse_limit_ack_stale_since = std::chrono::steady_clock::time_point{};
+                            evse_limit_ack_stale_log_ts = std::chrono::steady_clock::time_point{};
+                        }
                     }
                 } else {
                     evse_limit_ack_stale_since = std::chrono::steady_clock::time_point{};
+                    evse_limit_ack_stale_log_ts = std::chrono::steady_clock::time_point{};
                 }
             } else {
                 evse_limit_ack_stale_since = std::chrono::steady_clock::time_point{};
+                evse_limit_ack_stale_log_ts = std::chrono::steady_clock::time_point{};
             }
 
             if (telemetry_stale) {
-                fault = true;
                 if (!telemetry_stale_active) {
                     telemetry_stale_active = true;
                     telemetry_stale_log_ts = now;
-                    telemetry_stale_disable_ts = now;
-                    EVLOG_error << "Telemetry stale on connector " << connector
-                                << " age=" << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
-                                << "ms timeout=" << telemetry_timeout(cfg_).count()
-                                << "ms -- forcing stop for safety";
+                    telemetry_stale_fail_since = now;
+                    EVLOG_warning << "Telemetry stale on connector " << connector
+                                  << " age="
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
+                                  << "ms timeout=" << telemetry_timeout(cfg_).count()
+                                  << "ms -- keeping session alive and waiting for recovery";
                     {
                         std::lock_guard<std::mutex> lock(state_mutex_);
                         telemetry_timeout_events_[connector]++;
                     }
-                    if (had_session) {
-                        finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                        had_session = false;
-                    }
+                } else if (telemetry_stale_log_ts.time_since_epoch().count() == 0 ||
+                           (now - telemetry_stale_log_ts) > std::chrono::seconds(10)) {
+                    telemetry_stale_log_ts = now;
+                    EVLOG_warning << "Telemetry still stale on connector " << connector
+                                  << " age="
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
+                                  << "ms timeout=" << telemetry_timeout(cfg_).count()
+                                  << "ms -- waiting for recovery";
+                }
+                constexpr auto kTelemetryStaleStopDelay = std::chrono::seconds(25);
+                constexpr double kTelemetryStaleCurrentReqA = 1.0;
+                const bool cp_power_ready = status.cp_state == 'C' || status.cp_state == 'D';
+                const bool relay_or_power_phase = status.relay_closed || cp_power_ready;
+                const bool current_requested =
+                    status.target_current_a && status.target_current_a.value() >= kTelemetryStaleCurrentReqA;
+                if (!fault && had_session && session.transaction_started && relay_or_power_phase && current_requested &&
+                    telemetry_stale_fail_since.time_since_epoch().count() != 0 &&
+                    (now - telemetry_stale_fail_since) >= kTelemetryStaleStopDelay) {
+                    EVLOG_error << "Telemetry stale too long on connector " << connector
+                                << " stale_for_ms="
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(now - telemetry_stale_fail_since).count()
+                                << " -- stopping session";
+                    finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
                     disable_local("telemetry_stale");
-                } else {
-                    if (telemetry_stale_log_ts.time_since_epoch().count() == 0 ||
-                        (now - telemetry_stale_log_ts) > std::chrono::seconds(10)) {
-                        telemetry_stale_log_ts = now;
-                        EVLOG_error << "Telemetry still stale on connector " << connector
-                                    << " age="
-                                    << std::chrono::duration_cast<std::chrono::milliseconds>(telemetry_age).count()
-                                    << "ms timeout=" << telemetry_timeout(cfg_).count() << "ms";
-                    }
-                    if (telemetry_stale_disable_ts.time_since_epoch().count() == 0 ||
-                        (now - telemetry_stale_disable_ts) > std::chrono::seconds(1)) {
-                        telemetry_stale_disable_ts = now;
-                        disable_local("telemetry_stale");
-                    }
+                    had_session = false;
+                    fault = true;
+                    telemetry_stale_active = false;
+                    telemetry_stale_log_ts = std::chrono::steady_clock::time_point{};
+                    telemetry_stale_fail_since = std::chrono::steady_clock::time_point{};
                 }
             } else if (telemetry_stale_active) {
                 telemetry_stale_active = false;
                 telemetry_stale_log_ts = std::chrono::steady_clock::time_point{};
-                telemetry_stale_disable_ts = std::chrono::steady_clock::time_point{};
+                telemetry_stale_fail_since = std::chrono::steady_clock::time_point{};
                 EVLOG_info << "Telemetry recovered on connector " << connector;
+            } else {
+                telemetry_stale_fail_since = std::chrono::steady_clock::time_point{};
             }
 
             if (!fault && had_session && session.transaction_started && status.hlc_charge_complete) {
@@ -2742,7 +2881,8 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
 
     double energy_wh = 0.0;
     if (was_started && charge_point_) {
-        const auto measurement = hardware_->sample_meter(connector);
+        auto measurement = hardware_->sample_meter(connector);
+        apply_energy_fallback(connector, stop_status, measurement, stop_now);
         energy_wh = measurement.power_meter.energy_Wh_import.total;
         if (!std::isfinite(energy_wh) || energy_wh < 0.0) {
             energy_wh = 0.0;
@@ -2763,11 +2903,17 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         }
         charge_point_->on_transaction_stopped(connector, session_id, reason, ocpp::DateTime(),
                                               energy_wh, id_tag_end, std::nullopt);
+        {
+            std::lock_guard<std::mutex> lock(meter_mutex_);
+            fallback_energy_wh_[connector] = std::max(0.0, energy_wh);
+            fallback_energy_last_update_[connector] = stop_now;
+        }
     }
 
     std::string stop_origin;
     std::chrono::steady_clock::time_point cp_drop_time{};
     std::string cp_drop_reason;
+    std::string local_fault_reason;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto origin_it = stop_origin_hint_.find(connector);
@@ -2784,6 +2930,10 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
         if (cp_reason_it != last_cp_request_drop_reason_.end()) {
             cp_drop_reason = cp_reason_it->second;
             last_cp_request_drop_reason_.erase(cp_reason_it);
+        }
+        auto local_fault_it = last_local_fault_reason_.find(connector);
+        if (local_fault_it != last_local_fault_reason_.end()) {
+            local_fault_reason = local_fault_it->second;
         }
     }
     if (stop_origin.empty()) {
@@ -2825,6 +2975,23 @@ void OcppAdapter::finish_transaction(std::int32_t connector, ocpp::v16::Reason r
                << " target_I=" << stop_status.target_current_a.value_or(0.0)
                << " cp_drop_age_ms=" << cp_drop_age_ms
                << " cp_drop_reason=" << (cp_drop_reason.empty() ? "none" : cp_drop_reason);
+    const auto target_age_ms =
+        stop_status.last_target_update.time_since_epoch().count() != 0
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(stop_now - stop_status.last_target_update).count()
+            : -1;
+    const bool module_watchdog_observed =
+        (stop_origin.find("PowerDeliveryStalled") != std::string::npos) || (local_fault_reason == "PowerDeliveryStalled");
+    if (module_watchdog_observed) {
+        EVLOG_info << "Module telemetry watchdog observed in this session.";
+    } else {
+        EVLOG_info << "Lower likelihood here: module telemetry watchdog (not observed in this session).";
+    }
+    if (target_age_ms >= 0 && target_age_ms <= (telemetry_timeout(cfg_) + std::chrono::milliseconds(200)).count()) {
+        EVLOG_info << "Lower likelihood here: lwIP/QCA transport delay for CurrentDemand (latency is very low in this session).";
+    } else {
+        EVLOG_info << "CurrentDemand target freshness at stop indicates possible PLC transport/processing delay"
+                   << " (target_age_ms=" << target_age_ms << ")";
+    }
 
     bool pending_changed = false;
     {
@@ -3078,6 +3245,39 @@ bool OcppAdapter::clear_pending_autocharge_tokens_for_connector_locked(std::int3
 }
 
 int OcppAdapter::select_connector_for_token(const AuthToken& token) const {
+    if (token.source == AuthTokenSource::RFID && cfg_.connectors.size() == 2 && hardware_) {
+        int best_candidate = 0;
+        int best_rank = -1;
+        auto best_seen = std::chrono::steady_clock::time_point{};
+        for (const auto& c : cfg_.connectors) {
+            const auto status = sanitize_status(hardware_->get_status(c.id), cfg_.lab_bypass);
+            const auto sit = sessions_.find(c.id);
+            const bool tx_started = sit != sessions_.end() && sit->second.transaction_started;
+            if (tx_started) {
+                continue;
+            }
+            const bool preparing_like =
+                status.cp_state == 'B' || status.hlc_stage > 0 || status.hlc_precharge_active || status.hlc_power_ready;
+            const bool vehicle_present = status.plugged_in || preparing_like || status.relay_closed;
+            if (!vehicle_present) {
+                continue;
+            }
+            const int rank = preparing_like ? 2 : 1;
+            const auto seen_it = plug_event_time_.find(c.id);
+            const auto seen = (seen_it != plug_event_time_.end()) ? seen_it->second
+                                                                   : std::chrono::steady_clock::time_point{};
+            if (rank > best_rank || (rank == best_rank &&
+                                     (best_seen.time_since_epoch().count() == 0 || seen > best_seen))) {
+                best_candidate = c.id;
+                best_rank = rank;
+                best_seen = seen;
+            }
+        }
+        if (best_candidate > 0) {
+            return best_candidate;
+        }
+    }
+
     if (token.connector_hint > 0) {
         const bool exists = std::any_of(cfg_.connectors.begin(), cfg_.connectors.end(),
                                         [&](const ConnectorConfig& c) { return c.id == token.connector_hint; });
@@ -3159,6 +3359,12 @@ OcppAdapter::pop_next_pending_token(std::int32_t connector, const std::chrono::s
             queue[idx].defer_until_online) {
             continue;
         }
+        if (queue[idx].token.source == AuthTokenSource::Autocharge) {
+            const auto retry_it = autocharge_retry_not_before_.find(connector);
+            if (retry_it != autocharge_retry_not_before_.end() && now < retry_it->second) {
+                continue;
+            }
+        }
         if (!matches_reservation(queue[idx])) continue;
         const int prio = priority(queue[idx].token.source);
         if (!best_idx || prio < best_prio ||
@@ -3198,6 +3404,8 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
         session.authorized_at = std::chrono::steady_clock::now();
         session.power_wait_started_at = session.authorized_at;
         session.token_source = pending.token.source;
+        autocharge_retry_not_before_.erase(connector);
+        autocharge_retry_fail_count_.erase(connector);
         set_auth_state(connector, AuthorizationState::Granted);
         persist_pending_tokens();
         return AuthorizationState::Granted;
@@ -3208,10 +3416,20 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
             const bool csms_online = csms_connected_.load();
             if (mac_autocharge_mode || !csms_online) {
                 state = AuthorizationState::Pending;
+                const int base_backoff_s = cfg_.auth_denied_hold_s > 0 ? cfg_.auth_denied_hold_s : 15;
+                int& fail_count = autocharge_retry_fail_count_[connector];
+                fail_count = std::min(fail_count + 1, 6);
+                const int retry_delay_s =
+                    std::clamp(base_backoff_s * (1 << (fail_count - 1)), 5, 180);
+                autocharge_retry_not_before_[connector] =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(retry_delay_s);
                 EVLOG_info << "Autocharge not accepted on connector " << connector
                            << "; keeping auth pending for retry (mode=" << cfg_.autocharge_id_source
-                           << ", csms_online=" << (csms_online ? "true" : "false") << ")";
+                           << ", csms_online=" << (csms_online ? "true" : "false")
+                           << ", retry_in_s=" << retry_delay_s << ")";
             } else {
+                autocharge_retry_not_before_.erase(connector);
+                autocharge_retry_fail_count_.erase(connector);
                 EVLOG_info << "Autocharge rejected on connector " << connector
                            << "; forcing EIM fallback";
             }
@@ -3219,6 +3437,8 @@ AuthorizationState OcppAdapter::try_authorize_with_token(std::int32_t connector,
         set_auth_state(connector, state);
         if (state == AuthorizationState::Denied) {
             note_auth_denied(connector, trimmed);
+            autocharge_retry_not_before_.erase(connector);
+            autocharge_retry_fail_count_.erase(connector);
         }
         persist_pending_tokens();
         return state;
@@ -3261,9 +3481,15 @@ AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connecto
         const bool mac_autocharge_mode = cfg_.autocharge_id_source == "evmac";
         if (csms_offline || mac_autocharge_mode) {
             new_state = AuthorizationState::Pending;
+            const int base_backoff_s = cfg_.auth_denied_hold_s > 0 ? cfg_.auth_denied_hold_s : 15;
+            int& fail_count = autocharge_retry_fail_count_[connector];
+            fail_count = std::min(fail_count + 1, 6);
+            const int retry_delay_s = std::clamp(base_backoff_s * (1 << (fail_count - 1)), 5, 180);
+            autocharge_retry_not_before_[connector] = now + std::chrono::seconds(retry_delay_s);
             EVLOG_info << "Autocharge not accepted for session " << session_id << " on connector " << connector
                        << "; keeping auth pending for retry (mode=" << cfg_.autocharge_id_source
-                       << ", csms_online=" << (csms_offline ? "false" : "true") << ")";
+                       << ", csms_online=" << (csms_offline ? "false" : "true")
+                       << ", retry_in_s=" << retry_delay_s << ")";
             if (autocharge_enabled_.load() && pending.expires_at > now) {
                 std::lock_guard<std::mutex> lock(session_mutex_);
                 const auto& queue = pending_tokens_[connector];
@@ -3280,6 +3506,8 @@ AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connecto
                 }
             }
         } else {
+            autocharge_retry_not_before_.erase(connector);
+            autocharge_retry_fail_count_.erase(connector);
             EVLOG_info << "Autocharge rejected for session " << session_id << " on connector " << connector
                        << "; forcing EIM fallback";
         }
@@ -3341,6 +3569,11 @@ AuthorizationState OcppAdapter::apply_authorization_result(std::int32_t connecto
         set_auth_state(connector, new_state);
         if (new_state == AuthorizationState::Denied) {
             note_auth_denied(connector, trimmed);
+            autocharge_retry_not_before_.erase(connector);
+            autocharge_retry_fail_count_.erase(connector);
+        } else if (new_state == AuthorizationState::Granted) {
+            autocharge_retry_not_before_.erase(connector);
+            autocharge_retry_fail_count_.erase(connector);
         }
     }
     return new_state;
@@ -4113,11 +4346,21 @@ void OcppAdapter::apply_power_plan() {
                 measured_power_kw = module_power_kw;
                 st.present_current_a = measured_i;
                 st.present_power_w = measured_power_kw * 1000.0;
-            } else if (prefer_module_meter) {
-                // On module-meter connectors, do not retain stale non-module current/power when
-                // module current telemetry is temporarily incomplete.
-                st.present_current_a.reset();
-                st.present_power_w.reset();
+            } else {
+                // If module current readback blips briefly, keep the last fresh present-current sample
+                // for one telemetry window instead of forcing an immediate 0A step.
+                const bool present_fresh =
+                    st.last_telemetry.time_since_epoch().count() != 0 &&
+                    (now - st.last_telemetry) <= telemetry_timeout(cfg_);
+                if (st.relay_closed && present_fresh && st.present_current_a && st.present_power_w) {
+                    measured_i = std::max(0.0, st.present_current_a.value());
+                    measured_power_kw = std::max(0.0, st.present_power_w.value() / 1000.0);
+                } else {
+                    measured_i = 0.0;
+                    measured_power_kw = 0.0;
+                    st.present_current_a = 0.0;
+                    st.present_power_w = 0.0;
+                }
             }
         } else if (!st.relay_closed) {
             // Do not keep publishing stale current/power values when the gun contactor is open.
@@ -4245,7 +4488,27 @@ void OcppAdapter::apply_power_plan() {
             } else {
                 const auto timeout_ms = std::max({2000, cfg_.precharge_timeout_ms, cfg_.telemetry_timeout_ms});
                 if ((now - ts) > std::chrono::milliseconds(timeout_ms)) {
-                    module_unavailable_fault = true;
+                    constexpr auto kModuleRecoveryGrace = std::chrono::seconds(20);
+                    const auto missing_age = now - ts;
+                    if (missing_age >= (std::chrono::milliseconds(timeout_ms) + kModuleRecoveryGrace)) {
+                        module_unavailable_fault = true;
+                        EVLOG_error << "Connector " << c.id
+                                    << " modules unavailable beyond recovery grace"
+                                    << " missing_ms="
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(missing_age).count()
+                                    << " timeout_ms=" << timeout_ms;
+                    } else {
+                        static std::map<int, std::chrono::steady_clock::time_point> last_module_missing_log;
+                        auto& last_log = last_module_missing_log[c.id];
+                        if (last_log.time_since_epoch().count() == 0 ||
+                            (now - last_log) > std::chrono::seconds(2)) {
+                            EVLOG_warning << "Connector " << c.id
+                                          << " modules temporarily unavailable; waiting for recovery"
+                                          << " missing_ms="
+                                          << std::chrono::duration_cast<std::chrono::milliseconds>(missing_age).count();
+                            last_log = now;
+                        }
+                    }
                 }
             }
         } else {
@@ -4257,13 +4520,23 @@ void OcppAdapter::apply_power_plan() {
         // treat it as a local fault (possible welded contactor, EV backfeed, or discharge failure).
         const bool present_fresh = st.last_telemetry.time_since_epoch().count() != 0 &&
                                    (now - st.last_telemetry) <= telemetry_timeout(cfg_);
-        const bool output_expected_off = !power_ready && !precharge_hint && !post_precharge_hold_candidate && !st.relay_closed;
+        const bool recent_target_forced_fault =
+            st.last_target_update.time_since_epoch().count() != 0 &&
+            (now - st.last_target_update) <= std::chrono::milliseconds(std::max(2500, cfg_.telemetry_timeout_ms));
+        const bool cp_confirms_off = st.cp_state == 'A' || st.cp_state == 'B';
         const double stuck_v_threshold =
             (cfg_.unlock_voltage_threshold_v > 0.0) ? cfg_.unlock_voltage_threshold_v : 60.0;
         const double stuck_i_threshold =
             (cfg_.gc_open_current_a > 0.0) ? cfg_.gc_open_current_a : 1.0;
-        constexpr std::chrono::milliseconds kStuckVoltageTimeoutMs(5000);
-        constexpr std::chrono::milliseconds kStuckCurrentTimeoutMs(500);
+        constexpr std::chrono::milliseconds kStuckVoltageTimeoutMs(12000);
+        constexpr std::chrono::milliseconds kStuckCurrentTimeoutMs(2500);
+        const bool module_flowing_now = module_current_valid && std::fabs(module_current_a) >= std::max(stuck_i_threshold, 1.0);
+        const bool current_near_zero = !st.present_current_a || std::fabs(st.present_current_a.value()) < std::max(stuck_i_threshold, 1.5);
+        const bool high_voltage_present =
+            st.present_voltage_v && st.present_voltage_v.value() >= std::max(80.0, stuck_v_threshold * 0.5);
+        const bool output_expected_off = !power_ready && !precharge_hint && !post_precharge_hold_candidate && !st.relay_closed &&
+                                         cp_confirms_off && !recent_target_forced_fault && current_near_zero &&
+                                         !module_flowing_now;
         bool forced_fault = false;
         std::string forced_fault_reason;
         if (output_expected_off && present_fresh && st.present_voltage_v &&
@@ -4278,7 +4551,7 @@ void OcppAdapter::apply_power_plan() {
         } else {
             stuck_output_voltage_since_.erase(c.id);
         }
-        if (output_expected_off && present_fresh && st.present_current_a &&
+        if (output_expected_off && present_fresh && high_voltage_present && st.present_current_a &&
             std::fabs(st.present_current_a.value()) >= stuck_i_threshold) {
             auto& ts = stuck_output_current_since_[c.id];
             if (ts.time_since_epoch().count() == 0) {
@@ -4292,7 +4565,7 @@ void OcppAdapter::apply_power_plan() {
         }
 
         const bool general_fault = !st.safety_ok || st.cp_fault || meter_fault_active || welded || isolation_fault ||
-                                   thermal_fault || overcurrent_fault || comm_fault || module_unavailable_fault ||
+                                   thermal_fault || overcurrent_fault || comm_fault ||
                                    module_can_overload || forced_fault;
         uint8_t fault_bits = 0;
         if (general_fault) fault_bits |= 0x01;
@@ -4330,6 +4603,9 @@ void OcppAdapter::apply_power_plan() {
             !st.gc_welded && !st.mc_welded) {
             const double precharge_i_max = (cfg_.precharge_max_current_a > 0.0) ? cfg_.precharge_max_current_a : 2.0;
             const bool hlc_precharge_only = is_hlc_precharge_phase(st) && !hlc_power_phase;
+            const bool have_target_timestamp = st.last_target_update.time_since_epoch().count() != 0;
+            // Hold the last valid HLC target long enough to ride out short PLC/CP jitter bursts.
+            constexpr auto kHlcPowerTargetHoldMs = std::chrono::milliseconds(12000);
             // Use EV-requested current/voltage whenever available (CurrentDemand / PreChargeReq), but avoid
             // allocating extra modules during the post-precharge authorization hold (no energy delivery).
             if (!post_precharge_hold_candidate && st.target_current_a) {
@@ -4344,10 +4620,19 @@ void OcppAdapter::apply_power_plan() {
                 }
             }
 
-            // If the EV is in precharge/power phases but not requesting real current yet (or we're holding for
-            // authorization), keep a small keepalive budget so the planner assigns exactly one "home" module and
-            // can hold the requested voltage without a 0V dip.
-            if (req_kw <= 0.0 && (precharge_hint || hlc_power_phase || post_precharge_hold_candidate)) {
+            // During HLC power phase, briefly hold the last valid EV target if target frames gap.
+            // This avoids abrupt 51A->2A drops from short communication jitter.
+            const bool hold_last_hlc_target =
+                req_kw <= 0.0 && hlc_power_phase && !hlc_precharge_only && !post_precharge_hold_candidate &&
+                have_target_timestamp &&
+                (now - st.last_target_update) <= kHlcPowerTargetHoldMs && ev_target_kw > 0.0;
+            if (hold_last_hlc_target) {
+                req_kw = ev_target_kw;
+            }
+
+            // Keepalive current is only for precharge/auth-hold phases; do not use it for normal
+            // HLC power delivery where stale targets should use bounded hold above.
+            if (req_kw <= 0.0 && (precharge_hint || post_precharge_hold_candidate)) {
                 double v_keep = g.ev_req_voltage_v;
                 if (st.target_voltage_v && st.target_voltage_v.value() > 0.0) {
                     v_keep = st.target_voltage_v.value();
@@ -5484,9 +5769,12 @@ void OcppAdapter::apply_power_plan() {
         const bool hlc_precharge_phase = is_hlc_precharge_phase(status);
         const bool hlc_precharge_only = hlc_precharge_phase && !hlc_power_phase;
         const bool cp_known = status.cp_state != 'U';
+        const bool cp_power_ready = status.cp_state == 'C' || status.cp_state == 'D';
         const bool hlc_known = status.hlc_stage > 0 || hlc_precharge_phase || status.hlc_power_ready;
-        const bool ev_requesting = status.cp_state == 'C' || status.cp_state == 'D';
-        const bool ev_current_req = status.target_current_a && status.target_current_a.value() > 0.5;
+        const bool ev_requesting = cp_power_ready;
+        constexpr double kEvCurrentRequestThresholdA = 0.1;
+        const bool ev_current_req =
+            status.target_current_a && status.target_current_a.value() > kEvCurrentRequestThresholdA;
         const bool ev_voltage_req = status.target_voltage_v && status.target_voltage_v.value() > 10.0;
         const bool ev_target_recent =
             status.last_target_update.time_since_epoch().count() != 0 &&
@@ -5512,12 +5800,23 @@ void OcppAdapter::apply_power_plan() {
             isolation_ready = true;
         }
 
+        constexpr double kFlowingCurrentA = 0.8;
+        constexpr double kFlowingPowerW = 350.0;
+        const double meas_i_abs = std::fabs(meas_i);
+        const double present_i_abs =
+            status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
+        const double present_p_abs = status.present_power_w ? std::fabs(status.present_power_w.value()) : 0.0;
+        const bool power_path_active_now =
+            meas_i_abs >= kFlowingCurrentA || present_i_abs >= kFlowingCurrentA ||
+            present_p_abs >= kFlowingPowerW;
+        // If CP/PLC state is temporarily unknown but power is still clearly flowing, keep request active.
+        const bool cp_unknown_with_flow = !cp_known && status.relay_closed && power_path_active_now;
         bool power_request_active =
-            (ev_requesting && hlc_power_phase) || (!hlc_known && ev_target_active) || (hlc_power_phase && ev_target_active);
+            (ev_requesting && hlc_power_phase) || (!hlc_known && ev_target_active) ||
+            (hlc_power_phase && ev_target_active) || cp_unknown_with_flow;
         std::string request_loss_reason;
         if (hlc_power_phase && !hlc_precharge_phase && !ev_requesting) {
             const bool explicit_unplug = cp_known && status.cp_state == 'A' && !status.plugged_in;
-            const bool explicit_ev_stop = cp_known && status.cp_state == 'B';
             if (explicit_unplug) {
                 power_request_lost_since_.erase(c.id);
                 power_request_active = false;
@@ -5527,41 +5826,21 @@ void OcppAdapter::apply_power_plan() {
                 if (lost_since.time_since_epoch().count() == 0) {
                     lost_since = now;
                 }
-                // Ignore brief CP/PLC telemetry blips (including cp_state='U');
-                // sustained loss means EV is no longer requesting power.
-                constexpr auto kCpRequestDropDebounce = std::chrono::milliseconds(900);
-                // CP=B can briefly blip during HLC transitions on some vehicles.
-                constexpr auto kCpEvStopDebounce = std::chrono::milliseconds(900);
-                constexpr auto kCpEvStopTargetHold = std::chrono::milliseconds(1500);
-                // If CurrentDemand targets are still arriving, allow a slightly longer hold but keep it bounded.
-                // This avoids false drops on CP noise while preventing indefinite power offer on stale CP=B.
-                constexpr auto kCpTargetOnlyMaxHold = std::chrono::milliseconds(2500);
-                // If connector-side current is still flowing while CP reads B/U, treat it as telemetry skew and hold longer.
-                constexpr auto kCpFlowingCurrentHold = std::chrono::milliseconds(5000);
-                constexpr double kFlowingCurrentA = 0.8;
-                constexpr double kFlowingPowerW = 350.0;
-                const double meas_i_abs = std::fabs(meas_i);
-                const double present_i_abs =
-                    status.present_current_a ? std::fabs(status.present_current_a.value()) : 0.0;
-                const double present_p_abs = status.present_power_w ? std::fabs(status.present_power_w.value()) : 0.0;
-                const bool power_path_active_now =
-                    meas_i_abs >= kFlowingCurrentA || present_i_abs >= kFlowingCurrentA ||
-                    present_p_abs >= kFlowingPowerW;
-                std::chrono::milliseconds hold_window = ev_target_active ? kCpTargetOnlyMaxHold : kCpRequestDropDebounce;
-                if (explicit_ev_stop) {
-                    hold_window = ev_target_active ? kCpEvStopTargetHold : kCpEvStopDebounce;
-                }
-                if (power_path_active_now) {
-                    hold_window = std::max(hold_window, kCpFlowingCurrentHold);
-                }
-                if ((now - lost_since) < hold_window) {
+                // Keep charging through short CP/telemetry jitter. Only declare request loss if
+                // CP/targets/current have all been inactive for a sustained window.
+                constexpr auto kPowerRequestLossDebounce = std::chrono::milliseconds(12000);
+                constexpr auto kTargetFreshHold = std::chrono::milliseconds(12000);
+                const bool target_recent_extended =
+                    status.last_target_update.time_since_epoch().count() != 0 &&
+                    (now - status.last_target_update) <= kTargetFreshHold;
+                if ((now - lost_since) < kPowerRequestLossDebounce || target_recent_extended || power_path_active_now) {
                     power_request_active = true;
                 } else {
                     power_request_active = false;
-                    if (explicit_ev_stop) {
-                        request_loss_reason = "cp_b_sustained";
-                    } else if (!cp_known) {
+                    if (!cp_known) {
                         request_loss_reason = "cp_unknown_sustained";
+                    } else if (status.cp_state == 'B') {
+                        request_loss_reason = "cp_b_sustained";
                     } else {
                         request_loss_reason = "ev_not_requesting_sustained";
                     }
@@ -5569,6 +5848,28 @@ void OcppAdapter::apply_power_plan() {
             }
         } else {
             power_request_lost_since_.erase(c.id);
+        }
+        bool power_delivery_allowed = power_request_active;
+        if (hlc_power_phase && !hlc_precharge_phase && cp_known && !cp_power_ready) {
+            const auto lost_it = power_request_lost_since_.find(c.id);
+            const auto cp_not_ready_ms =
+                (lost_it != power_request_lost_since_.end() && lost_it->second.time_since_epoch().count() != 0)
+                    ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lost_it->second).count()
+                    : 0;
+            if (cp_not_ready_ms >= CP_NOT_READY_POWER_CUT_DELAY_MS.count()) {
+                power_delivery_allowed = false;
+                static std::map<int, std::chrono::steady_clock::time_point> last_cp_cut_log;
+                auto& last_log = last_cp_cut_log[c.id];
+                if (last_log.time_since_epoch().count() == 0 ||
+                    (now - last_log) >= std::chrono::seconds(1)) {
+                    EVLOG_warning << "Connector " << c.id
+                                  << " CP not power-ready; clamping current to 0"
+                                  << " cp=" << status.cp_state
+                                  << " hlc_stage=" << static_cast<int>(status.hlc_stage)
+                                  << " hold_ms=" << cp_not_ready_ms;
+                    last_log = now;
+                }
+            }
         }
         const auto prev_request_it = last_power_request_active_.find(c.id);
         const bool prev_request_active =
@@ -5605,11 +5906,11 @@ void OcppAdapter::apply_power_plan() {
             }
         }
         const bool gc_debounce_hold = is_home && hlc_power_phase && !hlc_precharge_phase && !ev_requesting &&
-                                      power_request_active && gc_closed_effective;
+                                      power_delivery_allowed && gc_closed_effective;
         bool gc_close_requested = is_home &&
                                   (info.desired_gc_state == ContactorState::Closed || gc_debounce_hold) &&
                                   dispatch.modules_assigned > 0 && !info.disabled_by_csms && !local_fault;
-        if (hlc_power_phase && !hlc_precharge_phase && !power_request_active) {
+        if (hlc_power_phase && !hlc_precharge_phase && !power_delivery_allowed) {
             gc_close_requested = false;
         }
         if (hlc_precharge_only && precharge_single_home_slot && !info.disabled_by_csms && !local_fault) {
@@ -5909,7 +6210,7 @@ void OcppAdapter::apply_power_plan() {
         const double stall_current_req_thresh = 1.0;
         const bool stall_current_requested =
             status.target_current_a && status.target_current_a.value() >= stall_current_req_thresh;
-        const bool stall_cp_power_ready = status.cp_state == 'C' || status.cp_state == 'D';
+        const bool stall_cp_power_ready = cp_power_ready;
         const bool evse_current_offered = dispatch.current_limit_a >= stall_current_req_thresh;
         const double stall_no_current_thresh = std::max(gc_open_thresh, 1.0);
         const bool stall_target_recent =
@@ -5919,7 +6220,7 @@ void OcppAdapter::apply_power_plan() {
         // do not arm a delivery-stall fault from a single path alone.
         const bool stall_module_low_confirmed =
             !info.module_current_valid || std::fabs(info.module_current_a) < stall_no_current_thresh;
-        if (!local_fault && !hold_no_current && gc_close_requested && power_request_active && stall_cp_power_ready &&
+        if (!local_fault && !hold_no_current && gc_close_requested && power_delivery_allowed && stall_cp_power_ready &&
             stall_current_requested && stall_target_recent && stall_module_low_confirmed && evse_current_offered &&
             current_valid && (gc_closed_cmd || gc_closed_effective)) {
             if (std::fabs(meas_i) < stall_no_current_thresh) {
@@ -5931,24 +6232,42 @@ void OcppAdapter::apply_power_plan() {
                         std::chrono::milliseconds(std::max(2000, cfg_.precharge_timeout_ms));
                     const auto timeout_ms = std::max(configured_timeout, POWER_DELIVERY_STALL_TIMEOUT_MS);
                     if ((now - ts) > timeout_ms) {
+                        constexpr auto kStallRecoveryGrace = std::chrono::seconds(20);
                         const auto target_age_ms = status.last_target_update.time_since_epoch().count() != 0
                                                        ? std::chrono::duration_cast<std::chrono::milliseconds>(
                                                              now - status.last_target_update)
                                                              .count()
                                                        : -1;
-                        local_fault = true;
-                        if (info.fault_reason.empty()) {
-                            info.fault_reason = "PowerDeliveryStalled";
+                        const auto stall_age = now - ts;
+                        static std::map<int, std::chrono::steady_clock::time_point> last_stall_log;
+                        auto& last_log = last_stall_log[c.id];
+                        if (last_log.time_since_epoch().count() == 0 ||
+                            (now - last_log) >= std::chrono::seconds(2)) {
+                            EVLOG_warning << "Power delivery stalled for connector " << c.id
+                                          << " (I_meas=" << meas_i
+                                          << "A I_offered=" << dispatch.current_limit_a
+                                          << "A target_I=" << status.target_current_a.value_or(0.0)
+                                          << "A module_I=" << info.module_current_a
+                                          << "A module_telem_valid=" << (info.module_telem_valid ? "1" : "0")
+                                          << " module_current_valid=" << (info.module_current_valid ? "1" : "0")
+                                          << " target_age_ms=" << target_age_ms
+                                          << " I_thresh=" << stall_no_current_thresh
+                                          << "A stall_ms="
+                                          << std::chrono::duration_cast<std::chrono::milliseconds>(stall_age).count()
+                                          << ") -- waiting for telemetry/module recovery";
+                            last_log = now;
                         }
-                        EVLOG_warning << "Power delivery stalled for connector " << c.id
-                                      << " (I_meas=" << meas_i
-                                      << "A I_offered=" << dispatch.current_limit_a
-                                      << "A target_I=" << status.target_current_a.value_or(0.0)
-                                      << "A module_I=" << info.module_current_a
-                                      << "A module_telem_valid=" << (info.module_telem_valid ? "1" : "0")
-                                      << " module_current_valid=" << (info.module_current_valid ? "1" : "0")
-                                      << " target_age_ms=" << target_age_ms
-                                      << " I_thresh=" << stall_no_current_thresh << "A)";
+                        if (stall_age >= (timeout_ms + kStallRecoveryGrace)) {
+                            local_fault = true;
+                            if (info.fault_reason.empty()) {
+                                info.fault_reason = "PowerDeliveryStalled";
+                            }
+                            EVLOG_error << "Power delivery stall persisted beyond recovery grace on connector " << c.id
+                                        << " stall_ms="
+                                        << std::chrono::duration_cast<std::chrono::milliseconds>(stall_age).count()
+                                        << " timeout_ms="
+                                        << std::chrono::duration_cast<std::chrono::milliseconds>(timeout_ms).count();
+                        }
                     }
                 }
             } else {
@@ -6185,11 +6504,33 @@ void OcppAdapter::apply_power_plan() {
             limits.max_power_kw = g.gun_power_limit_kw;
         }
         if (allow_energy_home) {
-            if (cmd.current_limit_a > 0.0 && limits.max_current_a) {
-                limits.max_current_a = std::min(limits.max_current_a.value(), cmd.current_limit_a);
-            }
-            if (cmd.power_kw > 0.0 && limits.max_power_kw) {
-                limits.max_power_kw = std::min(limits.max_power_kw.value(), cmd.power_kw);
+            // Advertise EVSE capability, not instantaneous dispatch target. Using cmd.current_limit_a/cmd.power_kw
+            // here can trap the EV at precharge-level current after PowerDelivery start.
+            const double module_cap_kw =
+                (cmd.module_count > 0 && planner_cfg_.module_power_kw > 0.0)
+                    ? (static_cast<double>(cmd.module_count) * planner_cfg_.module_power_kw)
+                    : 0.0;
+            if (module_cap_kw > 0.0) {
+                if (limits.max_power_kw) {
+                    limits.max_power_kw = std::min(limits.max_power_kw.value(), module_cap_kw);
+                } else {
+                    limits.max_power_kw = module_cap_kw;
+                }
+                const double v_for_cap = std::max(
+                    planner_cfg_.min_voltage_v_for_div,
+                    g.ev_req_voltage_v > 0.0
+                        ? g.ev_req_voltage_v
+                        : (cmd.voltage_set_v > 0.0 ? cmd.voltage_set_v : cfg_.default_voltage_v));
+                if (v_for_cap > 0.0) {
+                    const double module_cap_current_a = (module_cap_kw * 1000.0) / v_for_cap;
+                    if (module_cap_current_a > 0.0) {
+                        if (limits.max_current_a) {
+                            limits.max_current_a = std::min(limits.max_current_a.value(), module_cap_current_a);
+                        } else {
+                            limits.max_current_a = module_cap_current_a;
+                        }
+                    }
+                }
             }
         }
         if (allow_energy_home && limits.max_current_a && limits.max_current_a.value() > 0.0) {
@@ -6214,38 +6555,29 @@ void OcppAdapter::apply_power_plan() {
             }
             const double target_i = std::max(0.0, status.target_current_a.value_or(cmd.current_limit_a));
             const bool sustained_phase =
-                status.relay_closed && (status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE) &&
+                cp_power_ready && power_request_active && status.relay_closed &&
+                (status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE) &&
                 !status.hlc_charge_complete;
             const bool underdelivering_now =
                 sustained_phase && target_recent && measured_i_valid && target_i >= 2.0 &&
                 (measured_i_abs + std::max(0.6, target_i * 0.12)) < target_i;
-
+            auto& last_log = current_underdelivery_log_[c.id];
             if (underdelivering_now) {
                 auto& since = current_underdelivery_since_[c.id];
                 if (since.time_since_epoch().count() == 0) {
                     since = now;
-                }
-            } else {
-                current_underdelivery_since_.erase(c.id);
-            }
-
-            const auto ud_it = current_underdelivery_since_.find(c.id);
-            if (ud_it != current_underdelivery_since_.end() &&
-                (now - ud_it->second) >= std::chrono::milliseconds(2500)) {
-                const double derated_max_i = std::clamp(measured_i_abs + std::max(0.3, target_i * 0.05), 1.0,
-                                                        limits.max_current_a.value());
-                if (derated_max_i + 0.05 < limits.max_current_a.value()) {
-                    limits.max_current_a = derated_max_i;
-                    auto& last_log = current_underdelivery_log_[c.id];
+                } else if ((now - since) >= std::chrono::milliseconds(2500)) {
                     if (last_log.time_since_epoch().count() == 0 ||
                         (now - last_log) >= std::chrono::seconds(1)) {
                         EVLOG_warning << "Connector " << c.id
-                                      << " adaptive EVSE current derate applied target_I=" << target_i
+                                      << " module underdelivery observed target_I=" << target_i
                                       << "A measured_I=" << measured_i_abs
-                                      << "A offered_I=" << derated_max_i << "A";
+                                      << "A offered_I=" << limits.max_current_a.value() << "A";
                         last_log = now;
                     }
                 }
+            } else {
+                current_underdelivery_since_.erase(c.id);
             }
         } else {
             current_underdelivery_since_.erase(c.id);
@@ -6998,8 +7330,8 @@ void OcppAdapter::update_connector_state(std::int32_t connector, GunStatus statu
                     since = now;
                 }
                 // Keep status in Charging through short CP=B/U jitter to avoid unnecessary
-                // Charging<->SuspendedEV churn while power is still flowing.
-                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(2500);
+                // Charging<->SuspendedEV churn while still reflecting EVReady drops promptly.
+                constexpr auto kChargingStateCpDropDebounce = std::chrono::milliseconds(700);
                 request_lost = (now - since) >= kChargingStateCpDropDebounce;
             } else {
                 std::lock_guard<std::mutex> lock(state_mutex_);
