@@ -174,6 +174,7 @@ int main() {
         /*hlc_enable=*/true,
         /*pnc_blocked=*/false,
         /*lock_cmd=*/true,
+        /*no_energy_mode=*/1,
         /*use_crc8=*/true);
     assert(slow[7] == can_contract::crc8_07(slow.data(), 7));
     const uint64_t slow_packed = unpack_u56(slow);
@@ -186,6 +187,7 @@ int main() {
     assert(((slow_packed >> 34) & 0x1u) == 0u);
     assert(((slow_packed >> 35) & 0x1u) == 1u);
     assert(((slow_packed >> 36) & 0x0Fu) == can_contract::PROTOCOL_VERSION);
+    assert(((slow_packed >> 40) & 0x03u) == 1u);
 
     std::cout << "plc_tlm_v3_tests passed\n";
     return 0;

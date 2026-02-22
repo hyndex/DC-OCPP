@@ -330,6 +330,9 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> gc_open_timeout_exceeded_since_;
     std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
+    std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_recovery_until_;
+    std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_last_log_;
+    std::map<int, uint8_t> power_delivery_stall_recovery_attempts_;
     std::map<int, std::chrono::steady_clock::time_point> power_request_lost_since_;
     std::map<int, bool> last_power_request_active_;
     std::map<int, std::chrono::steady_clock::time_point> last_cp_request_drop_;

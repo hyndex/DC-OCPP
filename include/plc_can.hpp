@@ -57,6 +57,7 @@ public:
     void publish_evse_present(std::int32_t connector, double voltage_v, double current_a, double power_kw,
                               bool output_enabled, bool regulating) override;
     void publish_fault_state(std::int32_t connector, uint8_t fault_bits) override;
+    void set_no_energy_mode(std::int32_t connector, EvseNoEnergyMode mode) override;
     void clear_faults(std::int32_t connector) override;
     std::vector<AuthToken> poll_auth_tokens() override;
     bool supports_cross_slot_islands() const override;
@@ -121,6 +122,7 @@ private:
         bool auth_pending{false};
         bool hlc_enabled{false};
         bool pnc_blocked{false};
+        EvseNoEnergyMode no_energy_mode{EvseNoEnergyMode::None};
         bool sys_enable{false};
         bool output_enabled{false};
         bool regulating{false};

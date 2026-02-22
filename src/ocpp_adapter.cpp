@@ -48,6 +48,9 @@ constexpr std::chrono::milliseconds PRECHARGE_STABLE_HOLD_MS(300);
 // Avoid tripping local stall faults on short/noisy underdelivery windows.
 // EVs and module telemetry can transiently dip for a few seconds without indicating a hard fault.
 constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_TIMEOUT_MS(8000);
+constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS(6000);
+constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_ESCALATION_MS(45000);
+constexpr uint8_t POWER_DELIVERY_STALL_MAX_RECOVERIES = 3;
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::seconds RFID_TAP_LATCH_WINDOW(3);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(20000);
@@ -4243,6 +4246,9 @@ void OcppAdapter::apply_power_plan() {
             gc_open_timeout_exceeded_since_.erase(connector_id);
             gc_close_request_time_.erase(connector_id);
             power_delivery_stall_since_.erase(connector_id);
+            power_delivery_stall_recovery_until_.erase(connector_id);
+            power_delivery_stall_last_log_.erase(connector_id);
+            power_delivery_stall_recovery_attempts_.erase(connector_id);
             power_request_lost_since_.erase(connector_id);
             last_power_request_active_.erase(connector_id);
             last_cp_request_drop_.erase(connector_id);
@@ -6242,6 +6248,22 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
+        auto clear_stall_tracking = [&]() {
+            power_delivery_stall_since_.erase(c.id);
+            power_delivery_stall_recovery_until_.erase(c.id);
+            power_delivery_stall_last_log_.erase(c.id);
+            power_delivery_stall_recovery_attempts_.erase(c.id);
+        };
+        bool stall_recovery_active = false;
+        auto recovery_until_it = power_delivery_stall_recovery_until_.find(c.id);
+        if (recovery_until_it != power_delivery_stall_recovery_until_.end()) {
+            if (now < recovery_until_it->second) {
+                stall_recovery_active = true;
+            } else {
+                power_delivery_stall_recovery_until_.erase(recovery_until_it);
+            }
+        }
+
         const double stall_current_req_thresh = 1.0;
         const bool stall_current_requested =
             status.target_current_a && status.target_current_a.value() >= stall_current_req_thresh;
@@ -6255,9 +6277,12 @@ void OcppAdapter::apply_power_plan() {
         // do not arm a delivery-stall fault from a single path alone.
         const bool stall_module_low_confirmed =
             !info.module_current_valid || std::fabs(info.module_current_a) < stall_no_current_thresh;
-        if (!local_fault && !hold_no_current && gc_close_requested && power_delivery_allowed && stall_cp_power_ready &&
+        const bool stall_conditions_met =
+            !local_fault && !hold_no_current && gc_close_requested && power_delivery_allowed && stall_cp_power_ready &&
             stall_current_requested && stall_target_recent && stall_module_low_confirmed && evse_current_offered &&
-            current_valid && (gc_closed_cmd || gc_closed_effective)) {
+            current_valid && (gc_closed_cmd || gc_closed_effective);
+
+        if (stall_conditions_met && !stall_recovery_active) {
             if (std::fabs(meas_i) < stall_no_current_thresh) {
                 auto& ts = power_delivery_stall_since_[c.id];
                 if (ts.time_since_epoch().count() == 0) {
@@ -6266,16 +6291,14 @@ void OcppAdapter::apply_power_plan() {
                     const auto configured_timeout =
                         std::chrono::milliseconds(std::max(2000, cfg_.precharge_timeout_ms));
                     const auto timeout_ms = std::max(configured_timeout, POWER_DELIVERY_STALL_TIMEOUT_MS);
-                    if ((now - ts) > timeout_ms) {
-                        constexpr auto kStallRecoveryGrace = std::chrono::seconds(20);
+                    const auto stall_age = now - ts;
+                    if (stall_age > timeout_ms) {
                         const auto target_age_ms = status.last_target_update.time_since_epoch().count() != 0
                                                        ? std::chrono::duration_cast<std::chrono::milliseconds>(
                                                              now - status.last_target_update)
                                                              .count()
                                                        : -1;
-                        const auto stall_age = now - ts;
-                        static std::map<int, std::chrono::steady_clock::time_point> last_stall_log;
-                        auto& last_log = last_stall_log[c.id];
+                        auto& last_log = power_delivery_stall_last_log_[c.id];
                         if (last_log.time_since_epoch().count() == 0 ||
                             (now - last_log) >= std::chrono::seconds(2)) {
                             EVLOG_warning << "Power delivery stalled for connector " << c.id
@@ -6289,27 +6312,42 @@ void OcppAdapter::apply_power_plan() {
                                           << " I_thresh=" << stall_no_current_thresh
                                           << "A stall_ms="
                                           << std::chrono::duration_cast<std::chrono::milliseconds>(stall_age).count()
-                                          << ") -- waiting for telemetry/module recovery";
+                                          << ")";
                             last_log = now;
                         }
-                        if (stall_age >= (timeout_ms + kStallRecoveryGrace)) {
+                        auto& attempts = power_delivery_stall_recovery_attempts_[c.id];
+                        if (attempts < POWER_DELIVERY_STALL_MAX_RECOVERIES) {
+                            attempts++;
+                            power_delivery_stall_recovery_until_[c.id] = now + POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS;
+                            stall_recovery_active = true;
+                            ts = now;
+                            EVLOG_warning << "Entering no-energy recovery window for connector " << c.id
+                                          << " attempt=" << static_cast<int>(attempts) << "/"
+                                          << static_cast<int>(POWER_DELIVERY_STALL_MAX_RECOVERIES)
+                                          << " pause_ms=" << POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS.count();
+                        } else if (stall_age >= POWER_DELIVERY_STALL_ESCALATION_MS) {
                             local_fault = true;
                             if (info.fault_reason.empty()) {
                                 info.fault_reason = "PowerDeliveryStalled";
                             }
-                            EVLOG_error << "Power delivery stall persisted beyond recovery grace on connector " << c.id
+                            EVLOG_error << "Power delivery stall exceeded escalation window on connector " << c.id
                                         << " stall_ms="
                                         << std::chrono::duration_cast<std::chrono::milliseconds>(stall_age).count()
                                         << " timeout_ms="
-                                        << std::chrono::duration_cast<std::chrono::milliseconds>(timeout_ms).count();
+                                        << std::chrono::duration_cast<std::chrono::milliseconds>(timeout_ms).count()
+                                        << " attempts=" << static_cast<int>(attempts);
+                        } else {
+                            // Keep session alive a bit longer before hard-faulting after max retries.
+                            power_delivery_stall_recovery_until_[c.id] = now + std::chrono::milliseconds(1000);
+                            stall_recovery_active = true;
                         }
                     }
                 }
             } else {
-                power_delivery_stall_since_.erase(c.id);
+                clear_stall_tracking();
             }
-        } else {
-            power_delivery_stall_since_.erase(c.id);
+        } else if (!stall_conditions_met && !stall_recovery_active) {
+            clear_stall_tracking();
         }
         if (!gc_closed_cmd && !local_fault && is_home) {
             bool current_valid = true;
@@ -6403,6 +6441,15 @@ void OcppAdapter::apply_power_plan() {
             gun_for_slot > 0 && gun_allow_energy.count(gun_for_slot) ? gun_allow_energy[gun_for_slot] : false;
         const bool allow_energy = slot_modules_allowed && allow_energy_for_gun;
         const bool allow_energy_home = is_home && allow_energy_for_gun;
+        const bool hlc_power_phase_active =
+            status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
+        const bool no_energy_stall_pause =
+            stall_recovery_active && is_home && !local_fault && !info.disabled_by_csms && gc_close_requested;
+        const bool no_energy_ocpp_pause =
+            info.paused && g.ev_session_active && is_home && !local_fault && !info.disabled_by_csms &&
+            hlc_power_phase_active;
+        EvseNoEnergyMode no_energy_mode =
+            (no_energy_stall_pause || no_energy_ocpp_pause) ? EvseNoEnergyMode::Paused : EvseNoEnergyMode::None;
 
         uint8_t relay_mask_cmd = 0u;
         bool module_slots_valid = false;
@@ -6507,6 +6554,18 @@ void OcppAdapter::apply_power_plan() {
                 cmd.mc_closed = (!info.disabled_by_csms && !local_fault) ? mc_closed_cmd : false;
             }
         }
+        if (no_energy_mode == EvseNoEnergyMode::Paused) {
+            cmd.current_limit_a = 0.0;
+            cmd.power_kw = 0.0;
+            auto& last_log = power_delivery_stall_last_log_[c.id];
+            if (last_log.time_since_epoch().count() == 0 || (now - last_log) >= std::chrono::seconds(2)) {
+                const char* pause_reason = no_energy_stall_pause ? "stall_recovery" : "ocpp_pause";
+                EVLOG_warning << "Connector " << c.id
+                              << " holding no-energy pause (reason=" << pause_reason
+                              << ", current forced to 0A)";
+                last_log = now;
+            }
+        }
 
         // Persist dynamic home-slot fault decisions (e.g., GC open timeout) back into `slot_info`
         // so module command generation sees the same final state.
@@ -6596,7 +6655,7 @@ void OcppAdapter::apply_power_plan() {
                 (status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE) &&
                 !status.hlc_charge_complete;
             const bool underdelivering_now =
-                sustained_phase && target_recent && measured_i_valid && expected_i >= 2.0 &&
+                sustained_phase && target_recent && measured_i_valid && expected_i >= 1.5 &&
                 (measured_i_abs + std::max(0.6, expected_i * 0.12)) < expected_i;
             auto& last_log = current_underdelivery_log_[c.id];
             if (underdelivering_now) {
@@ -6620,6 +6679,7 @@ void OcppAdapter::apply_power_plan() {
             current_underdelivery_since_.erase(c.id);
             current_underdelivery_log_.erase(c.id);
         }
+        hardware_->set_no_energy_mode(c.id, no_energy_mode);
         hardware_->apply_power_command(cmd);
         hardware_->set_evse_limits(c.id, limits);
         last_mc_state_[slot->mc_id] = cmd.mc_closed ? ContactorState::Closed : ContactorState::Open;
@@ -6943,6 +7003,9 @@ void OcppAdapter::apply_zero_power_plan() {
     gc_close_request_time_.clear();
     gc_switch_ready_since_.clear();
     power_delivery_stall_since_.clear();
+    power_delivery_stall_recovery_until_.clear();
+    power_delivery_stall_last_log_.clear();
+    power_delivery_stall_recovery_attempts_.clear();
     precharge_ramp_cmd_voltage_v_.clear();
     precharge_target_power_kw_.clear();
     precharge_arm_ready_since_.clear();
@@ -6970,6 +7033,7 @@ void OcppAdapter::apply_zero_power_plan() {
         limits.max_current_a = 0.0;
         limits.max_power_kw = 0.0;
         hardware_->set_evse_limits(c.id, limits);
+        hardware_->set_no_energy_mode(c.id, EvseNoEnergyMode::None);
         if (charge_point_) {
             charge_point_->on_max_current_offered(c.id, 0);
             charge_point_->on_max_power_offered(c.id, 0);

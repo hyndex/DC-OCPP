@@ -290,6 +290,7 @@ inline std::array<uint8_t, 8> build_evse_slow(uint16_t max_v_0p5,
                                               bool hlc_enable,
                                               bool pnc_blocked,
                                               bool lock_cmd,
+                                              uint8_t no_energy_mode,
                                               bool use_crc8) {
     std::array<uint8_t, 8> data{};
     uint64_t packed = 0;
@@ -302,6 +303,7 @@ inline std::array<uint8_t, 8> build_evse_slow(uint16_t max_v_0p5,
     packed |= static_cast<uint64_t>(pnc_blocked ? 1u : 0u) << 34;
     packed |= static_cast<uint64_t>(lock_cmd ? 1u : 0u) << 35;
     packed |= static_cast<uint64_t>(PROTOCOL_VERSION & 0x0Fu) << 36;
+    packed |= static_cast<uint64_t>(no_energy_mode & 0x03u) << 40;
     for (int i = 0; i < 7; ++i) {
         data[i] = static_cast<uint8_t>((packed >> (i * 8)) & 0xFFu);
     }

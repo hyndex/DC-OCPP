@@ -1226,6 +1226,7 @@ void PlcCanHardware::update_slow_tx(PlcState& st,
                                                        st.hlc_enabled,
                                                        st.pnc_blocked,
                                                        st.lock_command,
+                                                       static_cast<uint8_t>(st.no_energy_mode),
                                                        use_crc_);
     const bool payload_changed = !st.last_limits_payload_valid || (payload != st.last_limits_payload);
     const int keepalive_ms =
@@ -2283,6 +2284,18 @@ void PlcCanHardware::publish_fault_state(std::int32_t connector, uint8_t fault_b
     }
 }
 
+void PlcCanHardware::set_no_energy_mode(std::int32_t connector, EvseNoEnergyMode mode) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto it = connectors_.find(connector);
+    if (it == connectors_.end()) return;
+    auto& st = it->second;
+    if (st.no_energy_mode != mode) {
+        st.no_energy_mode = mode;
+        st.last_limits_tx = std::chrono::steady_clock::time_point{};
+        st.last_limits_payload_valid = false;
+    }
+}
+
 void PlcCanHardware::clear_faults(std::int32_t connector) {
     std::unique_lock<std::mutex> lock(state_mutex_);
     auto it = connectors_.find(connector);
@@ -2356,6 +2369,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t, int) {}
 void PlcCanHardware::set_evse_limits(std::int32_t, const EvseLimits&) {}
 void PlcCanHardware::publish_evse_present(std::int32_t, double, double, double, bool, bool) {}
 void PlcCanHardware::publish_fault_state(std::int32_t, uint8_t) {}
+void PlcCanHardware::set_no_energy_mode(std::int32_t, EvseNoEnergyMode) {}
 void PlcCanHardware::clear_faults(std::int32_t) {}
 std::vector<AuthToken> PlcCanHardware::poll_auth_tokens() { return {}; }
 bool PlcCanHardware::supports_cross_slot_islands() const { return false; }

@@ -25,6 +25,11 @@ enum class AuthorizationState {
     Denied
 };
 
+enum class EvseNoEnergyMode : std::uint8_t {
+    None = 0,
+    Paused = 1,
+};
+
 struct AuthToken {
     std::string id_token;
     AuthTokenSource source{AuthTokenSource::RFID};
@@ -199,6 +204,13 @@ public:
     virtual void publish_fault_state(std::int32_t connector, uint8_t fault_bits) {
         (void)connector;
         (void)fault_bits;
+    }
+
+    /// \brief Hint PLC/HLC status behavior during intentional no-energy windows.
+    /// Default is a no-op for hardware that does not support this transport hint.
+    virtual void set_no_energy_mode(std::int32_t connector, EvseNoEnergyMode mode) {
+        (void)connector;
+        (void)mode;
     }
 
     /// \brief Explicitly request clearing latched hardware faults (no-op if unsupported).
