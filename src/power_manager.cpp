@@ -385,6 +385,12 @@ double PowerManager::apply_voltage_guard(const GunState& g, double i_target_a, d
     if (i_target_a <= 0.0) {
         return 0.0;
     }
+    // In active HLC power phase (CurrentDemand), current-limiting via voltage guard
+    // can double-derate against already headroomed EV targets from PLC telemetry.
+    // Keep guard for precharge/non-HLC phases, bypass for steady power regulation.
+    if (!g.voltage_guard_active) {
+        return std::max(0.0, i_target_a);
+    }
     const double guard_v = std::max(0.0, cfg_.voltage_guard_band_v);
     if (guard_v <= 0.0 || g.v_meas_v <= 0.0 || v_ceiling_v <= 0.0) {
         return std::max(0.0, i_target_a);

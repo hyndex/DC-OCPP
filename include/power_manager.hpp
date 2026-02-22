@@ -69,6 +69,7 @@ struct GunState {
     bool mc_welded{false};
     double ev_req_power_kw{0.0};
     double ev_req_voltage_v{0.0};
+    bool voltage_guard_active{true};
     double min_voltage_v{0.0};
     double max_voltage_v{0.0};
     double gun_power_limit_kw{0.0};

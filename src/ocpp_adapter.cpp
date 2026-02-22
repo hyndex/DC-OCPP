@@ -4317,12 +4317,13 @@ void OcppAdapter::apply_power_plan() {
         }
         const bool power_ready =
             session_ready && (st.relay_closed || power_delivery_requested(st, lock_required));
+        const bool hlc_precharge_phase = is_hlc_precharge_phase(st);
         const bool hlc_power_phase =
             st.hlc_power_ready || (st.hlc_stage >= HLC_MIN_POWER_STAGE && !st.hlc_charge_complete);
         // Allow precharge/warmup decisions even before the OCPP transaction is authorized so ISO15118 can progress.
         // Energy delivery is still gated by `power_ready`/GC closure later in the state machine.
         bool precharge_hint = lock_ok && st.plugged_in && !post_stop_plugged && !st.hlc_charge_complete &&
-                              is_hlc_precharge_phase(st) && !disabled_by_control && !paused_by_csms;
+                              hlc_precharge_phase && !disabled_by_control && !paused_by_csms;
         if (cfg_.require_auth_for_precharge) {
             precharge_hint = precharge_hint && session_ready;
         }
@@ -4628,7 +4629,7 @@ void OcppAdapter::apply_power_plan() {
         if ((power_ready || precharge_hint || post_precharge_hold_candidate) && g.safety_ok &&
             !st.gc_welded && !st.mc_welded) {
             const double precharge_i_max = (cfg_.precharge_max_current_a > 0.0) ? cfg_.precharge_max_current_a : 2.0;
-            const bool hlc_precharge_only = is_hlc_precharge_phase(st) && !hlc_power_phase;
+            const bool hlc_precharge_only = hlc_precharge_phase && !hlc_power_phase;
             const bool have_target_timestamp = st.last_target_update.time_since_epoch().count() != 0;
             // Hold the last valid HLC target long enough to ride out short PLC/CP jitter bursts.
             constexpr auto kHlcPowerTargetHoldMs = std::chrono::milliseconds(12000);
@@ -4675,6 +4676,9 @@ void OcppAdapter::apply_power_plan() {
             }
         }
         g.ev_req_power_kw = std::max(0.0, req_kw);
+        // Voltage guard remains useful during precharge/non-HLC phases, but in active
+        // HLC power regulation it can double-derate against PLC-side headroom policy.
+        g.voltage_guard_active = hlc_precharge_phase || !hlc_power_phase;
         g.ev_req_voltage_v = st.target_voltage_v ? st.target_voltage_v.value()
                                                  : (st.present_voltage_v ? st.present_voltage_v.value() : measured_v);
         if (g.ev_req_voltage_v <= 0.0) {
@@ -5718,6 +5722,11 @@ void OcppAdapter::apply_power_plan() {
     // Per-gun gating derived from the home slot. Populated in the command loop (home slots are processed first).
     std::map<int, bool> gun_drive_modules;
     std::map<int, bool> gun_allow_energy;
+    // Effective per-gun output limits after all final safety/hold/no-energy gating.
+    // Module command fan-out must use these values (not raw dispatch) to keep module
+    // writes consistent with the planner command shown to PLC/telemetry.
+    std::map<int, double> gun_effective_current_limit_a;
+    std::map<int, double> gun_effective_power_kw;
 
     for (const auto* cptr : connector_order) {
         const auto& c = *cptr;
@@ -6580,6 +6589,8 @@ void OcppAdapter::apply_power_plan() {
         last_current_limit_a_[c.id] = cmd.current_limit_a;
         if (is_home && gun_for_slot > 0) {
             last_requested_power_kw_[gun_for_slot] = dispatch.p_set_kw;
+            gun_effective_current_limit_a[gun_for_slot] = std::max(0.0, cmd.current_limit_a);
+            gun_effective_power_kw[gun_for_slot] = std::max(0.0, cmd.power_kw);
         }
         last_module_alloc_[c.id] = cmd.module_count;
         last_module_mask_cmd_[c.id] = cmd.module_mask;
@@ -6894,8 +6905,17 @@ void OcppAdapter::apply_power_plan() {
                                      ? (static_cast<double>(slot_module_cmd) /
                                         static_cast<double>(dispatch.modules_assigned))
                                      : 0.0;
-            const double commanded_current_limit_a = allow_energy_for_gun ? dispatch.current_limit_a : 0.0;
-            const double commanded_power_kw = allow_energy_for_gun ? dispatch.p_set_kw : 0.0;
+            const double effective_current_limit_a =
+                (gun_id > 0 && gun_effective_current_limit_a.count(gun_id))
+                    ? gun_effective_current_limit_a.at(gun_id)
+                    : dispatch.current_limit_a;
+            const double effective_power_kw =
+                (gun_id > 0 && gun_effective_power_kw.count(gun_id))
+                    ? gun_effective_power_kw.at(gun_id)
+                    : dispatch.p_set_kw;
+            const double commanded_current_limit_a =
+                allow_energy_for_gun ? std::max(0.0, effective_current_limit_a) : 0.0;
+            const double commanded_power_kw = allow_energy_for_gun ? std::max(0.0, effective_power_kw) : 0.0;
             bool enable = drive_modules;
             uint8_t mask = drive_modules ? slot_mask_cmd : 0u;
             double voltage_v = drive_modules ? dispatch.voltage_set_v : 0.0;
