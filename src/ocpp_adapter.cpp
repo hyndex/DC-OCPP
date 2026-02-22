@@ -2363,6 +2363,8 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             if (!fault && had_session && session.transaction_started && session.authorized &&
                 status.plugged_in && status.cp_state == 'B' && !status.hlc_charge_complete) {
                 const auto target_timeout = telemetry_timeout(cfg_);
+                const auto suspended_stop_window =
+                    std::chrono::seconds(std::max(0, cfg_.suspended_no_output_stop_s));
                 const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
                                            (now - status.last_target_update) <= target_timeout;
                 const double present_i_abs = std::fabs(status.present_current_a.value_or(0.0));
@@ -2371,13 +2373,15 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                 if (!target_recent && no_output) {
                     if (suspended_no_power_since.time_since_epoch().count() == 0) {
                         suspended_no_power_since = now;
-                    } else if ((now - suspended_no_power_since) >= std::chrono::seconds(90)) {
+                    } else if (suspended_stop_window.count() > 0 &&
+                               (now - suspended_no_power_since) >= suspended_stop_window) {
                         EVLOG_info << "Connector " << connector
                                    << " stopping transaction after sustained SuspendedEV/no-output"
                                    << " cp=" << status.cp_state
                                    << " relay=" << (status.relay_closed ? "1" : "0")
                                    << " present_I=" << present_i_abs
-                                   << " present_P=" << present_p_abs;
+                                   << " present_P=" << present_p_abs
+                                   << " hold_s=" << suspended_stop_window.count();
                         {
                             std::lock_guard<std::mutex> lock(state_mutex_);
                             stop_origin_hint_[connector] = "suspended_ev_no_output";
@@ -2399,6 +2403,10 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                                       << " present_I=" << present_i_abs
                                       << " present_P=" << present_p_abs
                                       << " age_ms=" << age_ms
+                                      << " stop_after_s="
+                                      << (suspended_stop_window.count() > 0
+                                              ? std::to_string(suspended_stop_window.count())
+                                              : std::string("disabled"))
                                       << " -- waiting for recovery";
                         suspended_no_power_log_ts = now;
                     }
@@ -5540,22 +5548,36 @@ void OcppAdapter::apply_power_plan() {
         auto& disp = kv.second;
         const int gid = kv.first;
         const int actual = actual_modules_per_gun.count(gid) ? actual_modules_per_gun[gid] : 0;
-        disp.modules_assigned = actual;
-        const auto g_it = gun_lookup.find(gid);
-        const double gun_cap = g_it != gun_lookup.end() && g_it->second.gun_power_limit_kw > 0.0
-                                   ? g_it->second.gun_power_limit_kw
-                                   : disp.p_budget_kw;
-        const double p_cap_modules = actual * planner_cfg_.module_power_kw;
-        const double p_set = std::min({disp.p_budget_kw, p_cap_modules, gun_cap});
+        const double base_p_set_kw = std::max(0.0, disp.p_set_kw);
+        const double base_i_target_a = std::max(0.0, disp.current_limit_a);
         const double v_target = disp.voltage_set_v > 0.0 ? disp.voltage_set_v : planner_cfg_.default_voltage_v;
-        const double v_safe = std::max(planner_cfg_.min_voltage_v_for_div, v_target);
-        double i_target = v_safe > 0.0 ? (p_set * 1000.0) / v_safe : 0.0;
-        if (g_it != gun_lookup.end() && g_it->second.gun_current_limit_a > 0.0) {
-            i_target = std::min(i_target, g_it->second.gun_current_limit_a);
-        }
-        disp.p_set_kw = p_set;
+        const auto g_it = gun_lookup.find(gid);
+        const double gun_cap_kw = (g_it != gun_lookup.end() && g_it->second.gun_power_limit_kw > 0.0)
+                                      ? g_it->second.gun_power_limit_kw
+                                      : std::numeric_limits<double>::max();
+        const double p_cap_modules_kw = std::max(0.0, actual * planner_cfg_.module_power_kw);
+        const double p_cap_budget_kw = std::max(0.0, disp.p_budget_kw);
+
+        disp.modules_assigned = actual;
         disp.voltage_set_v = v_target;
-        disp.current_limit_a = i_target;
+
+        // Preserve PowerManager's ramp/guard output and only clamp down for post-plan module changes.
+        double p_set_kw = std::min({base_p_set_kw, p_cap_budget_kw, p_cap_modules_kw, gun_cap_kw});
+        const double v_safe = std::max(planner_cfg_.min_voltage_v_for_div, v_target);
+        const double i_cap_from_p_a = v_safe > 0.0 ? (p_set_kw * 1000.0) / v_safe : 0.0;
+        double i_target_a = std::min(base_i_target_a, i_cap_from_p_a);
+        if (g_it != gun_lookup.end() && g_it->second.gun_current_limit_a > 0.0) {
+            i_target_a = std::min(i_target_a, g_it->second.gun_current_limit_a);
+        }
+        i_target_a = std::max(0.0, i_target_a);
+        p_set_kw = std::min(p_set_kw, (i_target_a * v_safe) / 1000.0);
+
+        if (actual <= 0) {
+            p_set_kw = 0.0;
+            i_target_a = 0.0;
+        }
+        disp.p_set_kw = p_set_kw;
+        disp.current_limit_a = i_target_a;
         if (hold_guns_no_current.count(gid)) {
             // Authorization hold: keep modules enabled and voltage regulated, but do not allow any current/power.
             disp.p_set_kw = 0.0;
@@ -6566,14 +6588,16 @@ void OcppAdapter::apply_power_plan() {
                     measured_i_valid = true;
                 }
             }
-            const double target_i = std::max(0.0, status.target_current_a.value_or(cmd.current_limit_a));
+            const double offered_i = std::max(0.0, cmd.current_limit_a);
+            const double target_i = std::max(0.0, status.target_current_a.value_or(offered_i));
+            const double expected_i = std::min(target_i, offered_i);
             const bool sustained_phase =
                 cp_power_ready && power_request_active && status.relay_closed &&
                 (status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE) &&
                 !status.hlc_charge_complete;
             const bool underdelivering_now =
-                sustained_phase && target_recent && measured_i_valid && target_i >= 2.0 &&
-                (measured_i_abs + std::max(0.6, target_i * 0.12)) < target_i;
+                sustained_phase && target_recent && measured_i_valid && expected_i >= 2.0 &&
+                (measured_i_abs + std::max(0.6, expected_i * 0.12)) < expected_i;
             auto& last_log = current_underdelivery_log_[c.id];
             if (underdelivering_now) {
                 auto& since = current_underdelivery_since_[c.id];
@@ -6585,7 +6609,7 @@ void OcppAdapter::apply_power_plan() {
                         EVLOG_warning << "Connector " << c.id
                                       << " module underdelivery observed target_I=" << target_i
                                       << "A measured_I=" << measured_i_abs
-                                      << "A offered_I=" << limits.max_current_a.value() << "A";
+                                      << "A offered_I=" << offered_i << "A";
                         last_log = now;
                     }
                 }

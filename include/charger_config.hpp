@@ -169,6 +169,9 @@ struct ChargerConfig {
     int hlc_auth_timeout_s{150};
     int pnc_block_ttl_s{1200};
     int power_request_timeout_s{60};
+    // Grace window before force-stopping long CP=B + no-output sessions while still plugged in.
+    // 0 disables this stop condition (vehicle-friendly default is to wait for EV/unplug events).
+    int suspended_no_output_stop_s{600};
     // Allow more time for PLCs that acknowledge EVSE limits slowly during precharge/auth phases.
     int evse_limit_ack_timeout_ms{5000};
     int telemetry_timeout_ms{2000};

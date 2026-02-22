@@ -231,6 +231,8 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.hlc_auth_timeout_s = timeouts.value("hlcAuthorizationSeconds", cfg.hlc_auth_timeout_s);
     cfg.pnc_block_ttl_s = timeouts.value("pncBlockSeconds", cfg.pnc_block_ttl_s);
     cfg.power_request_timeout_s = timeouts.value("powerRequestSeconds", cfg.power_request_timeout_s);
+    cfg.suspended_no_output_stop_s =
+        timeouts.value("suspendedNoOutputStopSeconds", cfg.suspended_no_output_stop_s);
     cfg.evse_limit_ack_timeout_ms = timeouts.value("evseLimitAckMs", cfg.evse_limit_ack_timeout_ms);
     cfg.telemetry_timeout_ms = timeouts.value("telemetryTimeoutMs", cfg.telemetry_timeout_ms);
     cfg.plc_present_warn_ms = timeouts.value("plcPresentWarnMs", cfg.plc_present_warn_ms);
@@ -311,6 +313,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     // Keep the legacy default (60s) only when the value is negative/invalid.
     if (cfg.power_request_timeout_s < 0) {
         cfg.power_request_timeout_s = 60;
+    }
+    // suspendedNoOutputStopSeconds == 0 disables auto-stop on long SuspendedEV/no-output.
+    if (cfg.suspended_no_output_stop_s < 0) {
+        cfg.suspended_no_output_stop_s = 600;
     }
     if (cfg.evse_limit_ack_timeout_ms <= 0) {
         cfg.evse_limit_ack_timeout_ms = 5000;

@@ -139,6 +139,7 @@
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
     "powerRequestSeconds": 600,
+    "suspendedNoOutputStopSeconds": 600,
     "authorizationDeniedHoldSeconds": 5,
     "hlcAuthorizationSeconds": 150,
     "pncBlockSeconds": 1200

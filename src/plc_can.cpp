@@ -1096,11 +1096,14 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
     const int change_ms = compute_interval_ms(change_base_ms, kMinTxPresentMs, kPresentMaxIntervalMs, backoff_factor);
     const bool allow_change_tx = elapsed >= change_ms;
     const bool allow_keepalive_tx = elapsed >= keepalive_ms;
+    // Keep urgent relay retries responsive, but still cadence-limited so ENOBUFS cannot
+    // trigger a per-loop retry storm.
+    const bool allow_urgent_tx = st.relay_tx_urgent && elapsed >= change_ms;
     if (st.tx_quiet_until.time_since_epoch().count() != 0 && now < st.tx_quiet_until && !st.relay_tx_urgent &&
         !st.relay_state_dirty) {
         return;
     }
-    if (!(payload_changed ? allow_change_tx : allow_keepalive_tx) && !st.relay_tx_urgent) {
+    if (!(payload_changed ? allow_change_tx : allow_keepalive_tx) && !allow_urgent_tx) {
         return;
     }
     const TxPriority pri = (st.relay_tx_urgent || st.relay_state_dirty) ? TxPriority::Control : TxPriority::Heartbeat;
@@ -1133,8 +1136,11 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
             const int level = std::max(0, std::min(3, backpressure_level_.load(std::memory_order_relaxed)));
             st.tx_backpressure_level_hits[static_cast<std::size_t>(level)]++;
         }
-        if (had_dirty) st.relay_state_dirty = true;
-        if (had_urgent) st.relay_tx_urgent = true;
+        const bool backpressure_err = (tx_errno == ENOBUFS || tx_errno == EAGAIN || tx_errno == EWOULDBLOCK);
+        // Preserve pending state until a successful TX, but do not re-arm immediate urgent retries
+        // on backpressure errors; those must retry on normal cadence.
+        if (had_dirty || (had_urgent && backpressure_err)) st.relay_state_dirty = true;
+        if (had_urgent && !backpressure_err) st.relay_tx_urgent = true;
         const auto warn_now = std::chrono::steady_clock::now();
         const bool log_now = st.last_tx_warn.time_since_epoch().count() == 0 ||
                              (warn_now - st.last_tx_warn) > std::chrono::milliseconds(500);
