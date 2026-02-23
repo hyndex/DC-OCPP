@@ -83,6 +83,17 @@ constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(8);
 constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(8);
 constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
 constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
+// Reduce command churn once modules are tracking requested setpoints.
+constexpr int MODULE_STABLE_CONTROL_REFRESH_FACTOR = 4;
+constexpr int MODULE_STABLE_CONTROL_REFRESH_MIN_MS = 2000;
+constexpr int MODULE_STABLE_CONTROL_REFRESH_MAX_MS = 5000;
+constexpr double MODULE_TRACKING_CURRENT_RATIO = 0.80;
+constexpr double MODULE_TRACKING_CURRENT_MARGIN_A = 1.5;
+// Planner issues commands at 50 ms cadence; suppress identical repeats inside this window.
+constexpr auto MODULE_COMMAND_CACHE_WINDOW = std::chrono::milliseconds(120);
+constexpr double MODULE_COMMAND_CACHE_EPS_V = 0.05;
+constexpr double MODULE_COMMAND_CACHE_EPS_A = 0.05;
+constexpr double MODULE_COMMAND_CACHE_EPS_KW = 0.05;
 constexpr int MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS = 180;
 // Keep last valid current telemetry through short module/CAN jitter windows.
 constexpr int MODULE_CURRENT_VALID_HOLD_WINDOWS = 8;
@@ -104,6 +115,43 @@ inline std::chrono::milliseconds current_valid_hold_window(std::chrono::millisec
     const int hold_ms = static_cast<int>(
         std::clamp<int64_t>(raw_ms, MODULE_CURRENT_VALID_HOLD_MIN_MS, MODULE_CURRENT_VALID_HOLD_MAX_MS));
     return std::chrono::milliseconds(hold_ms);
+}
+
+inline std::chrono::milliseconds control_refresh_interval(const ModuleSpec& spec, bool stable_tracking) {
+    const int base_ms = std::max(500, spec.cmd_interval_ms);
+    if (!stable_tracking) {
+        return std::chrono::milliseconds(base_ms);
+    }
+    const int64_t scaled_ms = static_cast<int64_t>(base_ms) * MODULE_STABLE_CONTROL_REFRESH_FACTOR;
+    const int stable_ms = static_cast<int>(std::clamp<int64_t>(scaled_ms,
+                                                                MODULE_STABLE_CONTROL_REFRESH_MIN_MS,
+                                                                MODULE_STABLE_CONTROL_REFRESH_MAX_MS));
+    return std::chrono::milliseconds(stable_ms);
+}
+
+inline bool module_current_tracking(double measured_a, double requested_a) {
+    const double requested = std::max(0.0, requested_a);
+    if (requested <= 0.5) {
+        return true;
+    }
+    const double threshold = (requested <= 2.0)
+                                 ? 0.5
+                                 : std::max(MODULE_TRACKING_CURRENT_MARGIN_A,
+                                            requested * MODULE_TRACKING_CURRENT_RATIO);
+    return measured_a >= threshold;
+}
+
+inline bool finite_approx_equal(double lhs, double rhs, double eps) {
+    return std::isfinite(lhs) && std::isfinite(rhs) && std::fabs(lhs - rhs) <= eps;
+}
+
+inline bool same_command_request(const ModuleCommandRequest& lhs, const ModuleCommandRequest& rhs) {
+    return lhs.slot_id == rhs.slot_id &&
+           lhs.mask == rhs.mask &&
+           lhs.enable == rhs.enable &&
+           finite_approx_equal(lhs.voltage_v, rhs.voltage_v, MODULE_COMMAND_CACHE_EPS_V) &&
+           finite_approx_equal(lhs.current_a, rhs.current_a, MODULE_COMMAND_CACHE_EPS_A) &&
+           finite_approx_equal(lhs.power_kw, rhs.power_kw, MODULE_COMMAND_CACHE_EPS_KW);
 }
 
 constexpr uint32_t RECTIFIER_STATUS_IGNORE_MASK =
@@ -942,18 +990,18 @@ public:
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
-        const auto cmd_refresh_interval = std::chrono::milliseconds(std::max(500, spec_.cmd_interval_ms));
         const auto control_retry_interval = std::chrono::milliseconds(std::max(100, spec_.cmd_interval_ms));
         const bool control_retry_due =
             last_control_attempt_.time_since_epoch().count() == 0 ||
             (now - last_control_attempt_) >= control_retry_interval;
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         // Keep command granularity aligned with the 0.1A EV/PLC contract.
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
         const bool power_changed = std::fabs(sp.power_kw - last_sent_.power_kw) > 0.1;
+        const bool power_control_active = spec_.send_output_power;
+        const bool power_changed_effective = power_control_active && power_changed;
         const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
                                       (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
                                       (!std::isfinite(sp.power_kw) || sp.power_kw < 0.0);
@@ -985,6 +1033,12 @@ public:
         const bool module_off_known = have_recent_status;
         const bool module_off =
             have_recent_status && ((telemetry_.alarms & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0);
+        const bool severe_alarm_active = (telemetry_.alarms & MAXWELL_ALARM_SEVERE_MASK) != 0;
+        const bool steady_tracking =
+            sp.enable && have_recent_status && !module_off && !severe_alarm_active &&
+            module_current_tracking(telemetry_.current_a, sp.current_a);
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
+        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
@@ -1000,7 +1054,7 @@ public:
         const bool control_update_due = sp.enable &&
                                         (enable_edge_on ||
                                          (control_retry_due &&
-                                          (voltage_changed || current_changed || power_changed ||
+                                          (voltage_changed || current_changed || power_changed_effective ||
                                            periodic_refresh)));
 
         const bool should_send = control_update_due || need_off_command;
@@ -1161,7 +1215,10 @@ public:
         if (attempted_control) {
             last_control_attempt_ = now;
         }
-        if (sent_control || should_send) {
+        // Advance refresh timing only when we actually attempted/sent module control traffic.
+        // This prevents non-actionable planner deltas (e.g. power_kw while send_output_power=false)
+        // from starving periodic current/voltage keepalive commands.
+        if (sent_control || attempted_control) {
             last_tx_ = now;
         }
     }
@@ -1742,8 +1799,6 @@ public:
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
-        const auto cmd_refresh_interval = std::chrono::milliseconds(std::max(500, spec_.cmd_interval_ms));
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
@@ -1778,6 +1833,11 @@ public:
             (now - last_status_update_) <= telemetry_stale_interval(spec_);
         const bool module_off_known = have_recent_status;
         const bool module_off = have_recent_status && ((last_status_bits_ & (1u << 25)) != 0);
+        const bool steady_tracking =
+            sp.enable && have_recent_status && !module_off && !telemetry_.fault &&
+            module_current_tracking(telemetry_.current_a, sp.current_a);
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
+        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
@@ -2141,14 +2201,20 @@ public:
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
-        const auto cmd_refresh_interval = std::chrono::milliseconds(std::max(500, spec_.cmd_interval_ms));
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         // Keep command granularity aligned with the 0.1A EV/PLC contract.
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
         const bool module_off = last_state_ != TONHE_STATE_ON;
+        const bool have_recent_status =
+            telemetry_.last_update.time_since_epoch().count() != 0 &&
+            (now - telemetry_.last_update) <= telemetry_stale_interval(spec_);
+        const bool steady_tracking =
+            sp.enable && have_recent_status && !module_off && !telemetry_.fault &&
+            module_current_tracking(telemetry_.current_a, sp.current_a);
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
+        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
@@ -2354,6 +2420,12 @@ public:
         std::chrono::steady_clock::time_point hold_until{};
     };
 
+    struct LastAppliedRequestState {
+        bool valid{false};
+        ModuleCommandRequest req{};
+        std::chrono::steady_clock::time_point last_forwarded{};
+    };
+
     PowerModuleControllerImpl() = default;
     explicit PowerModuleControllerImpl(std::vector<ModuleSpec> specs) { set_modules(std::move(specs)); }
 
@@ -2376,6 +2448,7 @@ public:
         slot_index_.clear();
         poll_rr_cursor_by_iface_.clear();
         current_hold_by_slot_.clear();
+        last_applied_req_by_slot_.clear();
         std::set<std::string> ifaces;
         for (auto& spec : specs) {
             if (spec.type.empty()) {
@@ -2425,8 +2498,14 @@ public:
 
     void apply(const ModuleCommandRequest& req) {
         std::lock_guard<std::mutex> lock(mtx_);
+        const auto now = std::chrono::steady_clock::now();
         const auto it = slot_index_.find(req.slot_id);
         if (it == slot_index_.end()) {
+            return;
+        }
+        auto& cache = last_applied_req_by_slot_[req.slot_id];
+        if (cache.valid && same_command_request(cache.req, req) &&
+            (now - cache.last_forwarded) < MODULE_COMMAND_CACHE_WINDOW) {
             return;
         }
         const auto& indices = it->second;
@@ -2459,6 +2538,9 @@ public:
                 mod.driver->apply(sp);
             }
         }
+        cache.valid = true;
+        cache.req = req;
+        cache.last_forwarded = now;
     }
 
     ModuleHealthSnapshot snapshot(int slot_id) const {
@@ -2652,6 +2734,7 @@ private:
     std::map<int, std::vector<size_t>> slot_index_;
     std::map<std::string, size_t> poll_rr_cursor_by_iface_;
     mutable std::unordered_map<int, CurrentHoldState> current_hold_by_slot_;
+    std::unordered_map<int, LastAppliedRequestState> last_applied_req_by_slot_;
     ModuleCanTrafficPolicy policy_{};
 };
 } // namespace
