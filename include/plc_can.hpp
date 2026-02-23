@@ -200,6 +200,10 @@ private:
         bool meter_available{true};
         uint64_t tlm_v3_crc_fail_count{0};
         std::chrono::steady_clock::time_point last_tlm_crc_warn{};
+        // v3 safety bits are latched in telemetry between frames; require consecutive asserted frames
+        // before treating critical trips as real to avoid one-frame false positives.
+        uint8_t estop_active_streak{0};
+        uint8_t earth_fault_streak{0};
         // Debounce safety-related trips to avoid flapping on single-frame glitches.
         std::chrono::steady_clock::time_point safety_trip_since{};
         std::chrono::steady_clock::time_point estop_trip_since{};

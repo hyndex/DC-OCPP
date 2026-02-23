@@ -318,6 +318,10 @@ private:
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
     std::map<int, double> last_ev_target_power_kw_;
+    std::map<int, std::chrono::steady_clock::time_point> last_nonzero_req_kw_seen_;
+    std::map<int, std::chrono::steady_clock::time_point> last_hlc_power_phase_seen_;
+    std::map<int, std::chrono::steady_clock::time_point> session_ready_hold_until_;
+    std::map<int, std::chrono::steady_clock::time_point> session_absent_since_;
     std::map<int, std::string> last_plan_session_id_;
     std::map<std::string, ContactorState> last_gc_state_;
     std::map<std::string, ContactorState> last_mc_state_;

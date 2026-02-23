@@ -202,9 +202,17 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.plc_use_crc8 = plc_cfg.value("useCRC8", true);
     cfg.plc_owns_gun_relay = plc_cfg.value("gunRelayOwnedByPlc", false);
     cfg.plc_module_relays_enabled = plc_cfg.value("moduleRelaysEnabled", true);
-    cfg.plc_relay3_enabled = plc_cfg.value("relay3Enabled", true);
+    const bool requested_relay3_enabled = plc_cfg.value("relay3Enabled", false);
+    cfg.plc_relay3_enabled = false; // Relay3 islanding is retired in single-island-contactor architecture.
     cfg.plc_relay_mode = parse_plc_relay_mode(plc_cfg.value("relayMode", "ties"));
-    cfg.plc_relay_feedback = plc_cfg.value("relayFeedbackAvailable", true);
+    const bool requested_relay_feedback = plc_cfg.value("relayFeedbackAvailable", false);
+    cfg.plc_relay_feedback = false; // No AUX feedback path; run commanded-state model.
+    if (requested_relay3_enabled) {
+        std::cerr << "[cfg] plc.relay3Enabled=true is ignored (single-island-contactor mode uses Relay2 only)\n";
+    }
+    if (requested_relay_feedback) {
+        std::cerr << "[cfg] plc.relayFeedbackAvailable=true is ignored (commanded-state model is enforced)\n";
+    }
     cfg.autocharge_id_source = normalize_autocharge_source(
         plc_cfg.value("autochargeIdSource", cfg.autocharge_id_source));
     cfg.require_https_uploads = plc_cfg.value("requireHttpsUploads", true);
@@ -386,6 +394,11 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.can_traffic.over_cap_debounce_ms < 0) {
         cfg.can_traffic.over_cap_debounce_ms = 0;
+    }
+    if (cfg.allow_cross_slot_islands) {
+        std::cerr << "[cfg] planner.allowCrossSlotIslands=true is not supported in single-island-contactor mode; "
+                     "forcing false\n";
+        cfg.allow_cross_slot_islands = false;
     }
     if (!cfg.plc_module_relays_enabled) {
         throw std::runtime_error(

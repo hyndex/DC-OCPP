@@ -115,10 +115,10 @@ struct ChargerConfig {
     bool plc_backend_available{false}; // Set at runtime when PLC backend actually initialized
     bool plc_use_crc8{true};
     bool plc_owns_gun_relay{false}; // When true, controller will not command GC relay; PLC owns it
-    bool plc_module_relays_enabled{true}; // Drive PLC auxiliary relays as tie contactors
-    bool plc_relay3_enabled{true}; // When false, Relay3 is never driven by controller
+    bool plc_module_relays_enabled{true}; // Drive PLC auxiliary relays as tie/island contactors
+    bool plc_relay3_enabled{false}; // Deprecated: single-island-contactor mode never drives Relay3
     PlcRelayMode plc_relay_mode{PlcRelayMode::Ties}; // Split charging: relay bits [1..2] drive tie contactors
-    bool plc_relay_feedback{true}; // When false, assume relay commands succeed (no relay feedback available)
+    bool plc_relay_feedback{false}; // Commanded-state model; AUX relay feedback is not used
     std::string autocharge_id_source{"evmac"}; // "evmac", "evccid", or "emaid"
     bool require_https_uploads{true};
     double module_power_kw{30.0};

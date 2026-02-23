@@ -152,6 +152,7 @@ struct PlcTlmV3 {
     uint8_t limits_rx_count_lsb{0};
     double ev_target_voltage_v{0.0};
     double ev_target_current_a{0.0};
+    bool ev_target_recent{false};
     bool crc_ok{true};
 };
 
@@ -182,6 +183,7 @@ inline std::array<uint8_t, 8> build_plc_tlm_v3(uint8_t cp_state_enum,
                                                uint8_t limits_rx_count_lsb,
                                                uint16_t ev_target_voltage_1v,
                                                uint16_t ev_target_current_0p1a,
+                                               bool ev_target_recent,
                                                bool use_crc8) {
     std::array<uint8_t, 8> data{};
     uint64_t packed = 0;
@@ -201,6 +203,7 @@ inline std::array<uint8_t, 8> build_plc_tlm_v3(uint8_t cp_state_enum,
     packed |= static_cast<uint64_t>(limits_rx_count_lsb) << 27;
     packed |= static_cast<uint64_t>(ev_target_voltage_1v & 0x03FFu) << 35;
     packed |= static_cast<uint64_t>(ev_target_current_0p1a & 0x03FFu) << 45;
+    packed |= static_cast<uint64_t>(ev_target_recent ? 1u : 0u) << 55;
     for (int i = 0; i < 7; ++i) {
         data[i] = static_cast<uint8_t>((packed >> (i * 8)) & 0xFFu);
     }
@@ -243,6 +246,7 @@ inline PlcTlmV3 decode_plc_tlm_v3(const uint8_t in[8], bool use_crc8) {
     const uint16_t v_1v = static_cast<uint16_t>((packed >> 35) & 0x03FFu);
     // PLC telemetry encodes target current in 0.1A steps in a 10-bit field (0..102.3A).
     const uint16_t i_0p1a = static_cast<uint16_t>((packed >> 45) & 0x03FFu);
+    st.ev_target_recent = ((packed >> 55) & 0x01u) != 0;
     st.ev_target_voltage_v = static_cast<double>(v_1v);
     st.ev_target_current_a = static_cast<double>(i_0p1a) * 0.1;
     return st;

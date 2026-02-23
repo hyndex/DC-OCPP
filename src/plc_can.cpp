@@ -69,11 +69,9 @@ uint8_t module_relay_enable_mask(const ChargerConfig& cfg) {
     if (!cfg.plc_module_relays_enabled) {
         return 0u;
     }
-    uint8_t mask = kRelayModule0Mask;
-    if (cfg.plc_relay3_enabled) {
-        mask = static_cast<uint8_t>(mask | kRelayModule1Mask);
-    }
-    return mask;
+    // Single-island-contactor architecture: Relay2 is the only module-side island relay.
+    // Relay3 is intentionally not used for islanding in production control.
+    return kRelayModule0Mask;
 }
 
 bool is_printable_ascii(const std::vector<uint8_t>& bytes) {
@@ -741,6 +739,21 @@ void PlcCanHardware::handle_frame(const std::string& iface, uint32_t can_id, con
         st->last_safety.earth_fault = tlm.earth_fault;
         st->last_safety.crc_ok = tlm.crc_ok;
 
+        if (tlm.estop) {
+            if (st->estop_active_streak < 0xFFu) {
+                st->estop_active_streak++;
+            }
+        } else {
+            st->estop_active_streak = 0;
+        }
+        if (tlm.earth_fault) {
+            if (st->earth_fault_streak < 0xFFu) {
+                st->earth_fault_streak++;
+            }
+        } else {
+            st->earth_fault_streak = 0;
+        }
+
         st->last_relay_rx = now;
         st->last_safety_rx = now;
 
@@ -748,7 +761,7 @@ void PlcCanHardware::handle_frame(const std::string& iface, uint32_t can_id, con
         st->ev_target_current_a = tlm.ev_target_current_a;
         const bool precharge_stage =
             tlm.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) && !tlm.charge_complete;
-        if (cp_allows_power(tlm.cp_state) || precharge_stage) {
+        if (tlm.ev_target_recent && (cp_allows_power(tlm.cp_state) || precharge_stage)) {
             st->last_ev_targets_rx = now;
         }
 
@@ -893,11 +906,9 @@ bool PlcCanHardware::set_relay_command(PlcState& st, bool gun_on, uint8_t module
     const uint8_t module_enable_mask = module_relay_enable_mask(cfg_);
     if (module_enable_mask != 0u) {
         enable_mask |= module_enable_mask;
-        if (module_mask & 0x01u) {
+        // Collapse planner/module slot intent onto the single physical island relay.
+        if ((module_mask & 0x03u) != 0u) {
             cmd_mask |= kRelayModule0Mask;
-        }
-        if ((module_enable_mask & kRelayModule1Mask) != 0u && (module_mask & 0x02u)) {
-            cmd_mask |= kRelayModule1Mask;
         }
     }
     const bool relay_force_off = force_off && !cfg_.plc_owns_gun_relay;
@@ -1646,10 +1657,18 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     const bool safety_status_ok =
         !safety_fresh ? true : (st.last_safety.safety_ok && !st.last_safety.earth_fault);
     const bool raw_safety_ok = relay_safety_ok && safety_status_ok;
-    const bool raw_estop =
+    const bool raw_estop_unconfirmed =
         (relay_feedback ? (st.last_relay.estop_latched || st.last_relay.estop_input) : false) ||
         st.last_safety.estop_latched || st.last_safety.estop_input;
-    const bool raw_earth_fault = (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
+    const bool raw_earth_unconfirmed =
+        (relay_feedback ? st.last_relay.earth_fault : false) || st.last_safety.earth_fault;
+    const bool use_v3_safety_confirmation = st.rx_tlm_v3 > 0;
+    const bool raw_estop = use_v3_safety_confirmation
+                               ? (raw_estop_unconfirmed && st.estop_active_streak >= 2)
+                               : raw_estop_unconfirmed;
+    const bool raw_earth_fault = use_v3_safety_confirmation
+                                     ? (raw_earth_unconfirmed && st.earth_fault_streak >= 2)
+                                     : raw_earth_unconfirmed;
 
     auto debounced_active = [&](bool active, std::chrono::steady_clock::time_point& since,
                                 std::chrono::milliseconds debounce) -> bool {
@@ -1664,19 +1683,21 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         return (now - since) >= debounce;
     };
 
-	    constexpr std::chrono::milliseconds kSafetyTripDebounceMs(200);
-	    constexpr std::chrono::milliseconds kCriticalTripDebounceMs(100);
-	    // Relax comm debounce to reduce false positives when PLC is slow to report.
-	    constexpr std::chrono::milliseconds kCommTripDebounceMs(6000);
-	    const bool safety_trip = debounced_active(!raw_safety_ok, st.safety_trip_since, kSafetyTripDebounceMs);
-	    const bool estop_trip = debounced_active(raw_estop, st.estop_trip_since, kCriticalTripDebounceMs);
-	    const bool earth_trip = debounced_active(raw_earth_fault, st.earth_trip_since, kCriticalTripDebounceMs);
-	    bool comm_trip = debounced_active(raw_comm_fault, st.comm_trip_since, kCommTripDebounceMs);
+    constexpr std::chrono::milliseconds kSafetyTripDebounceMs(200);
+    constexpr std::chrono::milliseconds kCriticalTripDebounceLegacyMs(100);
+    // Relax comm debounce to reduce false positives when PLC is slow to report.
+    constexpr std::chrono::milliseconds kCommTripDebounceMs(6000);
+    const auto critical_debounce =
+        use_v3_safety_confirmation ? std::chrono::milliseconds(0) : kCriticalTripDebounceLegacyMs;
+    const bool safety_trip = debounced_active(!raw_safety_ok, st.safety_trip_since, kSafetyTripDebounceMs);
+    const bool estop_trip = debounced_active(raw_estop, st.estop_trip_since, critical_debounce);
+    const bool earth_trip = debounced_active(raw_earth_fault, st.earth_trip_since, critical_debounce);
+    bool comm_trip = debounced_active(raw_comm_fault, st.comm_trip_since, kCommTripDebounceMs);
 
-	    gs.comm_fault = comm_trip;
-	    gs.safety_ok = !safety_trip;
-	    gs.estop = estop_trip;
-	    gs.earth_fault = earth_trip;
+    gs.comm_fault = comm_trip;
+    gs.safety_ok = !safety_trip;
+    gs.estop = estop_trip;
+    gs.earth_fault = earth_trip;
         // Map earth/IMD faults into the higher-level isolation fault used by the controller/PLC contract.
         gs.isolation_fault = earth_trip;
     if (relay_feedback) {
@@ -1993,11 +2014,12 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     if (it == connectors_.end()) return;
     auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
-    // `cmd.module_mask` drives the two auxiliary relay outputs as KM_A/KM_B
-    // (module bus sectionalizers owned by this PLC).
-    uint8_t relay_mask = static_cast<uint8_t>(cmd.module_mask & 0x03u);
+    // Single-island-contactor architecture:
+    // `cmd.module_mask` may still encode multi-slot planner intent, but only one physical
+    // module-side relay output (Relay2 / KM_A) is driven per PLC.
+    uint8_t relay_mask = ((cmd.module_mask & 0x03u) != 0u) ? 0x01u : 0u;
     if (relay_mask == 0u && cmd.module_count > 0 && cmd.mc_closed && cfg_.plc_module_relays_enabled) {
-        const int capped = std::max(0, std::min(cmd.module_count, 2));
+        const int capped = std::max(0, std::min(cmd.module_count, 1));
         const uint8_t fallback_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
         if (fallback_mask != 0u) {
             static std::map<int, std::chrono::steady_clock::time_point> last_log;
@@ -2138,7 +2160,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
     if (it == connectors_.end()) return;
     auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
-    const int capped = std::max(0, std::min(modules, 2));
+    const int capped = std::max(0, std::min(modules, 1));
     uint8_t module_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
     bool want_power = capped > 0;
     bool force_off = false;

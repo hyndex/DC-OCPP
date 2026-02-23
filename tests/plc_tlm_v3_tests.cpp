@@ -41,7 +41,8 @@ int main() {
         /*charge_complete=*/false,
         /*limits_rx_count_lsb=*/0xA7,
         /*ev_target_voltage_1v=*/800,
-        /*ev_target_current_0p5a=*/321, // 160.5 A
+        /*ev_target_current_0p1a=*/321, // 32.1 A
+        /*ev_target_recent=*/true,
         /*use_crc8=*/true);
     const auto tlm = can_contract::decode_plc_tlm_v3(data.data(), /*use_crc8=*/true);
     assert(tlm.crc_ok);
@@ -60,7 +61,7 @@ int main() {
     assert(!tlm.charge_complete);
     assert(tlm.limits_rx_count_lsb == 0xA7);
     assert(nearly_equal(tlm.ev_target_voltage_v, 800.0));
-    assert(nearly_equal(tlm.ev_target_current_a, 160.5));
+    assert(nearly_equal(tlm.ev_target_current_a, 32.1));
 
     // CRC failure should be detected when enabled.
     auto bad = data;
@@ -85,7 +86,8 @@ int main() {
         /*charge_complete=*/true,
         /*limits_rx_count_lsb=*/0xFF,
         /*ev_target_voltage_1v=*/4095,
-        /*ev_target_current_0p5a=*/4095,
+        /*ev_target_current_0p1a=*/4095,
+        /*ev_target_recent=*/true,
         /*use_crc8=*/true);
     const auto tlm_clamped = can_contract::decode_plc_tlm_v3(clamped.data(), /*use_crc8=*/true);
     assert(tlm_clamped.crc_ok);
@@ -95,7 +97,7 @@ int main() {
     assert(tlm_clamped.relay_state_mask == 0x07);
     assert(tlm_clamped.relay_fault_mask == 0x07);
     assert(nearly_equal(tlm_clamped.ev_target_voltage_v, 1023.0));
-    assert(nearly_equal(tlm_clamped.ev_target_current_a, 511.5));
+    assert(nearly_equal(tlm_clamped.ev_target_current_a, 102.3));
 
     // CRC disabled mode should not fail decode.
     auto no_crc = can_contract::build_plc_tlm_v3(
@@ -114,7 +116,8 @@ int main() {
         /*charge_complete=*/false,
         /*limits_rx_count_lsb=*/1,
         /*ev_target_voltage_1v=*/400,
-        /*ev_target_current_0p5a=*/80,
+        /*ev_target_current_0p1a=*/80,
+        /*ev_target_recent=*/false,
         /*use_crc8=*/false);
     const auto tlm_no_crc = can_contract::decode_plc_tlm_v3(no_crc.data(), /*use_crc8=*/false);
     assert(tlm_no_crc.crc_ok);

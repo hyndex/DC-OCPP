@@ -90,7 +90,7 @@ struct GunStatus {
 struct PowerCommand {
     std::int32_t connector{0};
     int module_count{0};
-    uint8_t module_mask{0}; // bit0 -> slot module[0], bit1 -> slot module[1], etc.
+    uint8_t module_mask{0}; // single-island-contactor mode: non-zero drives Relay2 (legacy bit1 is collapsed).
     bool gc_closed{false};
     bool mc_closed{false};
     double voltage_set_v{0.0};

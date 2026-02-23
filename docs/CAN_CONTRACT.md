@@ -16,7 +16,7 @@ controller (DC-OCPP + power/module orchestration).
 
 - PLC → Controller
   - `0x0400|(0x6<<4)|plc_id` `PLC_TLM_V3`
-    - Combined CP/HLC/relay/safety flags + EV targets + `limits_rx_count_lsb`.
+    - Combined CP/HLC/relay/safety flags + EV targets + target-recency bit + `limits_rx_count_lsb`.
     - Byte7: CRC8.
   - `0x0100|(0x7<<4)|plc_id` `ENERGY_METER` (if enabled)
   - `0x0100|(0x8<<4)|plc_id` `RFID_EVENT` (segmented UID events, if enabled)
@@ -36,8 +36,12 @@ controller (DC-OCPP + power/module orchestration).
 - **Gun contactor (GC) ownership is PLC-only when `plc.gunRelayOwnedByPlc=true` (default: false).**
   - Controller will not set GC bits in `EVSE_FAST` when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
-- Auxiliary relays (RLY2/RLY3) are used as KM_A/KM_B bus sectionalizers when `plc.moduleRelaysEnabled=true`
-  (module-level ring cuts; bit0=KM_A, bit1=KM_B).
+- Auxiliary relay control is **single-contactor per PLC** in production:
+  - `RLY2` (`KM_A`) is the only module/island relay driven by controller logic.
+  - `RLY3` (`KM_B`) is not used for islanding.
+  - Any legacy second-bit planner intent is collapsed into the single `RLY2` command.
+- `plc.relayFeedbackAvailable` is currently treated as unavailable in production mode; controller assumes
+  commanded relay state (no AUX feedback dependency).
 - `CLEAR_FAULTS` in `EVSE_FAST` is asserted only on explicit operator/service request (no auto-clear on any fault).
 
 ## Fault propagation (controller → PLC)
