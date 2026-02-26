@@ -69,7 +69,7 @@ uint8_t module_relay_enable_mask(const ChargerConfig& cfg) {
     if (!cfg.plc_module_relays_enabled) {
         return 0u;
     }
-    // Single-island-contactor architecture: Relay2 is the only module-side island relay.
+    // Single-island-contactor architecture: Relay2 is the only tie/island relay.
     // Relay3 is intentionally not used for islanding in production control.
     return kRelayModule0Mask;
 }
@@ -761,7 +761,28 @@ void PlcCanHardware::handle_frame(const std::string& iface, uint32_t can_id, con
         st->ev_target_current_a = tlm.ev_target_current_a;
         const bool precharge_stage =
             tlm.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) && !tlm.charge_complete;
-        if (tlm.ev_target_recent && (cp_allows_power(tlm.cp_state) || precharge_stage)) {
+        const bool precharge_active = tlm.precharge_active || precharge_stage;
+        const bool hlc_power_stage = tlm.hlc_stage >= kHlcMinPowerStage && !tlm.charge_complete;
+        // Ignore CP-only target freshness once HLC stage has reset to idle (stage=0). This prevents
+        // stale target payloads from being carried across peer-close/session teardown.
+        const bool cp_target_window = cp_allows_power(tlm.cp_state) && tlm.hlc_stage > 0;
+        const bool target_window_active = cp_target_window || precharge_active || hlc_power_stage;
+        const bool target_payload_valid = tlm.ev_target_voltage_v > 10.0 && tlm.ev_target_current_a >= 0.0;
+        // Keep synthetic freshness short and stage-aware. Long, stage-wide synthetic freshness can
+        // mask missing inbound CurrentDemand frames and keep stale EV targets alive after peer-close.
+        constexpr auto kSyntheticTargetFreshHoldMs = std::chrono::milliseconds(3000);
+        const bool strict_recent =
+            st->last_ev_targets_strict_rx.time_since_epoch().count() != 0 &&
+            (now - st->last_ev_targets_strict_rx) <= kSyntheticTargetFreshHoldMs;
+        const bool allow_precharge_fallback = precharge_active && !hlc_power_stage;
+        if (tlm.ev_target_recent && target_window_active) {
+            st->last_ev_targets_rx = now;
+            st->last_ev_targets_strict_rx = now;
+        } else if (target_payload_valid && target_window_active &&
+                   (strict_recent || allow_precharge_fallback)) {
+            // Some PLC builds can transiently deassert `ev_target_recent` while still carrying a valid
+            // target during active precharge/power phases. Keep target freshness alive for a bounded
+            // hold window to avoid dropping to measured-voltage fallback mid-session.
             st->last_ev_targets_rx = now;
         }
 
@@ -973,7 +994,9 @@ void PlcCanHardware::update_fast_tx(PlcState& st,
         chargeinfo_fresh &&
         st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
         !st.hlc_charge_complete;
-    const bool hlc_precharge_phase = chargeinfo_fresh && (st.hlc_precharge_active || precharge_from_stage);
+    // Treat only the explicit PRECHARGE stage as precharge. Ignore stale precharge_active
+    // on other HLC stages so relays are not held closed after session collapse.
+    const bool hlc_precharge_phase = precharge_from_stage;
     const bool hlc_power_phase = chargeinfo_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
     const bool hlc_session_active = hlc_precharge_phase || hlc_power_phase;
     // CP frames can briefly gap while HLC/session traffic is otherwise healthy.
@@ -1642,8 +1665,16 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     // RelayStatus comm_fault is transport health (not contactor aux feedback), so honor it even when
     // relay feedback contacts are unavailable on the harness.
     const bool relay_comm_fault = relay_seen && !relay_stale && st.last_relay.comm_fault;
+    const bool chargeinfo_state_fresh =
+        st.last_chargeinfo_rx.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last_chargeinfo_rx).count() <=
+            telemetry_timeout_ms_;
+    const bool precharge_stage_active =
+        chargeinfo_state_fresh &&
+        st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
+        !st.hlc_charge_complete;
     const bool comm_relevant = st.output_enabled || st.regulating || st.plugged_in || st.hlc_stage > 0 ||
-                               st.hlc_precharge_active || st.hlc_charge_complete || st.desired_relay_cmd_mask != 0 ||
+                               precharge_stage_active || st.hlc_charge_complete || st.desired_relay_cmd_mask != 0 ||
                                st.desired_sys_enable;
     const bool raw_comm_fault =
         comm_relevant &&
@@ -1710,7 +1741,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
         gs.relay_closed = st.sys_enable && !st.relay_force_off && (st.relay_cmd_mask & kRelayGunMask);
     }
     const bool idle_paths =
-        !st.regulating && !st.output_enabled && !st.plugged_in && st.hlc_stage == 0 && !st.hlc_precharge_active &&
+        !st.regulating && !st.output_enabled && !st.plugged_in && st.hlc_stage == 0 && !precharge_stage_active &&
         !st.hlc_charge_complete;
     if (idle_paths) {
         gs.relay_closed = false; // Assume open when no feedback hardware and no active session.
@@ -1842,8 +1873,7 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     gs.hlc_cable_check_ok = chargeinfo_fresh ? st.hlc_cable_checked : false;
     const bool precharge_from_stage =
         chargeinfo_fresh && st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) && !st.hlc_charge_complete;
-    gs.hlc_precharge_active =
-        chargeinfo_fresh ? (st.hlc_precharge_active || precharge_from_stage) : false;
+    gs.hlc_precharge_active = chargeinfo_fresh ? precharge_from_stage : false;
     gs.hlc_charge_complete = chargeinfo_fresh ? st.hlc_charge_complete : false;
     // Treat stage >= POWER_DELIVERY as power-ready even if `precharge_active` is stuck high.
     const bool hlc_ready = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !gs.hlc_charge_complete;
@@ -2014,25 +2044,9 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
     if (it == connectors_.end()) return;
     auto& st = it->second;
     const auto now = std::chrono::steady_clock::now();
-    // Single-island-contactor architecture:
-    // `cmd.module_mask` may still encode multi-slot planner intent, but only one physical
-    // module-side relay output (Relay2 / KM_A) is driven per PLC.
-    uint8_t relay_mask = ((cmd.module_mask & 0x03u) != 0u) ? 0x01u : 0u;
-    if (relay_mask == 0u && cmd.module_count > 0 && cmd.mc_closed && cfg_.plc_module_relays_enabled) {
-        const int capped = std::max(0, std::min(cmd.module_count, 1));
-        const uint8_t fallback_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
-        if (fallback_mask != 0u) {
-            static std::map<int, std::chrono::steady_clock::time_point> last_log;
-            auto& last_ts = last_log[cmd.connector];
-            if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
-                EVLOG_warning << "PLC fallback module mask on connector " << cmd.connector
-                              << " mask=0x" << std::hex << static_cast<int>(fallback_mask) << std::dec
-                              << " module_count=" << cmd.module_count;
-                last_ts = now;
-            }
-        }
-        relay_mask = fallback_mask;
-    }
+    // Single source of truth for the PLC tie relay (Relay2 / R2):
+    // follow finalized MC command from planner/ocpp_adapter.
+    uint8_t relay_mask = (cfg_.plc_module_relays_enabled && cmd.mc_closed) ? 0x01u : 0u;
     bool gun_on = cmd.gc_closed;
     bool force_off = false;
     if (cfg_.use_plc) {
@@ -2046,7 +2060,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
             hlc_fresh &&
             st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
             !st.hlc_charge_complete;
-        const bool hlc_precharge_phase = hlc_fresh && (st.hlc_precharge_active || precharge_from_stage);
+        const bool hlc_precharge_phase = precharge_from_stage;
         const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
         const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
         if (hlc_active) {
@@ -2175,7 +2189,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
             hlc_fresh &&
             st.hlc_stage == static_cast<uint8_t>(kHlcMinPowerStage - 1) &&
             !st.hlc_charge_complete;
-        const bool hlc_precharge_phase = hlc_fresh && (st.hlc_precharge_active || precharge_from_stage);
+        const bool hlc_precharge_phase = precharge_from_stage;
         const bool hlc_power_phase = hlc_fresh && st.hlc_stage >= kHlcMinPowerStage && !st.hlc_charge_complete;
         const bool hlc_active = hlc_precharge_phase || hlc_power_phase;
         if (hlc_active) {

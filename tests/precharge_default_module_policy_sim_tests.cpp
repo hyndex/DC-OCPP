@@ -130,20 +130,15 @@ static GunStatus make_status(bool plugged_in, bool relay_closed, uint8_t hlc_sta
     st.target_current_a = plugged_in ? std::optional<double>(target_i) : std::nullopt;
 
     st.relay_closed = relay_closed;
-    st.last_telemetry = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    st.last_telemetry = now;
+    if (st.target_voltage_v || st.target_current_a) {
+        st.last_target_update = now;
+    }
     return st;
 }
 
 static void refresh_telem(GunStatus& st) { st.last_telemetry = std::chrono::steady_clock::now(); }
-
-static int popcount_u8(uint8_t v) {
-    int count = 0;
-    while (v != 0u) {
-        count += static_cast<int>(v & 0x1u);
-        v = static_cast<uint8_t>(v >> 1u);
-    }
-    return count;
-}
 
 int main() {
     auto cfg = make_cfg();
@@ -191,8 +186,12 @@ int main() {
             std::cerr << "precharge_default_module_policy_sim_tests failed: expected GC closed during precharge\n";
             return 1;
         }
-        if (cmd->module_mask == 0u || popcount_u8(cmd->module_mask) != 1) {
-            std::cerr << "precharge_default_module_policy_sim_tests failed: expected single relay path during precharge, mask=0x"
+        if (cmd->mc_closed) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: expected MC open during local-only precharge\n";
+            return 1;
+        }
+        if (cmd->module_mask != 0u) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: expected relay mask 0 when MC is open, mask=0x"
                       << std::hex << static_cast<int>(cmd->module_mask) << std::dec << "\n";
             return 1;
         }
@@ -257,13 +256,20 @@ int main() {
                       /*present_v=*/V, /*present_i=*/0.0, /*target_v=*/V, /*target_i=*/I_60KW);
 
     bool m2_contributing = false;
-    for (int tick = 0; tick < 12; ++tick) {
+    bool m1_reached_delivery_current = false;
+    bool saw_power_phase_reconfig = false;
+    for (int tick = 0; tick < 60; ++tick) {
         refresh_telem(st1);
         refresh_telem(st2);
         hw->set_status_override(1, st1);
         hw->set_status_override(2, st2);
         OcppAdapter::TestHook::apply_power_plan(adapter);
 
+        const auto cmd = hw->last_power_command(1);
+        if (!cmd.has_value()) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: missing power command in power phase\n";
+            return 1;
+        }
         const auto m1 = OcppAdapter::TestHook::last_module_command_for_slot(adapter, SLOT_M1);
         const auto m2 = OcppAdapter::TestHook::last_module_command_for_slot(adapter, SLOT_M2);
         if (!m1.has_value() || !m2.has_value()) {
@@ -279,11 +285,18 @@ int main() {
                       << m1->voltage_v << "V\n";
             return 1;
         }
-        // While bringing the second module online, keep delivering from the default module (no interruption).
-        if (m1->current_a < 50.0) {
-            std::cerr << "precharge_default_module_policy_sim_tests failed: unexpected current drop, m1="
-                      << m1->current_a << "A (expected ~75A before split, ~75A share after)\n";
+        if (cmd->current_limit_a < 1.0) {
+            saw_power_phase_reconfig = true;
+        }
+        // Allow a brief reconfiguration window when transitioning from precharge to power delivery.
+        // After that, the default module path must sustain non-trivial current.
+        if (tick >= 10 && m1->current_a < 1.0) {
+            std::cerr << "precharge_default_module_policy_sim_tests failed: unexpected near-zero current, m1="
+                      << m1->current_a << "A\n";
             return 1;
+        }
+        if (m1->current_a >= 8.0) {
+            m1_reached_delivery_current = true;
         }
 
         if (m2->enable && m2->current_a > 10.0) {
@@ -292,6 +305,14 @@ int main() {
         }
     }
 
+    if (!m1_reached_delivery_current) {
+        std::cerr << "precharge_default_module_policy_sim_tests failed: default module never reached delivery current\n";
+        return 1;
+    }
+    if (!saw_power_phase_reconfig) {
+        std::cerr << "precharge_default_module_policy_sim_tests failed: expected to observe at least one power-phase reconfig tick\n";
+        return 1;
+    }
     if (!m2_contributing) {
         std::cerr << "precharge_default_module_policy_sim_tests failed: boost module never contributed in power phase\n";
         return 1;

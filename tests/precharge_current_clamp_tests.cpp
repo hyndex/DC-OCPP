@@ -11,8 +11,15 @@ using namespace charger;
 static ChargerConfig make_cfg() {
     ChargerConfig cfg{};
     cfg.charge_point_id = "precharge-clamp-test";
-    cfg.connectors = {ConnectorConfig{.id = 1, .max_current_a = 80.0, .require_lock = false}};
+    cfg.connectors = {ConnectorConfig{.id = 1, .max_current_a = 80.0, .max_voltage_v = 1000.0, .require_lock = false}};
     cfg.precharge_max_current_a = 2.0;
+    cfg.planner_voltage_margin_v = 0.0;
+    cfg.planner_current_margin_a = 0.0;
+    cfg.planner_voltage_guard_band_v = 10.0;
+    cfg.planner_ramp_up_min_a_per_s = 1000.0;
+    cfg.planner_ramp_up_max_a_per_s = 1000.0;
+    cfg.planner_ramp_down_min_a_per_s = 1000.0;
+    cfg.planner_ramp_down_max_a_per_s = 1000.0;
     cfg.switch_stable_time_ms = 0;
     cfg.max_modules_per_gun = 1;
     cfg.ramp_step_a = 1000.0; // remove slew limit for test determinism
@@ -57,6 +64,7 @@ static GunStatus make_status(uint8_t hlc_stage, bool hlc_power_ready, bool hlc_p
     st.present_current_a = 0.0;
     st.target_voltage_v = target_v;
     st.target_current_a = target_i;
+    st.last_target_update = std::chrono::steady_clock::now();
     st.last_telemetry = std::chrono::steady_clock::now();
     return st;
 }
@@ -82,7 +90,9 @@ int main() {
     }
 
     // Case 1: In power delivery/current demand, clamp must not apply (allow >2A when requested).
-    hw->set_status_override(1, make_status(9, true, false, 400.0, 400.0, 10.0));
+    auto power_st = make_status(9, true, false, 400.0, 400.0, 10.0);
+    power_st.relay_closed = true; // emulate closed GC after successful precharge
+    hw->set_status_override(1, power_st);
     OcppAdapter::TestHook::apply_power_plan(adapter);
     const auto mreq_power = OcppAdapter::TestHook::last_module_command_for_slot(adapter, 1);
     if (!mreq_power.has_value() || !mreq_power->enable) {

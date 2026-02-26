@@ -318,6 +318,10 @@ private:
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
     std::map<int, double> last_ev_target_power_kw_;
+    std::map<int, double> last_ev_target_voltage_v_;
+    std::map<int, std::chrono::steady_clock::time_point> last_ev_target_voltage_seen_;
+    std::map<int, double> last_ev_target_current_a_;
+    std::map<int, std::chrono::steady_clock::time_point> last_ev_target_current_seen_;
     std::map<int, std::chrono::steady_clock::time_point> last_nonzero_req_kw_seen_;
     std::map<int, std::chrono::steady_clock::time_point> last_hlc_power_phase_seen_;
     std::map<int, std::chrono::steady_clock::time_point> session_ready_hold_until_;
@@ -325,6 +329,8 @@ private:
     std::map<int, std::string> last_plan_session_id_;
     std::map<std::string, ContactorState> last_gc_state_;
     std::map<std::string, ContactorState> last_mc_state_;
+    std::map<std::string, bool> mc_weld_suspected_;
+    std::map<std::string, std::chrono::steady_clock::time_point> mc_open_verify_since_;
     std::map<int, bool> mc_open_pending_;
     std::map<int, std::chrono::steady_clock::time_point> mc_open_request_time_;
     std::map<std::string, std::chrono::steady_clock::time_point> mc_switch_ready_since_;
@@ -400,6 +406,9 @@ private:
     std::map<int, std::string> stop_origin_hint_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_since_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_log_;
+    std::map<int, double> current_underdelivery_cap_a_;
+    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_cap_recovery_since_;
+    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_cap_log_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};
     std::chrono::steady_clock::time_point last_reservation_expiry_check_{};

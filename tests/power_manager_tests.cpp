@@ -195,6 +195,18 @@ int main() {
     assert(plan_single.islands.size() == 1);
     assert(plan_single.islands.front().slot_ids.size() == module_slots.size());
     assert(plan_single.guns.front().modules_assigned == static_cast<int>(module_slots.size()));
+    int ring_break_open = 0;
+    std::string opened_mc;
+    for (const auto& kv : plan_single.mc_commands) {
+        if (kv.second == ContactorState::Open) {
+            ring_break_open++;
+            opened_mc = kv.first;
+        }
+    }
+    assert(ring_break_open == 1);
+    // Do not place the forced ring break on the active gun home segment.
+    assert(opened_mc != "MC_1");
+    assert(opened_mc != "MC_2");
 
     // Single gun with low request should only claim the minimum modules needed.
     PowerManager pm3_low(cfg3);
@@ -209,6 +221,22 @@ int main() {
     assert(plan_single_low.islands.size() == 1);
     assert(plan_single_low.islands.front().slot_ids.size() == 1);
     assert(plan_single_low.guns.front().modules_assigned == 1);
+
+    // Anti-clockwise preference: from slot 1 in a 1-2-3-4 ring, the first borrowed slot should be 4.
+    PowerManager pm3_pref(cfg3);
+    pm3_pref.set_slots(module_slots);
+    pm3_pref.update_modules(module_only);
+    guns3.clear();
+    g1 = make_gun(1, 31.0, 240.0, true); // needs 2 modules => 1 extra slot
+    g1.slot_id = 1;
+    guns3.push_back(g1);
+    pm3_pref.update_guns(guns3);
+    auto plan_pref = pm3_pref.compute_plan();
+    assert(plan_pref.islands.size() == 1);
+    const auto& pref_slots = plan_pref.islands.front().slot_ids;
+    assert(pref_slots.size() == 2);
+    assert(std::find(pref_slots.begin(), pref_slots.end(), 4) != pref_slots.end());
+    assert(std::find(pref_slots.begin(), pref_slots.end(), 2) == pref_slots.end());
 
     // Ceil module allocation: request slightly above 2 modules should allocate 3.
     PowerManager pm3_ceil(cfg3);
@@ -365,6 +393,24 @@ int main() {
     std::set<int> pass_island(plan_pass.islands.front().slot_ids.begin(),
                               plan_pass.islands.front().slot_ids.end());
     assert(pass_island.count(1) && pass_island.count(2) && pass_island.count(3));
+
+    // Local-only request should keep ownership on the home slot and keep the home MC open.
+    PowerManager pm4_local(cfg4);
+    pm4_local.set_slots(pass_slots);
+    pm4_local.update_modules(pass_mods);
+    std::vector<GunState> guns4_local;
+    auto g4_local = make_gun(1, 10.0, 120.0, true); // one module is sufficient
+    g4_local.slot_id = 1;
+    guns4_local.push_back(g4_local);
+    pm4_local.update_guns(guns4_local);
+    auto plan_pass_local = pm4_local.compute_plan();
+    assert(plan_pass_local.islands.size() == 1);
+    const auto& local_slots = plan_pass_local.islands.front().slot_ids;
+    assert(local_slots.size() == 1);
+    assert(local_slots.front() == 1);
+    const auto mc_home_it = plan_pass_local.mc_commands.find("MC_1");
+    assert(mc_home_it != plan_pass_local.mc_commands.end());
+    assert(mc_home_it->second == ContactorState::Open);
 
     std::cout << "power_manager_tests passed\n";
     return 0;

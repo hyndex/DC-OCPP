@@ -37,11 +37,18 @@ controller (DC-OCPP + power/module orchestration).
   - Controller will not set GC bits in `EVSE_FAST` when this flag is true.
   - PLC firmware must ignore/override any GC command bits from controller when it owns GC.
 - Auxiliary relay control is **single-contactor per PLC** in production:
-  - `RLY2` (`KM_A`) is the only module/island relay driven by controller logic.
+  - `RLY2` (`KM_A`) is the only tie/island relay driven by controller logic.
   - `RLY3` (`KM_B`) is not used for islanding.
-  - Any legacy second-bit planner intent is collapsed into the single `RLY2` command.
+  - `RLY2` follows planner `MC` state (single source of truth for tie command).
+- Split topology uses owner-partition truth rules (ring):
+  - `R2(i)` is **closed** iff adjacent cabinets share the same owner island.
+  - `R2(i)` is **open** iff adjacent cabinets have different owners.
+  - If a single owner spans the entire ring, controller keeps one deterministic ring-break tie open.
 - `plc.relayFeedbackAvailable` is currently treated as unavailable in production mode; controller assumes
   commanded relay state (no AUX feedback dependency).
+- With no AUX feedback, controller validates tie-open behavior from telemetry:
+  - if tie is commanded open, side current is quiet, commanded side voltages diverge, and measured ΔV remains
+    collapsed for the verification window, tie is marked welded-suspect and treated fail-safe as closed in topology.
 - `CLEAR_FAULTS` in `EVSE_FAST` is asserted only on explicit operator/service request (no auto-clear on any fault).
 
 ## Fault propagation (controller → PLC)

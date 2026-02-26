@@ -395,14 +395,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.can_traffic.over_cap_debounce_ms < 0) {
         cfg.can_traffic.over_cap_debounce_ms = 0;
     }
-    if (cfg.allow_cross_slot_islands) {
-        std::cerr << "[cfg] planner.allowCrossSlotIslands=true is not supported in single-island-contactor mode; "
-                     "forcing false\n";
-        cfg.allow_cross_slot_islands = false;
+    if (!cfg.allow_cross_slot_islands) {
+        std::cerr << "[cfg] planner.allowCrossSlotIslands=false: cross-cabinet borrowing disabled; "
+                     "each gun will stay on its home slot/island.\n";
     }
     if (!cfg.plc_module_relays_enabled) {
         throw std::runtime_error(
-            "Split charging requires plc.moduleRelaysEnabled=true (relay bits drive module-side contactors)");
+            "Split charging requires plc.moduleRelaysEnabled=true (relay bits drive tie/island contactors)");
     }
     if (cfg.plc_owns_gun_relay) {
         throw std::runtime_error(

@@ -42,7 +42,12 @@ constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power del
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_FAULT_CONFIRM_MS(1000);
-constexpr std::chrono::milliseconds PRECHARGE_OVERCURRENT_HOLD_MS(100);
+// Precharge current is intentionally clamped near 2 A, but real hardware can show short
+// measurement transients during contactor settle / CV-to-CI loop capture. Keep the fault
+// latch conservative enough to avoid false aborts while still catching sustained misuse.
+constexpr std::chrono::milliseconds PRECHARGE_OVERCURRENT_HOLD_MS(750);
+constexpr std::chrono::milliseconds PRECHARGE_OVERCURRENT_TRANSIENT_GRACE_MS(1500);
+constexpr double PRECHARGE_OVERCURRENT_MARGIN_A = 1.0;
 constexpr std::chrono::milliseconds PRECHARGE_OVERSHOOT_HOLD_MS(200);
 constexpr std::chrono::milliseconds PRECHARGE_STABLE_HOLD_MS(300);
 // Avoid tripping local stall faults on short/noisy underdelivery windows.
@@ -51,6 +56,14 @@ constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_TIMEOUT_MS(8000);
 constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS(6000);
 constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_ESCALATION_MS(45000);
 constexpr uint8_t POWER_DELIVERY_STALL_MAX_RECOVERIES = 3;
+// Persistent module underdelivery guard:
+// if measured current remains well below offered/expected current, clamp offered current
+// to a measured-deliverable envelope and recover only after sustained tracking recovers.
+constexpr std::chrono::milliseconds UNDERDELIVERY_CLAMP_ARM_MS(2500);
+constexpr std::chrono::milliseconds UNDERDELIVERY_CLAMP_RECOVERY_MS(4000);
+constexpr double UNDERDELIVERY_CLAMP_MIN_A = 1.0;
+constexpr double UNDERDELIVERY_CLAMP_HEADROOM_A = 0.8;
+constexpr double UNDERDELIVERY_CLAMP_HEADROOM_RATIO = 0.18;
 constexpr std::chrono::seconds RECENT_TOKEN_DEDUP_WINDOW(10);
 constexpr std::chrono::seconds RFID_TAP_LATCH_WINDOW(3);
 constexpr std::chrono::milliseconds SEAMLESS_RETRY_GRACE_MS(20000);
@@ -69,8 +82,16 @@ constexpr std::chrono::milliseconds CP_NOT_READY_POWER_CUT_DELAY_MS(500);
 constexpr std::chrono::milliseconds HLC_POWER_PHASE_HOLD_MS(5000);
 constexpr std::chrono::milliseconds SESSION_READY_DROP_HOLD_MS(3000);
 constexpr std::chrono::milliseconds HLC_REQ_KW_HOLD_MS(3000);
+constexpr std::chrono::milliseconds HLC_TARGET_VOLTAGE_HOLD_MS(12000);
+constexpr std::chrono::milliseconds HLC_TARGET_CURRENT_HOLD_MS(12000);
 // Debounce brief session-map gaps from OCPP/runtime races before clearing connector runtime state.
 constexpr std::chrono::milliseconds SESSION_ABSENT_RESET_DEBOUNCE_MS(1500);
+// No-aux-fbk contactor verification window:
+// if MC is commanded open while both sides are quiet and commanded voltages diverge, but measured
+// dv stays collapsed for this window, treat as welded-suspect and fail safe.
+constexpr std::chrono::milliseconds MC_OPEN_VERIFY_TIMEOUT_MS(2000);
+constexpr double MC_OPEN_VERIFY_CMD_DV_MIN_V = 25.0;
+constexpr double MC_OPEN_VERIFY_MEAS_DV_MAX_V = 5.0;
 
 template <typename TimePoint>
 std::chrono::steady_clock::time_point to_steady_from_utc(const TimePoint& t_utc) {
@@ -300,6 +321,12 @@ bool power_delivery_requested(const GunStatus& status, bool lock_required) {
     const bool hlc_power_phase =
         status.hlc_power_ready || (status.hlc_stage >= HLC_MIN_POWER_STAGE && !status.hlc_charge_complete);
     if (!hlc_power_phase) {
+        // If PLC is explicitly reporting a pre-power HLC stage, do not infer power delivery
+        // from cached EV targets. This prevents post-session stage fallback (e.g. TCP peer close)
+        // from being interpreted as an active power request.
+        if (status.hlc_stage > 0) {
+            return false;
+        }
         constexpr double kEvCurrentRequestThresholdA = 0.1;
         const bool ev_current_req =
             status.target_current_a && status.target_current_a.value() > kEvCurrentRequestThresholdA;
@@ -320,11 +347,31 @@ bool is_hlc_precharge_phase(const GunStatus& status) {
     if (status.hlc_stage >= HLC_MIN_POWER_STAGE) {
         return false;
     }
-    if (status.hlc_precharge_active) {
+    // Explicit PRECHARGE stage is authoritative.
+    if (status.hlc_stage == HLC_STAGE_PRECHARGE) {
         return true;
     }
-    // Some PLC builds may not assert precharge_active reliably; fall back to the explicit stage.
-    return status.hlc_stage == HLC_STAGE_PRECHARGE;
+    if (status.hlc_precharge_active) {
+        // Guard against stale precharge-active latching on non-precharge HLC stages
+        // (e.g., after TCP/session collapse back to handshake stages).
+        if (status.hlc_stage != 0) {
+            return false;
+        }
+        // In stage=0, only trust precharge-active if EV targets are fresh and power is requested.
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto kStageZeroTargetFresh = std::chrono::milliseconds(2000);
+        const bool target_recent =
+            status.last_target_update.time_since_epoch().count() != 0 &&
+            (now - status.last_target_update) <= kStageZeroTargetFresh;
+        constexpr double kEvCurrentRequestThresholdA = 0.1;
+        const bool cp_power_ready = status.cp_state == 'C' || status.cp_state == 'D';
+        const bool ev_current_req =
+            status.target_current_a && status.target_current_a.value() > kEvCurrentRequestThresholdA;
+        const bool ev_voltage_req =
+            status.target_voltage_v && status.target_voltage_v.value() > 10.0;
+        return target_recent && cp_power_ready && ev_current_req && ev_voltage_req;
+    }
+    return false;
 }
 
 bool evse_limit_ack_watchdog_relevant(const GunStatus& status, bool lock_required) {
@@ -3895,8 +3942,17 @@ void OcppAdapter::apply_power_plan() {
         }
         return true;
     };
+    auto gun_power_path_active = [&](int gun_id) -> bool {
+        const auto it = status_by_connector.find(gun_id);
+        if (it == status_by_connector.end()) {
+            return false;
+        }
+        const auto& st = it->second;
+        return st.relay_closed || is_hlc_precharge_phase(st) || st.hlc_power_ready || st.hlc_stage >= HLC_MIN_POWER_STAGE;
+    };
 
-    // Compute current islands from the previously commanded tie states (no aux feedback available).
+    // Compute current islands from commanded tie states.
+    // In no-feedback mode, fail safe by treating MCs with welded-suspect evidence as electrically closed.
     // This is used to publish island-level metering for the active gun and to avoid opening GC under load
     // when the home slot has no locally-assigned modules.
     if (tie_mode && !slots_.empty()) {
@@ -3929,7 +3985,12 @@ void OcppAdapter::apply_power_plan() {
             const auto cw_it = slot_index.find(s.cw_id);
             if (cw_it == slot_index.end()) continue;
             const auto mc_it = last_mc_state_.find(s.mc_id);
-            const ContactorState mc_state = (mc_it != last_mc_state_.end()) ? mc_it->second : ContactorState::Open;
+            ContactorState mc_state = (mc_it != last_mc_state_.end()) ? mc_it->second : ContactorState::Open;
+            const auto weld_it = mc_weld_suspected_.find(s.mc_id);
+            if (mc_state == ContactorState::Open &&
+                weld_it != mc_weld_suspected_.end() && weld_it->second) {
+                mc_state = ContactorState::Closed;
+            }
             if (mc_state == ContactorState::Closed) {
                 unite(i, cw_it->second);
             }
@@ -3977,7 +4038,10 @@ void OcppAdapter::apply_power_plan() {
                     // Prefer gun-side telemetry (connector/shunt/PLC) unless this connector's configured meter
                     // source is "module" and the module telemetry is available.
                     const bool allow_gun_telem = (!have_slot_telem) || (!prefer_module_meter);
-                    if (allow_gun_telem && gun_telem_ok(slot->gun_id, gv, gi, gp)) {
+                    // Ignore idle connector telemetry (often 0V/0A heartbeats) when building island telemetry.
+                    // Including idle gun telemetry can collapse island V to ~half during precharge.
+                    const bool power_path_active = gun_power_path_active(slot->gun_id);
+                    if (allow_gun_telem && power_path_active && gun_telem_ok(slot->gun_id, gv, gi, gp)) {
                         used_gun_telem = true;
                         any_telem = true;
                         v_sum += gv;
@@ -4265,10 +4329,17 @@ void OcppAdapter::apply_power_plan() {
             session_absent_since_.erase(connector_id);
             last_nonzero_req_kw_seen_.erase(connector_id);
             last_hlc_power_phase_seen_.erase(connector_id);
+            last_ev_target_voltage_v_.erase(connector_id);
+            last_ev_target_voltage_seen_.erase(connector_id);
+            last_ev_target_current_a_.erase(connector_id);
+            last_ev_target_current_seen_.erase(connector_id);
             last_cp_request_drop_.erase(connector_id);
             last_cp_request_drop_reason_.erase(connector_id);
             current_underdelivery_since_.erase(connector_id);
             current_underdelivery_log_.erase(connector_id);
+            current_underdelivery_cap_a_.erase(connector_id);
+            current_underdelivery_cap_recovery_since_.erase(connector_id);
+            current_underdelivery_cap_log_.erase(connector_id);
             precharge_arm_ready_since_.erase(connector_id);
             precharge_ramp_since_.erase(connector_id);
             precharge_voltage_stable_since_.erase(connector_id);
@@ -4294,6 +4365,8 @@ void OcppAdapter::apply_power_plan() {
                         continue;
                     }
                     mc_switch_ready_since_.erase(runtime_slot->mc_id);
+                    mc_open_verify_since_.erase(runtime_slot->mc_id);
+                    mc_weld_suspected_.erase(runtime_slot->mc_id);
                     if (!runtime_slot->gc_id.empty()) {
                         gc_switch_ready_since_.erase(runtime_slot->gc_id);
                     }
@@ -4302,6 +4375,8 @@ void OcppAdapter::apply_power_plan() {
                 mc_open_pending_.erase(slot_for_conn->id);
                 mc_open_request_time_.erase(slot_for_conn->id);
                 mc_switch_ready_since_.erase(slot_for_conn->mc_id);
+                mc_open_verify_since_.erase(slot_for_conn->mc_id);
+                mc_weld_suspected_.erase(slot_for_conn->mc_id);
                 if (!slot_for_conn->gc_id.empty()) {
                     gc_switch_ready_since_.erase(slot_for_conn->gc_id);
                 }
@@ -4350,7 +4425,8 @@ void OcppAdapter::apply_power_plan() {
             last_hlc_power_phase_seen_[c.id] = now;
         }
         bool hlc_power_phase = hlc_power_phase_raw;
-        if (!hlc_power_phase && st.plugged_in && st.relay_closed && !st.hlc_charge_complete) {
+        if (!hlc_power_phase && st.hlc_stage >= HLC_STAGE_PRECHARGE &&
+            st.plugged_in && st.relay_closed && !st.hlc_charge_complete) {
             const auto hold_it = last_hlc_power_phase_seen_.find(c.id);
             if (hold_it != last_hlc_power_phase_seen_.end() && hold_it->second.time_since_epoch().count() != 0 &&
                 (now - hold_it->second) <= HLC_POWER_PHASE_HOLD_MS) {
@@ -4395,6 +4471,10 @@ void OcppAdapter::apply_power_plan() {
             session_absent_since_.erase(c.id);
             last_hlc_power_phase_seen_.erase(c.id);
             last_nonzero_req_kw_seen_.erase(c.id);
+            last_ev_target_voltage_v_.erase(c.id);
+            last_ev_target_voltage_seen_.erase(c.id);
+            last_ev_target_current_a_.erase(c.id);
+            last_ev_target_current_seen_.erase(c.id);
         }
         const bool power_ready =
             session_ready_effective && (st.relay_closed || power_delivery_requested(st, lock_required));
@@ -4431,35 +4511,107 @@ void OcppAdapter::apply_power_plan() {
                                        : profile_power_limit_kw_[c.id];
         }
 
-        double measured_v = st.present_voltage_v ? st.present_voltage_v.value()
-                                                 : (last_voltage_v_[c.id] > 50.0 ? last_voltage_v_[c.id]
-                                                                                  : planner_cfg_.default_voltage_v);
+        const auto telemetry_window = telemetry_timeout(cfg_);
+        const auto raw_present_voltage = st.present_voltage_v;
+        const auto raw_present_current = st.present_current_a;
+        const auto raw_present_power_w = st.present_power_w;
+        const bool raw_present_fresh =
+            st.last_telemetry.time_since_epoch().count() != 0 && (now - st.last_telemetry) <= telemetry_window;
+        double measured_v = raw_present_voltage ? raw_present_voltage.value()
+                                                : (last_voltage_v_[c.id] > 50.0 ? last_voltage_v_[c.id]
+                                                                                 : planner_cfg_.default_voltage_v);
         double measured_i =
-            st.present_current_a ? st.present_current_a.value()
-                                 : (last_power_w_[c.id] > 0 && measured_v > 0.0 ? last_power_w_[c.id] / measured_v
-                                                                                : 0.0);
+            raw_present_current ? raw_present_current.value()
+                                : (last_power_w_[c.id] > 0 && measured_v > 0.0 ? last_power_w_[c.id] / measured_v
+                                                                               : 0.0);
         double measured_power_kw =
-            st.present_power_w ? st.present_power_w.value() / 1000.0
-                               : (last_power_w_[c.id] > 0 ? last_power_w_[c.id] / 1000.0 : 0.0);
+            raw_present_power_w ? raw_present_power_w.value() / 1000.0
+                                : (last_power_w_[c.id] > 0 ? last_power_w_[c.id] / 1000.0 : 0.0);
         const bool prefer_module_meter = (c.meter_source == "module");
         const bool missing_present = !st.present_voltage_v || !st.present_current_a;
-        if (module_telem_valid && (prefer_module_meter || missing_present)) {
+        const double precharge_tol_v =
+            (cfg_.precharge_voltage_tolerance_v > 0.0) ? cfg_.precharge_voltage_tolerance_v : 20.0;
+        const double precharge_target_v =
+            (g.ev_req_voltage_v > 0.0)
+                ? g.ev_req_voltage_v
+                : (st.target_voltage_v ? st.target_voltage_v.value() : 0.0);
+        const bool precharge_present_mismatch =
+            hlc_precharge_phase && !hlc_power_phase && module_telem_valid && st.relay_closed &&
+            precharge_target_v > 50.0 &&
+            (!st.present_voltage_v || st.present_voltage_v.value() + std::max(20.0, precharge_tol_v) <
+                                         precharge_target_v);
+        auto module_current_conflicts_with_raw_present = [&](double module_current_value_a) -> bool {
+            const bool cp_power_ready_local = st.cp_state == 'C' || st.cp_state == 'D';
+            if (!prefer_module_meter || !hlc_power_phase || !cp_power_ready_local || !st.relay_closed) {
+                return false;
+            }
+            if (!raw_present_fresh || !raw_present_current || !std::isfinite(raw_present_current.value())) {
+                return false;
+            }
+            const double target_i = std::fabs(st.target_current_a.value_or(0.0));
+            if (target_i < 8.0) {
+                return false;
+            }
+            const double module_i_abs = std::fabs(module_current_value_a);
+            const double present_i_abs = std::fabs(raw_present_current.value());
+            const double module_low_gate = std::max(1.0, target_i * 0.15);
+            const double present_high_gate = std::max(4.0, target_i * 0.40);
+            return module_i_abs <= module_low_gate && present_i_abs >= present_high_gate;
+        };
+        if (module_telem_valid && (prefer_module_meter || missing_present || precharge_present_mismatch)) {
+            if (precharge_present_mismatch) {
+                static std::map<int, std::chrono::steady_clock::time_point> last_precharge_present_log;
+                auto& last_log = last_precharge_present_log[c.id];
+                if (last_log.time_since_epoch().count() == 0 || (now - last_log) >= std::chrono::milliseconds(500)) {
+                    EVLOG_info << "Connector " << c.id
+                               << " precharge present-voltage mismatch; preferring module telemetry"
+                               << " present_v=" << st.present_voltage_v.value_or(0.0)
+                               << " target_v=" << precharge_target_v
+                               << " module_v=" << module_voltage_v
+                               << " relay=" << (st.relay_closed ? "1" : "0");
+                    last_log = now;
+                }
+            }
             measured_v = module_voltage_v;
             st.present_voltage_v = measured_v;
             if (module_current_valid) {
-                measured_i = module_current_a;
-                measured_power_kw = module_power_kw;
-                st.present_current_a = measured_i;
-                st.present_power_w = measured_power_kw * 1000.0;
+                const bool module_current_suspect = module_current_conflicts_with_raw_present(module_current_a);
+                if (!module_current_suspect) {
+                    measured_i = module_current_a;
+                    measured_power_kw = module_power_kw;
+                    st.present_current_a = measured_i;
+                    st.present_power_w = measured_power_kw * 1000.0;
+                } else if (raw_present_fresh && raw_present_current && raw_present_power_w) {
+                    measured_i = raw_present_current.value();
+                    measured_power_kw = std::max(0.0, raw_present_power_w.value() / 1000.0);
+                    st.present_current_a = raw_present_current;
+                    st.present_power_w = raw_present_power_w;
+                    static std::map<int, std::chrono::steady_clock::time_point> last_conflict_log;
+                    auto& last_log = last_conflict_log[c.id];
+                    if (last_log.time_since_epoch().count() == 0 ||
+                        (now - last_log) >= std::chrono::milliseconds(500)) {
+                        EVLOG_warning << "Connector " << c.id
+                                      << " module-current mismatch; keeping PLC present-current"
+                                      << " module_I=" << module_current_a
+                                      << "A present_I=" << raw_present_current.value()
+                                      << "A target_I=" << st.target_current_a.value_or(0.0)
+                                      << "A";
+                        last_log = now;
+                    }
+                } else {
+                    measured_i = module_current_a;
+                    measured_power_kw = module_power_kw;
+                    st.present_current_a = measured_i;
+                    st.present_power_w = measured_power_kw * 1000.0;
+                }
             } else {
                 // If module current readback blips briefly, keep the last fresh present-current sample
                 // for one telemetry window instead of forcing an immediate 0A step.
-                const bool present_fresh =
-                    st.last_telemetry.time_since_epoch().count() != 0 &&
-                    (now - st.last_telemetry) <= telemetry_timeout(cfg_);
-                if (st.relay_closed && present_fresh && st.present_current_a && st.present_power_w) {
-                    measured_i = std::max(0.0, st.present_current_a.value());
-                    measured_power_kw = std::max(0.0, st.present_power_w.value() / 1000.0);
+                if (st.relay_closed && raw_present_fresh && raw_present_current && raw_present_power_w) {
+                    measured_i = std::max(0.0, raw_present_current.value());
+                    measured_power_kw = std::max(0.0, raw_present_power_w.value() / 1000.0);
+                    st.present_current_a = raw_present_current;
+                    st.present_power_w = raw_present_power_w;
                 } else {
                     measured_i = 0.0;
                     measured_power_kw = 0.0;
@@ -4495,7 +4647,10 @@ void OcppAdapter::apply_power_plan() {
                     island_voltage_v = telem_it->second.voltage_v;
                     island_current_a = telem_it->second.current_a;
                     island_power_kw = telem_it->second.power_kw;
-                    if (st.relay_closed && island_telem_valid && island_current_valid) {
+                    const bool hold_module_present_for_precharge =
+                        hlc_precharge_phase && !hlc_power_phase && module_telem_valid;
+                    if (st.relay_closed && island_telem_valid && island_current_valid &&
+                        !hold_module_present_for_precharge) {
                         measured_v = island_voltage_v;
                         measured_i = island_current_a;
                         measured_power_kw = island_power_kw;
@@ -4690,12 +4845,92 @@ void OcppAdapter::apply_power_plan() {
                                             regulating);
         }
 
-        const double target_voltage_for_calc = st.target_voltage_v
-                                                   ? st.target_voltage_v.value()
-                                                   : (measured_v > 0.0 ? measured_v : planner_cfg_.default_voltage_v);
+        const bool has_live_target_voltage = st.target_voltage_v && st.target_voltage_v.value() > 10.0;
+        if (has_live_target_voltage) {
+            last_ev_target_voltage_v_[c.id] = st.target_voltage_v.value();
+            last_ev_target_voltage_seen_[c.id] = now;
+        }
+        constexpr double kLiveTargetCurrentMinA = 0.1;
+        const bool has_live_target_current_raw = st.target_current_a && st.target_current_a.value() >= 0.0;
+        const double live_target_current_a =
+            has_live_target_current_raw ? std::max(0.0, st.target_current_a.value()) : 0.0;
+        const bool live_target_current_zeroish =
+            has_live_target_current_raw && live_target_current_a <= kLiveTargetCurrentMinA;
+        const bool cp_power_ready_now = st.cp_state == 'C' || st.cp_state == 'D';
+        const bool active_power_current_phase =
+            hlc_power_phase && !hlc_precharge_phase && st.relay_closed && cp_power_ready_now &&
+            !post_precharge_hold_candidate;
+        bool suppress_live_zero_target = false;
+        if (live_target_current_zeroish && active_power_current_phase) {
+            const auto cache_i_it = last_ev_target_current_a_.find(c.id);
+            const auto cache_ts_it = last_ev_target_current_seen_.find(c.id);
+            const bool cached_positive_target =
+                cache_i_it != last_ev_target_current_a_.end() &&
+                cache_ts_it != last_ev_target_current_seen_.end() &&
+                cache_ts_it->second.time_since_epoch().count() != 0 &&
+                cache_i_it->second > kLiveTargetCurrentMinA &&
+                (now - cache_ts_it->second) <= HLC_REQ_KW_HOLD_MS;
+            if (cached_positive_target) {
+                suppress_live_zero_target = true;
+                static std::map<int, std::chrono::steady_clock::time_point> last_zero_hold_log;
+                auto& last_log = last_zero_hold_log[c.id];
+                if (last_log.time_since_epoch().count() == 0 ||
+                    (now - last_log) >= std::chrono::seconds(1)) {
+                    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            now - cache_ts_it->second)
+                                            .count();
+                    EVLOG_warning << "Connector " << c.id
+                                  << " suppressing transient live 0A target during power phase"
+                                  << " target_I=" << live_target_current_a
+                                  << "A cached_I=" << cache_i_it->second
+                                  << "A age_ms=" << age_ms;
+                    last_log = now;
+                }
+            }
+        }
+        const bool has_live_target_current = has_live_target_current_raw && !suppress_live_zero_target;
+        if (has_live_target_current) {
+            last_ev_target_current_a_[c.id] = live_target_current_a;
+            last_ev_target_current_seen_[c.id] = now;
+        }
+        double held_target_voltage_v = 0.0;
+        bool held_target_voltage_valid = false;
+        if (hlc_precharge_phase || hlc_power_phase || post_precharge_hold_candidate) {
+            const auto hold_v_it = last_ev_target_voltage_v_.find(c.id);
+            const auto hold_ts_it = last_ev_target_voltage_seen_.find(c.id);
+            if (hold_v_it != last_ev_target_voltage_v_.end() && hold_ts_it != last_ev_target_voltage_seen_.end() &&
+                hold_ts_it->second.time_since_epoch().count() != 0 &&
+                (now - hold_ts_it->second) <= HLC_TARGET_VOLTAGE_HOLD_MS && hold_v_it->second > 10.0) {
+                held_target_voltage_v = hold_v_it->second;
+                held_target_voltage_valid = true;
+            }
+        }
+        const double effective_target_voltage_v = has_live_target_voltage
+                                                      ? st.target_voltage_v.value()
+                                                      : (held_target_voltage_valid ? held_target_voltage_v : 0.0);
+        double held_target_current_a = 0.0;
+        bool held_target_current_valid = false;
+        if (hlc_power_phase || post_precharge_hold_candidate) {
+            const auto hold_i_it = last_ev_target_current_a_.find(c.id);
+            const auto hold_i_ts_it = last_ev_target_current_seen_.find(c.id);
+            if (hold_i_it != last_ev_target_current_a_.end() && hold_i_ts_it != last_ev_target_current_seen_.end() &&
+                hold_i_ts_it->second.time_since_epoch().count() != 0 &&
+                (now - hold_i_ts_it->second) <= HLC_TARGET_CURRENT_HOLD_MS && hold_i_it->second >= 0.0) {
+                held_target_current_a = hold_i_it->second;
+                held_target_current_valid = true;
+            }
+        }
+        const std::optional<double> effective_target_current_a =
+            has_live_target_current ? std::optional<double>(live_target_current_a)
+                                    : (held_target_current_valid ? std::optional<double>(held_target_current_a)
+                                                                 : std::nullopt);
+        const double target_voltage_for_calc =
+            effective_target_voltage_v > 0.0
+                ? effective_target_voltage_v
+                : (measured_v > 0.0 ? measured_v : planner_cfg_.default_voltage_v);
         double ev_target_kw = 0.0;
-        if ((power_ready || precharge_hint || post_precharge_hold_candidate) && st.target_current_a) {
-            ev_target_kw = (target_voltage_for_calc * st.target_current_a.value()) / 1000.0;
+        if ((power_ready || precharge_hint || post_precharge_hold_candidate) && effective_target_current_a) {
+            ev_target_kw = (target_voltage_for_calc * effective_target_current_a.value()) / 1000.0;
             if (ev_target_kw > 0.0) {
                 last_ev_target_power_kw_[c.id] = ev_target_kw;
             }
@@ -4713,13 +4948,13 @@ void OcppAdapter::apply_power_plan() {
             constexpr auto kHlcPowerTargetHoldMs = std::chrono::milliseconds(12000);
             // Use EV-requested current/voltage whenever available (CurrentDemand / PreChargeReq), but avoid
             // allocating extra modules during the post-precharge authorization hold (no energy delivery).
-            if (!post_precharge_hold_candidate && st.target_current_a) {
-                const double i_req_raw = st.target_current_a.value();
+            if (!post_precharge_hold_candidate && effective_target_current_a) {
+                const double i_req_raw = effective_target_current_a.value();
                 double i_req = std::max(0.0, i_req_raw);
                 if (hlc_precharge_only && precharge_i_max > 0.0) {
                     i_req = std::min(i_req, precharge_i_max);
                 }
-                const double v_req = st.target_voltage_v ? st.target_voltage_v.value() : target_voltage_for_calc;
+                const double v_req = effective_target_voltage_v > 0.0 ? effective_target_voltage_v : target_voltage_for_calc;
                 if (v_req > 0.0 && i_req > 0.0) {
                     req_kw = (v_req * i_req) / 1000.0;
                 }
@@ -4752,10 +4987,10 @@ void OcppAdapter::apply_power_plan() {
 
             // Keepalive current is only for precharge/auth-hold phases; do not use it for normal
             // HLC power delivery where stale targets should use bounded hold above.
-            if (req_kw <= 0.0 && (precharge_hint || post_precharge_hold_candidate)) {
+            if (req_kw <= 0.0 && ((precharge_hint && hlc_precharge_only) || post_precharge_hold_candidate)) {
                 double v_keep = g.ev_req_voltage_v;
-                if (st.target_voltage_v && st.target_voltage_v.value() > 0.0) {
-                    v_keep = st.target_voltage_v.value();
+                if (effective_target_voltage_v > 0.0) {
+                    v_keep = effective_target_voltage_v;
                 }
                 if (v_keep <= 0.0) {
                     v_keep = target_voltage_for_calc > 0.0 ? target_voltage_for_calc : planner_cfg_.default_voltage_v;
@@ -4772,8 +5007,9 @@ void OcppAdapter::apply_power_plan() {
         // Voltage guard remains useful during precharge/non-HLC phases, but in active
         // HLC power regulation it can double-derate against PLC-side headroom policy.
         g.voltage_guard_active = hlc_precharge_phase || !hlc_power_phase;
-        g.ev_req_voltage_v = st.target_voltage_v ? st.target_voltage_v.value()
-                                                 : (st.present_voltage_v ? st.present_voltage_v.value() : measured_v);
+        g.ev_req_voltage_v = effective_target_voltage_v > 0.0
+                                 ? effective_target_voltage_v
+                                 : (st.present_voltage_v ? st.present_voltage_v.value() : measured_v);
         if (g.ev_req_voltage_v <= 0.0) {
             g.ev_req_voltage_v = measured_v > 0.0 ? measured_v : planner_cfg_.default_voltage_v;
         }
@@ -4972,7 +5208,6 @@ void OcppAdapter::apply_power_plan() {
     std::map<int, std::string> island_fault_reason;
     std::map<int, int> precharge_home_slot_for_gun;
     std::map<int, uint8_t> precharge_home_mask_for_gun;
-    std::map<int, uint8_t> precharge_home_relay_mask_for_gun;
     std::set<int> precharge_frozen_mc_slots;
 
     for (const auto& slot : slots_) {
@@ -4993,6 +5228,8 @@ void OcppAdapter::apply_power_plan() {
         info.meas_voltage = snap_it != snapshots.end()
                                 ? snap_it->second.status.present_voltage_v.value_or(last_voltage_v_[owner_id])
                                 : last_voltage_v_[owner_id];
+        const bool owner_prefers_module_meter =
+            connector_meter_is_module.count(owner_id) ? connector_meter_is_module.at(owner_id) : false;
         const bool slot_has_modules = !slot.modules.empty();
         if (snap_it != snapshots.end()) {
             info.module_health_valid = snap_it->second.module_health_valid;
@@ -5025,6 +5262,15 @@ void OcppAdapter::apply_power_plan() {
                 info.module_voltage_v = 0.0;
                 info.module_current_a = 0.0;
                 info.module_power_kw = 0.0;
+            }
+        }
+        if (owner_prefers_module_meter) {
+            // Keep a single source-of-truth for precharge/timeout faulting on module-meter connectors.
+            if (info.module_telem_valid && info.module_voltage_v > 0.0) {
+                info.meas_voltage = info.module_voltage_v;
+            }
+            if (info.module_current_valid) {
+                info.meas_current = info.module_current_a;
             }
         }
         info.gun_state = gun_lookup.count(owner_id) ? gun_lookup.at(owner_id) : GunState{};
@@ -5140,7 +5386,8 @@ void OcppAdapter::apply_power_plan() {
                 last_hlc_power_phase_seen_[c.id] = now;
             }
             bool hlc_power_phase = hlc_power_phase_raw;
-            if (!hlc_power_phase && st.plugged_in && st.relay_closed && !st.hlc_charge_complete) {
+            if (!hlc_power_phase && st.hlc_stage >= HLC_STAGE_PRECHARGE &&
+                st.plugged_in && st.relay_closed && !st.hlc_charge_complete) {
                 const auto hold_it = last_hlc_power_phase_seen_.find(c.id);
                 if (hold_it != last_hlc_power_phase_seen_.end() && hold_it->second.time_since_epoch().count() != 0 &&
                     (now - hold_it->second) <= HLC_POWER_PHASE_HOLD_MS) {
@@ -5211,11 +5458,6 @@ void OcppAdapter::apply_power_plan() {
 
             const bool precharge_mc_frozen =
                 precharge_frozen_mc_slots.count(slot.id) > 0 && !info.disabled_by_csms && !info.local_fault;
-            if (precharge_mc_frozen) {
-                // During precharge, force MC boundaries closed around the home segment so GC sequencing can proceed
-                // without island open/close jitter.
-                desired = ContactorState::Closed;
-            }
 
             ContactorState prev = ContactorState::Open;
             const auto prev_it = last_mc_state_.find(slot.mc_id);
@@ -5224,6 +5466,10 @@ void OcppAdapter::apply_power_plan() {
             }
 
             ContactorState gated = prev;
+            const Slot* cw = nullptr;
+            IslandTelemetryLite telem_a{};
+            IslandTelemetryLite telem_b{};
+            bool have_pair_telem = false;
             if (precharge_mc_frozen) {
                 const auto held = enforce_hold(slot.mc_id, desired, last_mc_state_, mc_command_change_time_,
                                                planner_cfg_.min_mc_hold_ms, true);
@@ -5235,26 +5481,24 @@ void OcppAdapter::apply_power_plan() {
                 mc_open_pending_.erase(slot.id);
                 mc_open_request_time_.erase(slot.id);
                 gated = desired;
-	            } else {
-	                const Slot* cw = find_slot(slots_, slot.cw_id);
-	                const int island_a =
-	                    telemetry_slot_to_island.count(slot.id) ? telemetry_slot_to_island.at(slot.id) : 0;
-	                const int island_b =
-	                    cw && telemetry_slot_to_island.count(cw->id) ? telemetry_slot_to_island.at(cw->id) : 0;
+            } else {
+                cw = find_slot(slots_, slot.cw_id);
+                const int island_a =
+                    telemetry_slot_to_island.count(slot.id) ? telemetry_slot_to_island.at(slot.id) : 0;
+                const int island_b =
+                    cw && telemetry_slot_to_island.count(cw->id) ? telemetry_slot_to_island.at(cw->id) : 0;
                 const auto isl_a_it = telemetry_by_island.find(island_a);
                 const auto isl_b_it = telemetry_by_island.find(island_b);
-                IslandTelemetryLite telem_a{};
-                IslandTelemetryLite telem_b{};
                 if (isl_a_it != telemetry_by_island.end()) {
                     telem_a.complete = isl_a_it->second.telemetry_complete;
                     telem_a.voltage_v = isl_a_it->second.voltage_v;
                     telem_a.current_a = isl_a_it->second.current_a;
                 }
-	                if (isl_b_it != telemetry_by_island.end()) {
-	                    telem_b.complete = isl_b_it->second.telemetry_complete;
-	                    telem_b.voltage_v = isl_b_it->second.voltage_v;
-	                    telem_b.current_a = isl_b_it->second.current_a;
-	                }
+                if (isl_b_it != telemetry_by_island.end()) {
+                    telem_b.complete = isl_b_it->second.telemetry_complete;
+                    telem_b.voltage_v = isl_b_it->second.voltage_v;
+                    telem_b.current_a = isl_b_it->second.current_a;
+                }
                 // Some topologies include "pass-through" slots that have neither modules nor a gun.
                 // Those islands have no telemetry source of their own, but we still model an MC contactor
                 // for the segment (e.g., a bus tie / bypass). If we require telemetry on both sides, the
@@ -5278,17 +5522,22 @@ void OcppAdapter::apply_power_plan() {
                 };
                 const bool island_a_has_telem = island_has_telem(island_a);
                 const bool island_b_has_telem = island_has_telem(island_b);
-                if (island_a != 0 && !island_a_has_telem && island_b_has_telem) {
+                // For passive segments (island id 0 / no telemetry source), mirror the known side telemetry.
+                // Without this, close transitions can deadlock open forever on one-sided edges.
+                if (!island_a_has_telem && island_b_has_telem) {
                     telem_a = telem_b;
                 }
-                if (!cw || island_b == 0 || (!island_b_has_telem && island_a_has_telem)) {
+                if (!island_b_has_telem && island_a_has_telem) {
                     telem_b = telem_a;
                 }
-	                bool merge_ok = true;
-	                if (desired == ContactorState::Closed && prev == ContactorState::Open &&
-	                    island_a > 0 && island_b > 0 && island_a != island_b) {
-	                    const int gc_a =
-	                        island_gc_request_count.count(island_a) ? island_gc_request_count.at(island_a) : 0;
+                if (!cw || island_b == 0) {
+                    telem_b = telem_a;
+                }
+                bool merge_ok = true;
+                if (desired == ContactorState::Closed && prev == ContactorState::Open &&
+                    island_a > 0 && island_b > 0 && island_a != island_b) {
+                    const int gc_a =
+                        island_gc_request_count.count(island_a) ? island_gc_request_count.at(island_a) : 0;
                     const int gc_b =
                         island_gc_request_count.count(island_b) ? island_gc_request_count.at(island_b) : 0;
                     if (gc_a + gc_b > 1) {
@@ -5298,6 +5547,7 @@ void OcppAdapter::apply_power_plan() {
                 gated = gate_tie_switch(slot.mc_id, desired, prev, telem_a, telem_b,
                                         switch_i_thresh, max_dv_v, stable_ms,
                                         merge_ok, mc_switch_ready_since_, now);
+                have_pair_telem = telem_a.complete && telem_b.complete;
 
                 if (desired == ContactorState::Open && gated == ContactorState::Closed) {
                     mc_open_pending_[slot.id] = true;
@@ -5332,6 +5582,65 @@ void OcppAdapter::apply_power_plan() {
             const auto held = enforce_hold(slot.mc_id, gated, last_mc_state_, mc_command_change_time_,
                                            planner_cfg_.min_mc_hold_ms, true);
             mc_state_cmd_by_slot[slot.id] = held;
+
+            if (cw && have_pair_telem) {
+                const auto neigh_it = slot_info.find(cw->id);
+                auto cmd_voltage_for_slot = [&](int slot_id, double fallback_v) {
+                    const auto cmd_it = last_module_command_by_slot_.find(slot_id);
+                    if (cmd_it != last_module_command_by_slot_.end() && cmd_it->second.enable &&
+                        cmd_it->second.voltage_v > 0.0) {
+                        return cmd_it->second.voltage_v;
+                    }
+                    return fallback_v;
+                };
+                const double cmd_v_a = cmd_voltage_for_slot(slot.id, info.meas_voltage);
+                const double cmd_v_b = (neigh_it != slot_info.end())
+                                           ? cmd_voltage_for_slot(cw->id, neigh_it->second.meas_voltage)
+                                           : cmd_v_a;
+                const double cmd_dv = std::fabs(cmd_v_a - cmd_v_b);
+                const double meas_dv = std::fabs(telem_a.voltage_v - telem_b.voltage_v);
+                const bool quiet = std::fabs(telem_a.current_a) < switch_i_thresh &&
+                                   std::fabs(telem_b.current_a) < switch_i_thresh;
+                const bool split_expected =
+                    cmd_dv >= std::max(MC_OPEN_VERIFY_CMD_DV_MIN_V, max_dv_v + 5.0);
+                const bool collapse_seen =
+                    meas_dv <= std::max(MC_OPEN_VERIFY_MEAS_DV_MAX_V, max_dv_v * 0.25);
+
+                if (held == ContactorState::Open && split_expected && quiet && collapse_seen) {
+                    auto& since = mc_open_verify_since_[slot.mc_id];
+                    if (since.time_since_epoch().count() == 0) {
+                        since = now;
+                    } else if ((now - since) > MC_OPEN_VERIFY_TIMEOUT_MS) {
+                        const bool passive_split_slot = (info.selection.gun_id <= 0) && slot.modules.empty();
+                        mc_weld_suspected_[slot.mc_id] = true;
+                        if (!passive_split_slot) {
+                            info.local_fault = true;
+                            if (info.fault_reason.empty()) {
+                                info.fault_reason = "MCWeldSuspect";
+                            }
+                        }
+                        static std::map<std::string, std::chrono::steady_clock::time_point> last_warn;
+                        auto& last_ts = last_warn[slot.mc_id];
+                        if (last_ts.time_since_epoch().count() == 0 || (now - last_ts) > std::chrono::seconds(1)) {
+                            EVLOG_warning << "MC welded-suspect on " << slot.mc_id
+                                          << " held_open=1 cmd_dv=" << cmd_dv
+                                          << " meas_dv=" << meas_dv
+                                          << " passive=" << (passive_split_slot ? 1 : 0);
+                            last_ts = now;
+                        }
+                    }
+                } else {
+                    mc_open_verify_since_.erase(slot.mc_id);
+                    if (held == ContactorState::Closed || !split_expected || !collapse_seen) {
+                        mc_weld_suspected_.erase(slot.mc_id);
+                    }
+                }
+            } else {
+                mc_open_verify_since_.erase(slot.mc_id);
+                if (held == ContactorState::Closed) {
+                    mc_weld_suspected_.erase(slot.mc_id);
+                }
+            }
         }
 
     }
@@ -5357,8 +5666,9 @@ void OcppAdapter::apply_power_plan() {
         }
     }
 
-    // Compute runtime islands from the commanded MC states (tie mode) so that module allocation
-    // and safety checks track the actual bus topology during switching.
+    // Compute runtime islands from commanded MC states (tie mode).
+    // In no-feedback mode, fail safe by treating welded-suspect MCs as electrically closed.
+    // This keeps one-gun-per-island enforcement conservative under uncertain contactor state.
     std::map<int, int> slot_to_island;
     std::map<int, std::vector<int>> island_slots;
     {
@@ -5399,6 +5709,11 @@ void OcppAdapter::apply_power_plan() {
                     if (info_it != slot_info.end()) {
                         mc_state = info_it->second.desired_mc_state;
                     }
+                }
+                const auto weld_it = mc_weld_suspected_.find(s.mc_id);
+                if (mc_state == ContactorState::Open &&
+                    weld_it != mc_weld_suspected_.end() && weld_it->second) {
+                    mc_state = ContactorState::Closed;
                 }
                 if (mc_state == ContactorState::Closed) {
                     unite(i, cw_it->second);
@@ -5516,7 +5831,8 @@ void OcppAdapter::apply_power_plan() {
         const GunState gstate = (g_it != gun_lookup.end()) ? g_it->second : GunState{};
         bool hlc_power_recent = false;
         const auto hlc_hold_it = last_hlc_power_phase_seen_.find(gid);
-        if (hlc_hold_it != last_hlc_power_phase_seen_.end() && hlc_hold_it->second.time_since_epoch().count() != 0 &&
+        if (info.status.hlc_stage >= HLC_STAGE_PRECHARGE &&
+            hlc_hold_it != last_hlc_power_phase_seen_.end() && hlc_hold_it->second.time_since_epoch().count() != 0 &&
             (now - hlc_hold_it->second) <= HLC_POWER_PHASE_HOLD_MS) {
             hlc_power_recent = true;
         }
@@ -5621,19 +5937,6 @@ void OcppAdapter::apply_power_plan() {
 
         precharge_home_slot_for_gun[c.id] = home->id;
         precharge_home_mask_for_gun[c.id] = precharge_mask;
-        uint8_t precharge_relay_mask = 0u;
-        const auto relay_slots_it = connector_module_slots_.find(c.id);
-        if (relay_slots_it != connector_module_slots_.end()) {
-            const auto& relay_slots = relay_slots_it->second;
-            const bool slot0_matches = (relay_slots[0] == home->id);
-            const bool slot1_matches = (relay_slots[1] == home->id);
-            if (slot0_matches || slot1_matches) {
-                precharge_relay_mask |= 0x01u;
-            }
-        }
-        if (precharge_relay_mask != 0u) {
-            precharge_home_relay_mask_for_gun[c.id] = precharge_relay_mask;
-        }
         home_info.modules_final = 1;
         home_info.mask_final = precharge_mask;
 
@@ -5718,6 +6021,14 @@ void OcppAdapter::apply_power_plan() {
             return true;
         }
         if (cfg_.plc_relay_feedback) {
+            return false;
+        }
+        const bool telemetry_fresh =
+            st.last_telemetry.time_since_epoch().count() != 0 &&
+            (now - st.last_telemetry) <= telemetry_timeout(cfg_);
+        if (telemetry_fresh) {
+            // In no-aux mode, avoid latching "closed" purely from stale commands when fresh
+            // status telemetry reports relay open.
             return false;
         }
         const Slot* home = find_slot_for_gun(connector);
@@ -5915,7 +6226,11 @@ void OcppAdapter::apply_power_plan() {
                 // - this MC is already in its target state, or
                 // - the home slot already has a healthy local module that can sustain precharge.
                 // This prevents deadlock when non-critical tie boundaries are still settling.
-                if (gc_requests <= 1 && !island_conflict && (mc_settled || home_module_available)) {
+                const bool allow_home_gc_with_settling =
+                    !local_fault && !info.disabled_by_csms &&
+                    gc_requests <= 1 && !island_conflict &&
+                    (mc_settled || home_module_available);
+                if (allow_home_gc_with_settling) {
                     block_isolation = false;
                 }
             }
@@ -5924,6 +6239,9 @@ void OcppAdapter::apply_power_plan() {
                 if (is_home) {
                     power_constrained_[c.id] = true;
                 }
+            } else {
+                // Clear earlier MC-mismatch-only isolation gating for the local home-module path.
+                isolation_ready = true;
             }
         }
 
@@ -5938,7 +6256,8 @@ void OcppAdapter::apply_power_plan() {
             last_hlc_power_phase_seen_[c.id] = now;
         }
         bool hlc_power_phase = hlc_power_phase_raw;
-        if (!hlc_power_phase && status.plugged_in && status.relay_closed && !status.hlc_charge_complete) {
+        if (!hlc_power_phase && status.hlc_stage >= HLC_STAGE_PRECHARGE &&
+            status.plugged_in && status.relay_closed && !status.hlc_charge_complete) {
             const auto hold_it = last_hlc_power_phase_seen_.find(c.id);
             if (hold_it != last_hlc_power_phase_seen_.end() && hold_it->second.time_since_epoch().count() != 0 &&
                 (now - hold_it->second) <= HLC_POWER_PHASE_HOLD_MS) {
@@ -5974,8 +6293,8 @@ void OcppAdapter::apply_power_plan() {
             is_home && precharge_home_slot_for_gun.count(c.id) &&
             precharge_home_slot_for_gun.at(c.id) == slot->id;
         if (hlc_precharge_only && precharge_single_home_slot && !local_fault && !info.disabled_by_csms) {
-            // Precharge path should not be blocked by tie/island churn.
-            mc_closed_cmd = true;
+            // Precharge path should not be blocked by non-critical tie churn.
+            // Keep MC command ownership with planner/tie truth rules.
             isolation_ready = true;
         }
 
@@ -6029,7 +6348,7 @@ void OcppAdapter::apply_power_plan() {
             power_request_lost_since_.erase(c.id);
         }
         bool power_delivery_allowed = power_request_active;
-        if (hlc_power_phase && !hlc_precharge_phase && cp_known && !cp_power_ready) {
+        if (hlc_power_phase && !hlc_precharge_phase && !cp_power_ready) {
             const auto lost_it = power_request_lost_since_.find(c.id);
             const auto cp_not_ready_ms =
                 (lost_it != power_request_lost_since_.end() && lost_it->second.time_since_epoch().count() != 0)
@@ -6042,7 +6361,7 @@ void OcppAdapter::apply_power_plan() {
                 if (last_log.time_since_epoch().count() == 0 ||
                     (now - last_log) >= std::chrono::seconds(1)) {
                     EVLOG_warning << "Connector " << c.id
-                                  << " CP not power-ready; clamping current to 0"
+                                  << " CP not power-ready/unknown; clamping current to 0"
                                   << " cp=" << status.cp_state
                                   << " hlc_stage=" << static_cast<int>(status.hlc_stage)
                                   << " hold_ms=" << cp_not_ready_ms;
@@ -6314,8 +6633,12 @@ void OcppAdapter::apply_power_plan() {
             if (ramp_since.time_since_epoch().count() == 0) {
                 ramp_since = now;
             }
-            const double target_v = status.target_voltage_v.value_or(dispatch.voltage_set_v);
-            const bool have_target_v = target_v > 0.0;
+            const bool target_recent =
+                status.last_target_update.time_since_epoch().count() != 0 &&
+                (now - status.last_target_update) <= telemetry_timeout(cfg_);
+            const bool have_target_v =
+                target_recent && status.target_voltage_v && status.target_voltage_v.value() > 10.0;
+            const double target_v = have_target_v ? status.target_voltage_v.value() : 0.0;
             const double dv = have_target_v ? std::fabs(info.meas_voltage - target_v) : 0.0;
             const bool at_precharge_target = have_target_v && dv <= gc_close_max_dv;
             if (at_precharge_target) {
@@ -6354,7 +6677,26 @@ void OcppAdapter::apply_power_plan() {
                 precharge_overshoot_since_.erase(c.id);
             }
 
-            if (!local_fault && std::fabs(meas_i) > (precharge_i_limit + 0.5)) {
+            const auto transition_it = precharge_transition_since_.find(c.id);
+            const bool precharge_transition_grace =
+                transition_it != precharge_transition_since_.end() &&
+                transition_it->second.time_since_epoch().count() != 0 &&
+                (now - transition_it->second) <= PRECHARGE_OVERCURRENT_TRANSIENT_GRACE_MS;
+            double precharge_fault_i_abs = std::fabs(meas_i);
+            if (info.module_current_valid) {
+                const double module_i_abs = std::fabs(info.module_current_a);
+                if (connector_prefers_module_meter) {
+                    precharge_fault_i_abs = module_i_abs;
+                } else {
+                    // Use the stronger of present/module current to avoid tripping on a
+                    // single-path readback glitch while still catching true overcurrent.
+                    precharge_fault_i_abs = std::max(precharge_fault_i_abs, module_i_abs);
+                }
+            }
+            const bool precharge_overcurrent_now =
+                current_valid &&
+                precharge_fault_i_abs > (precharge_i_limit + PRECHARGE_OVERCURRENT_MARGIN_A);
+            if (!local_fault && precharge_overcurrent_now && !precharge_transition_grace) {
                 auto& ts = precharge_overcurrent_since_[c.id];
                 if (ts.time_since_epoch().count() == 0) {
                     ts = now;
@@ -6413,12 +6755,28 @@ void OcppAdapter::apply_power_plan() {
             (now - status.last_target_update) <= telemetry_timeout(cfg_);
         // Cross-signal validation: if module telemetry is available and still reporting non-trivial current,
         // do not arm a delivery-stall fault from a single path alone.
+        const bool stall_present_current_high =
+            present_fresh && status.present_current_a &&
+            std::fabs(status.present_current_a.value()) >= stall_no_current_thresh;
         const bool stall_module_low_confirmed =
-            !info.module_current_valid || std::fabs(info.module_current_a) < stall_no_current_thresh;
+            (!info.module_current_valid || std::fabs(info.module_current_a) < stall_no_current_thresh) &&
+            !stall_present_current_high;
+        const double stall_measured_v =
+            status.present_voltage_v ? status.present_voltage_v.value()
+                                     : (info.meas_voltage > 0.0 ? info.meas_voltage : dispatch.voltage_set_v);
+        const double stall_target_v = status.target_voltage_v.value_or(dispatch.voltage_set_v);
+        const bool stall_voltage_track_valid = stall_target_v > 50.0 && stall_measured_v > 0.0;
+        const double stall_voltage_shortfall_v =
+            stall_voltage_track_valid ? std::max(0.0, stall_target_v - stall_measured_v) : 0.0;
+        const double stall_voltage_shortfall_thresh =
+            stall_voltage_track_valid ? std::max(6.0, stall_target_v * 0.02) : 0.0;
+        const bool stall_voltage_underdelivery =
+            stall_voltage_track_valid && stall_voltage_shortfall_v >= stall_voltage_shortfall_thresh;
         const bool stall_conditions_met =
             !local_fault && !hold_no_current && gc_close_requested && power_delivery_allowed && stall_cp_power_ready &&
-            stall_current_requested && stall_target_recent && stall_module_low_confirmed && evse_current_offered &&
-            current_valid && (gc_closed_cmd || gc_closed_effective);
+            stall_current_requested && stall_target_recent && stall_module_low_confirmed &&
+            stall_voltage_underdelivery && evse_current_offered && current_valid &&
+            (gc_closed_cmd || gc_closed_effective);
 
         if (stall_conditions_met && !stall_recovery_active) {
             if (std::fabs(meas_i) < stall_no_current_thresh) {
@@ -6444,7 +6802,12 @@ void OcppAdapter::apply_power_plan() {
                                           << "A I_offered=" << dispatch.current_limit_a
                                           << "A target_I=" << status.target_current_a.value_or(0.0)
                                           << "A module_I=" << info.module_current_a
-                                          << "A module_telem_valid=" << (info.module_telem_valid ? "1" : "0")
+                                          << "A V_meas=" << stall_measured_v
+                                          << "V V_target=" << stall_target_v
+                                          << "V V_shortfall=" << stall_voltage_shortfall_v
+                                          << "V V_gate="
+                                          << (stall_voltage_underdelivery ? "under" : "not_under")
+                                          << " module_telem_valid=" << (info.module_telem_valid ? "1" : "0")
                                           << " module_current_valid=" << (info.module_current_valid ? "1" : "0")
                                           << " target_age_ms=" << target_age_ms
                                           << " I_thresh=" << stall_no_current_thresh
@@ -6577,7 +6940,6 @@ void OcppAdapter::apply_power_plan() {
         }
         const bool allow_energy_for_gun =
             gun_for_slot > 0 && gun_allow_energy.count(gun_for_slot) ? gun_allow_energy[gun_for_slot] : false;
-        const bool allow_energy = slot_modules_allowed && allow_energy_for_gun;
         const bool allow_energy_home = is_home && allow_energy_for_gun;
         const bool hlc_power_phase_active = hlc_power_phase;
         const bool no_energy_stall_pause =
@@ -6588,39 +6950,9 @@ void OcppAdapter::apply_power_plan() {
         EvseNoEnergyMode no_energy_mode =
             (no_energy_stall_pause || no_energy_ocpp_pause) ? EvseNoEnergyMode::Paused : EvseNoEnergyMode::None;
 
-        uint8_t relay_mask_cmd = 0u;
-        bool module_slots_valid = false;
-        const auto module_slots_it = connector_module_slots_.find(c.id);
-        if (module_slots_it != connector_module_slots_.end()) {
-            const auto& module_slots = module_slots_it->second;
-            module_slots_valid = (module_slots[0] > 0 || module_slots[1] > 0);
-            auto slot_closed = [&](int slot_id) -> bool {
-                if (slot_id <= 0) {
-                    return false;
-                }
-                if (slot_id == slot->id) {
-                    return mc_closed_cmd;
-                }
-                const auto mc_it = mc_state_cmd_by_slot.find(slot_id);
-                if (mc_it != mc_state_cmd_by_slot.end()) {
-                    return mc_it->second == ContactorState::Closed;
-                }
-                const auto info2_it = slot_info.find(slot_id);
-                return info2_it != slot_info.end() && info2_it->second.desired_mc_state == ContactorState::Closed;
-            };
-            const bool slot0_closed = slot_closed(module_slots[0]);
-            const bool slot1_closed = slot_closed(module_slots[1]);
-            if (slot0_closed || slot1_closed) {
-                relay_mask_cmd |= 0x01u;
-            }
-        }
-        if (hlc_precharge_only && precharge_single_home_slot) {
-            const auto precharge_relay_it = precharge_home_relay_mask_for_gun.find(c.id);
-            if (precharge_relay_it != precharge_home_relay_mask_for_gun.end() &&
-                precharge_relay_it->second != 0u) {
-                relay_mask_cmd = precharge_relay_it->second;
-            }
-        }
+        // Single source of truth for tie relay drive:
+        // follow the finalized MC command after gating/holds.
+        uint8_t relay_mask_cmd = mc_closed_cmd ? 0x01u : 0u;
         const bool connector_fault = !info.gun_state.safety_ok;
         if (info.disabled_by_csms || connector_fault) {
             relay_mask_cmd = 0u;
@@ -6636,62 +6968,50 @@ void OcppAdapter::apply_power_plan() {
         cmd.gc_closed = gc_closed_cmd;
         cmd.mc_closed = (!info.disabled_by_csms && !local_fault) ? mc_closed_cmd : false;
         cmd.voltage_set_v = dispatch.voltage_set_v;
-        cmd.current_limit_a = allow_energy_home ? dispatch.current_limit_a : 0.0;
-        cmd.power_kw = allow_energy_home ? dispatch.p_set_kw : 0.0;
+        cmd.current_limit_a = 0.0;
+        cmd.power_kw = 0.0;
 
-        if (cmd.module_count > 0 && cmd.module_mask == 0 && !info.disabled_by_csms && !connector_fault && !local_fault) {
-            if (!module_slots_valid && mc_closed_cmd) {
-                uint8_t fallback_mask = info.slot_cfg_mask;
-                if (fallback_mask == 0) {
-                    const auto last_it = last_module_mask_cmd_.find(c.id);
-                    if (last_it != last_module_mask_cmd_.end()) {
-                        fallback_mask = last_it->second;
-                    }
-                }
-                if (fallback_mask == 0) {
-                    const int max_bits = std::numeric_limits<uint8_t>::digits;
-                    const int capped = std::max(0, std::min(cmd.module_count, max_bits));
-                    fallback_mask = capped > 0 ? static_cast<uint8_t>((1u << capped) - 1u) : 0u;
-                }
-                fallback_mask = (fallback_mask != 0u) ? 0x01u : 0u;
-                if (fallback_mask != 0) {
-                    static std::map<int, std::chrono::steady_clock::time_point> last_log;
-                    auto& last_ts = last_log[c.id];
-                    const bool allow_log = last_ts.time_since_epoch().count() == 0 ||
-                                           (now - last_ts) > std::chrono::seconds(1);
-                    if (allow_log) {
-                        EVLOG_warning << "Connector " << c.id
-                                      << " module mask missing; using fallback mask 0x"
-                                      << std::hex << static_cast<int>(fallback_mask) << std::dec
-                                      << " for module_count=" << cmd.module_count;
-                        last_ts = now;
-                    }
-                    cmd.module_mask = fallback_mask;
-                }
-            }
-        }
+        // Atomic command finalization (single source of truth, priority ordered):
+        // 1) Hard-off conditions (faults/disable) force all outputs open/off.
+        // 2) No-energy conditions keep topology if needed but clamp I/P to 0.
+        // 3) Energy-delivery conditions use planner dispatch.
+        enum class CommandPriority : uint8_t { HardOff = 0, NoEnergy = 1, EnergyDelivery = 2 };
+        const bool force_hard_off = info.disabled_by_csms || connector_fault || local_fault;
+        const bool no_modules_available = cmd.module_count <= 0;
+        const bool pause_requested = info.paused && g.ev_session_active && is_home;
+        const bool no_energy_requested = no_energy_mode == EvseNoEnergyMode::Paused;
+        const bool force_no_energy = no_modules_available || pause_requested || no_energy_requested || !allow_energy_home;
+        const CommandPriority command_priority =
+            force_hard_off ? CommandPriority::HardOff
+                           : (force_no_energy ? CommandPriority::NoEnergy : CommandPriority::EnergyDelivery);
 
-        if (cmd.module_count <= 0) {
-            cmd.module_mask = 0;
-            cmd.mc_closed = false;
-        }
-
-        if (info.paused && g.ev_session_active && is_home) {
-            cmd.current_limit_a = 0.0;
-            cmd.power_kw = 0.0;
-            if (info.disabled_by_csms) {
+        switch (command_priority) {
+            case CommandPriority::HardOff:
                 cmd.gc_closed = false;
-                cmd.mc_closed = (!local_fault && !info.disabled_by_csms) ? mc_closed_cmd : false;
+                cmd.mc_closed = false;
                 cmd.module_count = 0;
                 cmd.module_mask = 0;
-            } else {
-                if (!allow_energy && isolation_ready && !local_fault) {
-                    cmd.gc_closed = gc_closed_cmd;
+                cmd.current_limit_a = 0.0;
+                cmd.power_kw = 0.0;
+                break;
+            case CommandPriority::NoEnergy:
+                cmd.current_limit_a = 0.0;
+                cmd.power_kw = 0.0;
+                if (no_modules_available) {
+                    cmd.module_mask = 0;
+                    cmd.mc_closed = false;
+                } else {
+                    cmd.mc_closed = mc_closed_cmd;
                 }
-                cmd.mc_closed = (!info.disabled_by_csms && !local_fault) ? mc_closed_cmd : false;
-            }
+                break;
+            case CommandPriority::EnergyDelivery:
+                cmd.current_limit_a = dispatch.current_limit_a;
+                cmd.power_kw = dispatch.p_set_kw;
+                cmd.mc_closed = mc_closed_cmd;
+                break;
         }
-        if (no_energy_mode == EvseNoEnergyMode::Paused) {
+
+        if (no_energy_requested) {
             cmd.current_limit_a = 0.0;
             cmd.power_kw = 0.0;
             auto& last_log = power_delivery_stall_last_log_[c.id];
@@ -6714,12 +7034,6 @@ void OcppAdapter::apply_power_plan() {
             }
         }
 
-        last_current_limit_a_[c.id] = cmd.current_limit_a;
-        if (is_home && gun_for_slot > 0) {
-            last_requested_power_kw_[gun_for_slot] = dispatch.p_set_kw;
-            gun_effective_current_limit_a[gun_for_slot] = std::max(0.0, cmd.current_limit_a);
-            gun_effective_power_kw[gun_for_slot] = std::max(0.0, cmd.power_kw);
-        }
         last_module_alloc_[c.id] = cmd.module_count;
         last_module_mask_cmd_[c.id] = cmd.module_mask;
         EvseLimits limits{};
@@ -6766,16 +7080,51 @@ void OcppAdapter::apply_power_plan() {
                 }
             }
         }
+        bool underdelivery_cap_active = false;
+        double underdelivery_cap_a = 0.0;
+        auto clear_underdelivery_state = [&](int connector_id, bool clear_log_cache) {
+            current_underdelivery_since_.erase(connector_id);
+            if (clear_log_cache) {
+                current_underdelivery_log_.erase(connector_id);
+            }
+            current_underdelivery_cap_a_.erase(connector_id);
+            current_underdelivery_cap_recovery_since_.erase(connector_id);
+            current_underdelivery_cap_log_.erase(connector_id);
+        };
         if (allow_energy_home && limits.max_current_a && limits.max_current_a.value() > 0.0) {
             const auto target_timeout = telemetry_timeout(cfg_);
             const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
                                        (now - status.last_target_update) <= target_timeout;
+            const auto existing_cap_it = current_underdelivery_cap_a_.find(c.id);
+            const double existing_cap_a = existing_cap_it != current_underdelivery_cap_a_.end()
+                                              ? std::max(0.0, existing_cap_it->second)
+                                              : 0.0;
+            const double offered_i_raw = std::max(0.0, cmd.current_limit_a);
+            const double offered_i_eval =
+                existing_cap_a > UNDERDELIVERY_CLAMP_MIN_A ? std::min(offered_i_raw, existing_cap_a) : offered_i_raw;
+            const double target_i = std::max(0.0, status.target_current_a.value_or(offered_i_eval));
+            const double expected_i = std::min(target_i, offered_i_eval);
             double measured_i_abs = 0.0;
             bool measured_i_valid = false;
             if (connector_prefers_module_meter) {
                 if (info.module_current_valid) {
                     measured_i_abs = std::fabs(info.module_current_a);
                     measured_i_valid = true;
+                }
+                const bool present_current_fresh =
+                    status.last_telemetry.time_since_epoch().count() != 0 &&
+                    (now - status.last_telemetry) <= telemetry_timeout(cfg_);
+                if (present_current_fresh && status.present_current_a && std::isfinite(status.present_current_a.value())) {
+                    const double present_i_abs = std::fabs(status.present_current_a.value());
+                    const double module_low_gate = std::max(1.0, expected_i * 0.15);
+                    const double present_high_gate = std::max(4.0, expected_i * 0.40);
+                    const bool module_meter_suspect =
+                        measured_i_valid && expected_i >= 8.0 && measured_i_abs <= module_low_gate &&
+                        present_i_abs >= present_high_gate;
+                    if (!measured_i_valid || module_meter_suspect) {
+                        measured_i_abs = present_i_abs;
+                        measured_i_valid = true;
+                    }
                 }
             } else {
                 if (status.present_current_a) {
@@ -6786,9 +7135,6 @@ void OcppAdapter::apply_power_plan() {
                     measured_i_valid = true;
                 }
             }
-            const double offered_i = std::max(0.0, cmd.current_limit_a);
-            const double target_i = std::max(0.0, status.target_current_a.value_or(offered_i));
-            const double expected_i = std::min(target_i, offered_i);
             const bool sustained_phase =
                 cp_power_ready && power_request_active && status.relay_closed &&
                 hlc_power_phase &&
@@ -6801,22 +7147,100 @@ void OcppAdapter::apply_power_plan() {
                 auto& since = current_underdelivery_since_[c.id];
                 if (since.time_since_epoch().count() == 0) {
                     since = now;
-                } else if ((now - since) >= std::chrono::milliseconds(2500)) {
+                } else if ((now - since) >= UNDERDELIVERY_CLAMP_ARM_MS) {
+                    const double headroom_a =
+                        std::max(UNDERDELIVERY_CLAMP_HEADROOM_A, target_i * UNDERDELIVERY_CLAMP_HEADROOM_RATIO);
+                    const double cap_candidate =
+                        std::clamp(measured_i_abs + headroom_a, UNDERDELIVERY_CLAMP_MIN_A, offered_i_raw);
+                    double cap_apply_a = cap_candidate;
+                    if (existing_cap_a > UNDERDELIVERY_CLAMP_MIN_A) {
+                        cap_apply_a = std::min(existing_cap_a, cap_candidate);
+                    }
+                    current_underdelivery_cap_a_[c.id] = cap_apply_a;
+                    current_underdelivery_cap_recovery_since_.erase(c.id);
                     if (last_log.time_since_epoch().count() == 0 ||
                         (now - last_log) >= std::chrono::seconds(1)) {
                         EVLOG_warning << "Connector " << c.id
                                       << " module underdelivery observed target_I=" << target_i
                                       << "A measured_I=" << measured_i_abs
-                                      << "A offered_I=" << offered_i << "A";
+                                      << "A offered_I=" << offered_i_raw
+                                      << "A cap_I=" << cap_apply_a << "A";
                         last_log = now;
                     }
                 }
             } else {
                 current_underdelivery_since_.erase(c.id);
+                const auto cap_it = current_underdelivery_cap_a_.find(c.id);
+                if (cap_it != current_underdelivery_cap_a_.end()) {
+                    const bool tracking_recovered =
+                        target_recent && measured_i_valid && expected_i >= UNDERDELIVERY_CLAMP_MIN_A &&
+                        (measured_i_abs + std::max(0.6, expected_i * 0.12)) >= expected_i;
+                    if (tracking_recovered) {
+                        auto& recovery_since = current_underdelivery_cap_recovery_since_[c.id];
+                        if (recovery_since.time_since_epoch().count() == 0) {
+                            recovery_since = now;
+                        } else if ((now - recovery_since) >= UNDERDELIVERY_CLAMP_RECOVERY_MS) {
+                            EVLOG_info << "Connector " << c.id
+                                       << " clearing underdelivery cap after sustained recovery (cap_I="
+                                       << cap_it->second << "A measured_I=" << measured_i_abs
+                                       << "A expected_I=" << expected_i << "A)";
+                            current_underdelivery_cap_a_.erase(c.id);
+                            current_underdelivery_cap_recovery_since_.erase(c.id);
+                            current_underdelivery_cap_log_.erase(c.id);
+                        }
+                    } else {
+                        current_underdelivery_cap_recovery_since_.erase(c.id);
+                    }
+                } else {
+                    current_underdelivery_cap_recovery_since_.erase(c.id);
+                }
+            }
+            if (!sustained_phase || !target_recent || offered_i_raw < UNDERDELIVERY_CLAMP_MIN_A) {
+                clear_underdelivery_state(c.id, false);
+            }
+            const auto cap_it = current_underdelivery_cap_a_.find(c.id);
+            if (cap_it != current_underdelivery_cap_a_.end() && cap_it->second > UNDERDELIVERY_CLAMP_MIN_A) {
+                underdelivery_cap_active = true;
+                underdelivery_cap_a = cap_it->second;
             }
         } else {
-            current_underdelivery_since_.erase(c.id);
-            current_underdelivery_log_.erase(c.id);
+            clear_underdelivery_state(c.id, true);
+        }
+        if (underdelivery_cap_active && cmd.current_limit_a > 0.0) {
+            const double capped_current_a = std::max(0.0, std::min(cmd.current_limit_a, underdelivery_cap_a));
+            if (capped_current_a + 1e-6 < cmd.current_limit_a) {
+                auto& cap_log = current_underdelivery_cap_log_[c.id];
+                if (cap_log.time_since_epoch().count() == 0 || (now - cap_log) >= std::chrono::seconds(1)) {
+                    EVLOG_warning << "Connector " << c.id
+                                  << " applying underdelivery cap command_I=" << cmd.current_limit_a
+                                  << "A cap_I=" << capped_current_a << "A";
+                    cap_log = now;
+                }
+                cmd.current_limit_a = capped_current_a;
+                if (cmd.voltage_set_v > 10.0) {
+                    const double capped_power_kw = (cmd.voltage_set_v * cmd.current_limit_a) / 1000.0;
+                    cmd.power_kw = std::min(cmd.power_kw, capped_power_kw);
+                }
+            }
+            if (limits.max_current_a) {
+                limits.max_current_a = std::min(limits.max_current_a.value(), cmd.current_limit_a);
+            } else {
+                limits.max_current_a = cmd.current_limit_a;
+            }
+            if (cmd.voltage_set_v > 10.0) {
+                const double cap_power_kw = (cmd.voltage_set_v * cmd.current_limit_a) / 1000.0;
+                if (limits.max_power_kw) {
+                    limits.max_power_kw = std::min(limits.max_power_kw.value(), cap_power_kw);
+                } else {
+                    limits.max_power_kw = cap_power_kw;
+                }
+            }
+        }
+        last_current_limit_a_[c.id] = cmd.current_limit_a;
+        if (is_home && gun_for_slot > 0) {
+            last_requested_power_kw_[gun_for_slot] = std::max(0.0, cmd.power_kw);
+            gun_effective_current_limit_a[gun_for_slot] = std::max(0.0, cmd.current_limit_a);
+            gun_effective_power_kw[gun_for_slot] = std::max(0.0, cmd.power_kw);
         }
         hardware_->set_no_energy_mode(c.id, no_energy_mode);
         hardware_->apply_power_command(cmd);
@@ -7145,6 +7569,8 @@ void OcppAdapter::apply_zero_power_plan() {
     mc_open_pending_.clear();
     mc_open_request_time_.clear();
     mc_switch_ready_since_.clear();
+    mc_open_verify_since_.clear();
+    mc_weld_suspected_.clear();
     gc_open_pending_.clear();
     gc_open_request_time_.clear();
     gc_open_timeout_exceeded_since_.clear();

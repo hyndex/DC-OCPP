@@ -157,7 +157,7 @@ int main() {
         }
     }
 
-    // Persistent low measured current must not silently clamp commanded current.
+    // Persistent low measured current should derate offered/commanded current to measured-deliverable range.
     auto no_cap_cfg = make_cfg();
     auto no_cap_hw = std::make_shared<TestHardware>(no_cap_cfg);
     OcppAdapter no_cap_adapter(no_cap_cfg, no_cap_hw);
@@ -167,7 +167,7 @@ int main() {
     no_cap_st.present_current_a = 7.0;
     no_cap_st.last_target_update = std::chrono::steady_clock::now();
     no_cap_hw->set_status_override(1, no_cap_st);
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 14; ++i) {
         no_cap_st.last_telemetry = std::chrono::steady_clock::now();
         no_cap_st.last_target_update = std::chrono::steady_clock::now();
         no_cap_hw->set_status_override(1, no_cap_st);
@@ -178,9 +178,19 @@ int main() {
         std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(no_cap_adapter));
         if (OcppAdapter::TestHook::sessions(no_cap_adapter).find(1) ==
             OcppAdapter::TestHook::sessions(no_cap_adapter).end()) {
-            std::cerr << "Power delivery stall test failed: short underdelivery window incorrectly faulted session\n";
+            std::cerr << "Power delivery stall test failed: persistent underdelivery incorrectly faulted session\n";
             return 1;
         }
+    }
+    const auto no_cap_cmd = no_cap_hw->last_power_command(1);
+    if (!no_cap_cmd.has_value() || no_cap_cmd->current_limit_a <= 0.5 || no_cap_cmd->current_limit_a >= 20.0) {
+        std::cerr << "Power delivery stall test failed: expected persistent underdelivery current derate\n";
+        return 1;
+    }
+    const auto no_cap_mreq = OcppAdapter::TestHook::last_module_command_for_slot(no_cap_adapter, 1);
+    if (!no_cap_mreq.has_value() || no_cap_mreq->current_a <= 0.5 || no_cap_mreq->current_a >= 20.0) {
+        std::cerr << "Power delivery stall test failed: module current did not follow underdelivery derate\n";
+        return 1;
     }
 
     // Stale CurrentDemand target metadata must not trigger stall-fault escalation.
@@ -206,6 +216,56 @@ int main() {
             std::cerr << "Power delivery stall test failed: stale target metadata triggered stall fault\n";
             return 1;
         }
+    }
+
+    // Brief live 0A target blips during active CurrentDemand must not instantly collapse output.
+    // Treat them as jitter for a short hold window, then honor sustained 0A requests.
+    auto zero_jitter_cfg = make_cfg();
+    auto zero_jitter_hw = std::make_shared<TestHardware>(zero_jitter_cfg);
+    OcppAdapter zero_jitter_adapter(zero_jitter_cfg, zero_jitter_hw);
+    seed_session(zero_jitter_adapter, 1);
+    auto zero_jitter_st = make_status(372.0, 384.0, 48.0);
+    zero_jitter_st.relay_closed = true;
+    zero_jitter_st.last_target_update = std::chrono::steady_clock::now();
+    zero_jitter_hw->set_status_override(1, zero_jitter_st);
+    OcppAdapter::TestHook::apply_power_plan(zero_jitter_adapter);
+    const auto zero_jitter_before = OcppAdapter::TestHook::last_module_command_for_slot(zero_jitter_adapter, 1);
+    if (!zero_jitter_before.has_value() || zero_jitter_before->current_a < 0.5) {
+        std::cerr << "Power delivery stall test failed: expected non-zero module current before 0A jitter\n";
+        return 1;
+    }
+    zero_jitter_st.target_current_a = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        zero_jitter_st.last_telemetry = std::chrono::steady_clock::now();
+        zero_jitter_st.last_target_update = std::chrono::steady_clock::now();
+        zero_jitter_hw->set_status_override(1, zero_jitter_st);
+        OcppAdapter::TestHook::apply_power_plan(zero_jitter_adapter);
+        const auto cmd = zero_jitter_hw->last_power_command(1);
+        if (!cmd.has_value() || cmd->current_limit_a < 0.5) {
+            std::cerr << "Power delivery stall test failed: 0A jitter collapsed connector current too early\n";
+            return 1;
+        }
+        const auto mreq = OcppAdapter::TestHook::last_module_command_for_slot(zero_jitter_adapter, 1);
+        if (!mreq.has_value() || mreq->current_a < 0.5) {
+            std::cerr << "Power delivery stall test failed: 0A jitter collapsed module current too early\n";
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(3200));
+    zero_jitter_st.last_telemetry = std::chrono::steady_clock::now();
+    zero_jitter_st.last_target_update = std::chrono::steady_clock::now();
+    zero_jitter_hw->set_status_override(1, zero_jitter_st);
+    OcppAdapter::TestHook::apply_power_plan(zero_jitter_adapter);
+    const auto zero_jitter_cmd_after = zero_jitter_hw->last_power_command(1);
+    if (!zero_jitter_cmd_after.has_value() || zero_jitter_cmd_after->current_limit_a > 1e-6) {
+        std::cerr << "Power delivery stall test failed: sustained 0A target was not honored after hold window\n";
+        return 1;
+    }
+    const auto zero_jitter_mreq_after = OcppAdapter::TestHook::last_module_command_for_slot(zero_jitter_adapter, 1);
+    if (!zero_jitter_mreq_after.has_value() || zero_jitter_mreq_after->current_a > 1e-6) {
+        std::cerr << "Power delivery stall test failed: module current did not gate after sustained 0A target\n";
+        return 1;
     }
 
     // When EV stops requesting power (CP drops to B), connector-side current offer is gated to 0A.

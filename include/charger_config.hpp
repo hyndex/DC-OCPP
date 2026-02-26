@@ -124,7 +124,9 @@ struct ChargerConfig {
     double module_power_kw{30.0};
     double grid_limit_kw{1000.0};
     double default_voltage_v{800.0};
-    bool allow_cross_slot_islands{false};
+    // True split charging across neighboring cabinets/modules in the ring topology.
+    // When enabled, the planner can expand a gun's island beyond its home slot.
+    bool allow_cross_slot_islands{true};
     int max_modules_per_gun{2};
     int min_modules_per_active_gun{1};
     int max_island_radius{6};

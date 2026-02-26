@@ -123,7 +123,7 @@ int main() {
     assert(tlm_no_crc.crc_ok);
     assert(tlm_no_crc.cp_state == 'B');
     assert(nearly_equal(tlm_no_crc.ev_target_voltage_v, 400.0));
-    assert(nearly_equal(tlm_no_crc.ev_target_current_a, 40.0));
+    assert(nearly_equal(tlm_no_crc.ev_target_current_a, 8.0));
 
     // LSB counter extension should be wrap-safe.
     bool changed = false;

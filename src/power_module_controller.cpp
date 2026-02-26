@@ -74,6 +74,11 @@ constexpr int MAXWELL_LIMIT_MISMATCH_CONFIRM_COUNT = 6;
 constexpr auto MAXWELL_LIMIT_MISMATCH_CONFIRM_TIME = std::chrono::milliseconds(5000);
 constexpr double MAXWELL_LIMIT_MISMATCH_ABS_DELTA = 0.25;
 constexpr double MAXWELL_LIMIT_MISMATCH_REL_DELTA = 0.35;
+constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MARGIN_V = 40.0;
+constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MIN_V = 80.0;
+constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MAX_V = 1000.0;
+constexpr auto MAXWELL_VOLTAGE_LIMIT_RETRY_INTERVAL = std::chrono::milliseconds(500);
+constexpr auto MAXWELL_SET_REJECT_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto MODULE_IDLE_STATUS_POLL_INTERVAL = std::chrono::milliseconds(800);
 constexpr auto MODULE_IDLE_TELEMETRY_POLL_INTERVAL = std::chrono::milliseconds(1500);
 // Keep OFF-command keepalive sparse in lab to avoid unnecessary command churn on inactive modules.
@@ -1142,6 +1147,24 @@ public:
                     sent_control = true;
                 }
             }
+            if (voltage_v > 0.0 && (enable_edge_on || voltage_changed || voltage_set_rejected_)) {
+                const double upper_limit_target_v = std::clamp(
+                    std::max(voltage_v + MAXWELL_VOLTAGE_UPPER_LIMIT_MARGIN_V, voltage_v * 1.05),
+                    MAXWELL_VOLTAGE_UPPER_LIMIT_MIN_V,
+                    MAXWELL_VOLTAGE_UPPER_LIMIT_MAX_V);
+                const bool upper_limit_retry_due =
+                    last_voltage_upper_limit_tx_.time_since_epoch().count() == 0 ||
+                    (now - last_voltage_upper_limit_tx_) >= MAXWELL_VOLTAGE_LIMIT_RETRY_INTERVAL;
+                const bool upper_limit_changed = std::fabs(upper_limit_target_v - last_voltage_upper_limit_v_) > 1.0;
+                if ((upper_limit_changed || voltage_set_rejected_) && upper_limit_retry_due) {
+                    attempted_control = true;
+                    if (send_set_float(0x0023, static_cast<float>(upper_limit_target_v))) {
+                        last_voltage_upper_limit_tx_ = now;
+                        last_voltage_upper_limit_v_ = upper_limit_target_v;
+                        sent_control = true;
+                    }
+                }
+            }
             if (enable_edge_on || (control_retry_due && (voltage_changed || periodic_refresh))) {
                 attempted_control = true;
                 if (send_set_float(0x0021, static_cast<float>(voltage_v))) {
@@ -1208,6 +1231,7 @@ public:
                     limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
                     last_limit_fraction_ = 0.0;
                     last_set_output_current_a_ = 0.0;
+                    voltage_set_rejected_ = false;
                     sent_control = true;
                 }
             }
@@ -1376,7 +1400,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((raw >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((raw >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(raw & 0xFF);
-        if (reg == 0x0021 || reg == 0x0022 || reg == 0x0020 || reg == 0x0046) {
+        if (reg == 0x0021 || reg == 0x0022 || reg == 0x0023 || reg == 0x0020 || reg == 0x0046) {
             EVLOG_debug << "MXR tx set-float module=" << spec_.id
                         << " can_id=0x" << hex_u32(frame.can_id & CAN_EFF_MASK, 8)
                         << " reg=0x" << hex_u32(reg, 4)
@@ -1465,6 +1489,22 @@ private:
         const uint8_t status = frame.data[1];
         const uint16_t reg = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
         if (status != MAXWELL_OK) {
+            if (type == MAXWELL_TYPE_FLOAT && reg == 0x0021) {
+                const float attempted_v = decode_float_be(&frame.data[4]);
+                if (std::isfinite(attempted_v)) {
+                    last_rejected_voltage_v_ = static_cast<double>(attempted_v);
+                }
+                voltage_set_rejected_ = true;
+                if (last_set_reject_log_.time_since_epoch().count() == 0 ||
+                    (now - last_set_reject_log_) >= MAXWELL_SET_REJECT_LOG_INTERVAL) {
+                    EVLOG_warning << "MXR module " << spec_.id
+                                  << " rejected voltage setpoint reg=0x0021 status=0x"
+                                  << std::hex << static_cast<int>(status) << std::dec
+                                  << " attempted_V=" << last_rejected_voltage_v_
+                                  << "V; will retry with raised reg=0x0023 upper limit";
+                    last_set_reject_log_ = now;
+                }
+            }
             if (status_error_since_.time_since_epoch().count() == 0) {
                 status_error_since_ = now;
             }
@@ -1495,7 +1535,13 @@ private:
                 telemetry_.last_update = now;
                 return;
             }
-            if (reg == 0x0001) {
+            if (reg == 0x0021) {
+                // Successful acceptance of output-voltage setpoint.
+                voltage_set_rejected_ = false;
+            } else if (reg == 0x0023) {
+                // Keep latest accepted over-voltage threshold to avoid unnecessary rewrites.
+                last_voltage_upper_limit_v_ = std::max(0.0, static_cast<double>(val));
+            } else if (reg == 0x0001) {
                 if (val >= -0.1f && val <= 2000.0f) {
                     telemetry_.voltage_v = std::max(0.0, static_cast<double>(val));
                     telemetry_.last_voltage_update = now;
@@ -1758,13 +1804,18 @@ private:
     std::chrono::steady_clock::time_point status_error_since_{};
     std::chrono::steady_clock::time_point last_limit_set_tx_{};
     std::chrono::steady_clock::time_point limit_mismatch_since_{};
+    std::chrono::steady_clock::time_point last_voltage_upper_limit_tx_{};
+    std::chrono::steady_clock::time_point last_set_reject_log_{};
     double last_limit_fraction_{0.0};
     double last_set_output_current_a_{0.0};
+    double last_voltage_upper_limit_v_{0.0};
+    double last_rejected_voltage_v_{0.0};
     int current_dip_confirm_count_{0};
     int limit_mismatch_count_{0};
     int status_error_count_{0};
     bool status_error_latched_{false};
     bool pending_current_recheck_{false};
+    bool voltage_set_rejected_{false};
 };
 
 class RectifierModuleDriver : public ModuleDriver {

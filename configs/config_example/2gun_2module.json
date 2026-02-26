@@ -42,7 +42,7 @@
   "defaultVoltageV": 800,
   "ocppConfig": "../ocpp/v16/config.json",
   "planner": {
-    "allowCrossSlotIslands": false,
+    "allowCrossSlotIslands": true,
     "maxModulesPerGun": 2,
     "minModulesPerActiveGun": 1,
     "requireAuthForPrecharge": false,

@@ -154,32 +154,10 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
     slots.push_back(g.slot_id);
     claimed_slots.insert(g.slot_id);
 
-    auto maybe_add_passthrough = [&](int candidate_id, bool prepend) {
-        if (candidate_id == 0 || claimed_slots.count(candidate_id) || active_home_slots.count(candidate_id)) {
-            return false;
-        }
-        const auto* cand = find_slot(candidate_id);
-        if (!cand) return false;
-        if (!cand->modules.empty() || cand->gun_id > 0) return false;
-        if (reserved_slots.count(candidate_id) && candidate_id != g.slot_id) return false;
-        if (prepend) {
-            slots.insert(slots.begin(), candidate_id);
-        } else {
-            slots.push_back(candidate_id);
-        }
-        claimed_slots.insert(candidate_id);
-        return true;
-    };
-
     if (!cfg_.allow_cross_slot_islands || n_needed <= count_healthy_modules_in_slot(g.slot_id)) {
-        // Keep single-module islands from opening the module's own MC contactor by
-        // including an adjacent pass-through slot (no modules, no gun) when present.
-        const auto* home = find_slot(g.slot_id);
-        if (home) {
-            if (!maybe_add_passthrough(home->cw_id, false)) {
-                (void)maybe_add_passthrough(home->ccw_id, true);
-            }
-        }
+        // Local-only operation: keep ownership on the home slot.
+        // This keeps the home gun's right-side tie open unless additional cabinets are
+        // explicitly borrowed for extra power.
         return slots;
     }
 
@@ -192,28 +170,7 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
 
     while (remaining > 0 && (cw_steps < cfg_.max_island_radius || ccw_steps < cfg_.max_island_radius)) {
         bool expanded = false;
-        if (cw_steps < cfg_.max_island_radius) {
-            if (slot_lookup_.count(cw_edge)) {
-                const int candidate = slot_lookup_.at(cw_edge).cw_id;
-                if (slot_lookup_.count(candidate) && !claimed_slots.count(candidate) &&
-                    !active_home_slots.count(candidate) &&
-                    (!reserved_slots.count(candidate) || candidate == g.slot_id)) {
-                    const int healthy = count_healthy_modules_in_slot(candidate);
-                    slots.push_back(candidate);
-                    cw_edge = candidate;
-                    claimed_slots.insert(candidate);
-                    available += healthy;
-                    remaining = std::max(0, n_needed - available);
-                    expanded = true;
-                }
-                cw_steps++;
-            } else {
-                cw_steps = cfg_.max_island_radius;
-            }
-        }
-
-        if (remaining <= 0) break;
-
+        // Borrow anti-clockwise first, then clockwise if more capacity is still needed.
         if (ccw_steps < cfg_.max_island_radius) {
             if (slot_lookup_.count(ccw_edge)) {
                 const int candidate = slot_lookup_.at(ccw_edge).ccw_id;
@@ -231,6 +188,28 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
                 ccw_steps++;
             } else {
                 ccw_steps = cfg_.max_island_radius;
+            }
+        }
+
+        if (remaining <= 0) break;
+
+        if (cw_steps < cfg_.max_island_radius) {
+            if (slot_lookup_.count(cw_edge)) {
+                const int candidate = slot_lookup_.at(cw_edge).cw_id;
+                if (slot_lookup_.count(candidate) && !claimed_slots.count(candidate) &&
+                    !active_home_slots.count(candidate) &&
+                    (!reserved_slots.count(candidate) || candidate == g.slot_id)) {
+                    const int healthy = count_healthy_modules_in_slot(candidate);
+                    slots.push_back(candidate);
+                    cw_edge = candidate;
+                    claimed_slots.insert(candidate);
+                    available += healthy;
+                    remaining = std::max(0, n_needed - available);
+                    expanded = true;
+                }
+                cw_steps++;
+            } else {
+                cw_steps = cfg_.max_island_radius;
             }
         }
 
@@ -555,20 +534,6 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         }
 
         const auto slots_for_g = island_slots[gid];
-        const bool full_island = slots_for_g.size() == slots_.size() && !slots_.empty();
-        if (!g.mc_welded && !slots_for_g.empty() && n_needed > 0 && !full_island) {
-            const auto* ccw_boundary = find_slot(slots_for_g.front());
-            if (ccw_boundary) {
-                const auto* prev_slot = find_slot(ccw_boundary->ccw_id);
-                if (prev_slot) {
-                    plan.mc_commands[prev_slot->mc_id] = ContactorState::Open;
-                }
-            }
-            const auto* cw_boundary = find_slot(slots_for_g.back());
-            if (cw_boundary) {
-                plan.mc_commands[cw_boundary->mc_id] = ContactorState::Open;
-            }
-        }
 
         const auto preferred = last_module_ids_[gid];
         auto selected = assign_modules_for_island(slots_for_g, n_needed, plan, preferred);
@@ -621,6 +586,106 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
 
         plan.islands.push_back(std::move(island));
         plan.guns.push_back(dispatch);
+    }
+
+    // Canonical tie truth rule for a ring:
+    // close tie(i->i+1) iff both adjacent cabinets share the same owner.
+    //
+    // Owners:
+    // - gun_id for active island members
+    // - 0 for idle/unassigned pool cabinets
+    std::map<int, int> slot_owner;
+    for (const auto& s : slots_) {
+        slot_owner[s.id] = 0;
+    }
+    for (const auto& island : plan.islands) {
+        if (!island.gun_id.has_value()) {
+            continue;
+        }
+        const int owner = island.gun_id.value();
+        for (int sid : island.slot_ids) {
+            slot_owner[sid] = owner;
+        }
+    }
+    for (const auto& s : slots_) {
+        ContactorState tie_state = ContactorState::Open;
+        const auto cw_it = slot_lookup_.find(s.cw_id);
+        const auto own_it = slot_owner.find(s.id);
+        if (cw_it != slot_lookup_.end() && own_it != slot_owner.end()) {
+            const auto cw_owner_it = slot_owner.find(cw_it->first);
+            if (cw_owner_it != slot_owner.end() && own_it->second == cw_owner_it->second) {
+                tie_state = ContactorState::Closed;
+            }
+        }
+        plan.mc_commands[s.mc_id] = tie_state;
+    }
+
+    // Keep one deterministic ring break open when a single owner spans all cabinets.
+    // This avoids a fully closed ring while preserving island integrity.
+    int common_owner = -1;
+    bool single_owner = !slots_.empty();
+    for (const auto& s : slots_) {
+        const int owner = slot_owner[s.id];
+        if (owner <= 0) {
+            single_owner = false;
+            break;
+        }
+        if (common_owner < 0) {
+            common_owner = owner;
+        } else if (owner != common_owner) {
+            single_owner = false;
+            break;
+        }
+    }
+    if (single_owner) {
+        std::set<int> avoid_slots;
+        const Slot* owner_home = nullptr;
+        const auto owner_it = guns_.find(common_owner);
+        if (owner_it != guns_.end()) {
+            owner_home = find_slot(owner_it->second.slot_id);
+            if (owner_home) {
+                avoid_slots.insert(owner_home->id);
+                // In split mappings, the home slot's CW neighbor is commonly the same cabinet's
+                // secondary/pass-through slot used for relay-mask derivation.
+                if (owner_home->cw_id > 0) {
+                    avoid_slots.insert(owner_home->cw_id);
+                }
+            }
+        }
+
+        auto choose_ring_break = [&](auto&& predicate) -> const Slot* {
+            const Slot* chosen = nullptr;
+            for (const auto& s : slots_) {
+                if (!predicate(s)) {
+                    continue;
+                }
+                if (!chosen || s.id > chosen->id) {
+                    chosen = &s;
+                }
+            }
+            return chosen;
+        };
+
+        const Slot* ring_break = choose_ring_break([&](const Slot& s) {
+            return !avoid_slots.count(s.id) && s.gun_id == 0;
+        });
+        if (!ring_break) {
+            ring_break = choose_ring_break([&](const Slot& s) {
+                return !avoid_slots.count(s.id);
+            });
+        }
+        if (!ring_break && owner_home) {
+            ring_break = choose_ring_break([&](const Slot& s) {
+                return s.id != owner_home->id;
+            });
+        }
+        if (!ring_break && !slots_.empty()) {
+            ring_break = &slots_.back();
+        }
+
+        if (ring_break) {
+            plan.mc_commands[ring_break->mc_id] = ContactorState::Open;
+        }
     }
 
     return plan;

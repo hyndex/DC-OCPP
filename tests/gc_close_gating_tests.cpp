@@ -62,7 +62,9 @@ static GunStatus make_status(double present_v, double target_v, double target_i,
     st.target_current_a = target_i;
     st.present_voltage_v = present_v;
     st.present_current_a = 0.0;
-    st.last_telemetry = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    st.last_telemetry = now;
+    st.last_target_update = now;
     return st;
 }
 

@@ -25,8 +25,8 @@
     }
   },
   {
-    "name": "PreCharge_CloseAtZeroAndRamp",
-    "ticks": 3,
+    "name": "PreCharge_CloseAtZero",
+    "ticks": 1,
     "gun": {
       "safety_ok": true,
       "plugged_in": true,
@@ -50,13 +50,42 @@
       "gc_closed": true,
       "module_count": 1,
       "max_current_limit_a": 2.0,
+      "max_voltage_set_v": 1.0
+    }
+  },
+  {
+    "name": "PreCharge_RampAfterClose",
+    "ticks": 2,
+    "gun": {
+      "safety_ok": true,
+      "plugged_in": true,
+      "cp_state": "C",
+      "hlc_stage": 8,
+      "hlc_cable_check_ok": true,
+      "hlc_precharge_active": true,
+      "hlc_power_ready": false,
+      "hlc_charge_complete": false,
+      "authorization_granted": true,
+      "relay_closed": true,
+      "lock_engaged": true,
+      "module_healthy_mask": 3,
+      "module_fault_mask": 0,
+      "present_voltage_v": 0.0,
+      "present_current_a": 0.0,
+      "target_voltage_v": 400.0,
+      "target_current_a": 10.0
+    },
+    "expect": {
+      "gc_closed": true,
+      "module_count": 1,
+      "max_current_limit_a": 2.0,
       "min_voltage_set_v": 70.0,
       "max_voltage_set_v": 90.0
     }
   },
   {
     "name": "PowerDelivery_AllocateBoostModule",
-    "ticks": 20,
+    "ticks": 80,
     "gun": {
       "safety_ok": true,
       "plugged_in": true,

@@ -12,7 +12,9 @@ using namespace charger;
 static ChargerConfig make_cfg() {
     ChargerConfig cfg{};
     cfg.charge_point_id = "post-precharge-hold-test";
-    cfg.connectors = {ConnectorConfig{.id = 1}};
+    cfg.connectors = {ConnectorConfig{.id = 1, .max_voltage_v = 1000.0}};
+    cfg.planner_voltage_margin_v = 0.0;
+    cfg.planner_current_margin_a = 0.0;
     cfg.precharge_voltage_tolerance_v = 50.0;
     cfg.switch_max_current_a = 2.0;
     cfg.tie_close_max_delta_v = 20.0;
@@ -69,6 +71,7 @@ static GunStatus make_status(double present_v, double target_v, double target_i,
     st.module_fault_mask = 0x00;
     st.target_voltage_v = target_v;
     st.target_current_a = target_i;
+    st.last_target_update = std::chrono::steady_clock::now();
     st.present_voltage_v = present_v;
     st.present_current_a = 0.0;
     st.last_telemetry = std::chrono::steady_clock::now();
@@ -125,6 +128,25 @@ int main() {
     }
     if (std::abs(cmd_charge->voltage_set_v - 400.0) > 1e-6) {
         std::cerr << "post_precharge_hold_tests failed: expected V_set=400 after auth\n";
+        return 1;
+    }
+
+    // HardOff precedence: safety fault must dominate over energy/no-energy paths.
+    auto fault = make_status(400.0, 400.0, 20.0);
+    fault.safety_ok = false;
+    fault.cp_fault = true;
+    fault.last_target_update = std::chrono::steady_clock::now();
+    fault.last_telemetry = std::chrono::steady_clock::now();
+    hw->set_status_override(1, fault);
+    OcppAdapter::TestHook::apply_power_plan(adapter);
+    const auto cmd_fault = hw->last_power_command(1);
+    if (!cmd_fault.has_value()) {
+        std::cerr << "post_precharge_hold_tests failed: missing power command in hard-off case\n";
+        return 1;
+    }
+    if (cmd_fault->gc_closed || cmd_fault->mc_closed || cmd_fault->module_count != 0 ||
+        cmd_fault->module_mask != 0u || cmd_fault->current_limit_a != 0.0 || cmd_fault->power_kw != 0.0) {
+        std::cerr << "post_precharge_hold_tests failed: hard-off did not dominate command output\n";
         return 1;
     }
 

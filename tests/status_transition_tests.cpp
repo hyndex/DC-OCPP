@@ -117,7 +117,7 @@ int main() {
     st = base_status();
     st.relay_closed = false;
     st.cp_state = 'C';
-    st.hlc_stage = 1;
+    st.hlc_stage = 8;
     st.hlc_power_ready = false;
     st.hlc_precharge_active = true;
     OcppAdapter::TestHook::update_connector_state(adapter, 1, st,

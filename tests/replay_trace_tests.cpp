@@ -113,7 +113,11 @@ static GunStatus parse_status(const nlohmann::json& j) {
     if (j.contains("module_healthy_mask")) st.module_healthy_mask = static_cast<uint8_t>(j["module_healthy_mask"].get<int>());
     if (j.contains("module_fault_mask")) st.module_fault_mask = static_cast<uint8_t>(j["module_fault_mask"].get<int>());
 
-    st.last_telemetry = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    st.last_telemetry = now;
+    if (st.target_voltage_v || st.target_current_a) {
+        st.last_target_update = now;
+    }
     return st;
 }
 

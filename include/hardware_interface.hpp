@@ -90,7 +90,7 @@ struct GunStatus {
 struct PowerCommand {
     std::int32_t connector{0};
     int module_count{0};
-    uint8_t module_mask{0}; // single-island-contactor mode: non-zero drives Relay2 (legacy bit1 is collapsed).
+    uint8_t module_mask{0}; // legacy payload; Relay2 drive follows mc_closed in single-island-contactor mode.
     bool gc_closed{false};
     bool mc_closed{false};
     double voltage_set_v{0.0};

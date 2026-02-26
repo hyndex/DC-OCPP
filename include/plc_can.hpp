@@ -151,6 +151,7 @@ private:
         std::array<uint8_t, 8> last_present_payload{};
         bool last_present_payload_valid{false};
         std::chrono::steady_clock::time_point last_ev_targets_rx{};
+        std::chrono::steady_clock::time_point last_ev_targets_strict_rx{};
         std::chrono::steady_clock::time_point last_relay_tx{};
         std::chrono::steady_clock::time_point last_evse_present_update{};
         std::chrono::steady_clock::time_point last_cp_rx{};
