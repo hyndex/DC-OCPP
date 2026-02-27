@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <set>
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <limits>
 #include <type_traits>
@@ -256,6 +257,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
     cfg.ramp_step_a = planner_value("rampStepA", cfg.ramp_step_a);
     cfg.planner_voltage_margin_v = planner_value("voltageMarginV", cfg.planner_voltage_margin_v);
+    cfg.planner_final_voltage_margin_low_pct =
+        planner_value("finalVoltageMarginLowPct", cfg.planner_final_voltage_margin_low_pct);
+    cfg.planner_final_voltage_margin_high_pct =
+        planner_value("finalVoltageMarginHighPct", cfg.planner_final_voltage_margin_high_pct);
     cfg.planner_current_margin_a = planner_value("currentMarginA", cfg.planner_current_margin_a);
     cfg.planner_voltage_guard_band_v = planner_value("voltageGuardBandV", cfg.planner_voltage_guard_band_v);
     cfg.planner_ramp_up_min_a_per_s = planner_value("rampUpMinAps", cfg.planner_ramp_up_min_a_per_s);
@@ -286,6 +291,10 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
         can_traffic.value("bitsPerFrameEstimate", cfg.can_traffic.bits_per_frame_estimate);
     cfg.can_traffic.over_cap_debounce_ms =
         can_traffic.value("overCapDebounceMs", cfg.can_traffic.over_cap_debounce_ms);
+    cfg.can_traffic.over_cap_clear_ratio =
+        can_traffic.value("overCapClearRatio", cfg.can_traffic.over_cap_clear_ratio);
+    cfg.can_traffic.over_cap_clear_hold_ms =
+        can_traffic.value("overCapClearHoldMs", cfg.can_traffic.over_cap_clear_hold_ms);
     cfg.can_traffic.enforce = can_traffic.value("enforce", cfg.can_traffic.enforce);
     if (cfg.module_power_kw <= 0.0) {
         cfg.module_power_kw = 30.0;
@@ -337,6 +346,17 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.planner_voltage_margin_v < 0.0) {
         cfg.planner_voltage_margin_v = 0.0;
+    }
+    if (!std::isfinite(cfg.planner_final_voltage_margin_low_pct)) {
+        cfg.planner_final_voltage_margin_low_pct = 0.035;
+    }
+    if (!std::isfinite(cfg.planner_final_voltage_margin_high_pct)) {
+        cfg.planner_final_voltage_margin_high_pct = 0.04;
+    }
+    cfg.planner_final_voltage_margin_low_pct = std::clamp(cfg.planner_final_voltage_margin_low_pct, 0.0, 0.20);
+    cfg.planner_final_voltage_margin_high_pct = std::clamp(cfg.planner_final_voltage_margin_high_pct, 0.0, 0.20);
+    if (cfg.planner_final_voltage_margin_high_pct < cfg.planner_final_voltage_margin_low_pct) {
+        std::swap(cfg.planner_final_voltage_margin_high_pct, cfg.planner_final_voltage_margin_low_pct);
     }
     if (cfg.planner_current_margin_a < 0.0) {
         cfg.planner_current_margin_a = 0.0;
@@ -394,6 +414,13 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.can_traffic.over_cap_debounce_ms < 0) {
         cfg.can_traffic.over_cap_debounce_ms = 0;
+    }
+    if (!std::isfinite(cfg.can_traffic.over_cap_clear_ratio)) {
+        cfg.can_traffic.over_cap_clear_ratio = 0.85;
+    }
+    cfg.can_traffic.over_cap_clear_ratio = std::clamp(cfg.can_traffic.over_cap_clear_ratio, 0.50, 0.99);
+    if (cfg.can_traffic.over_cap_clear_hold_ms < 0) {
+        cfg.can_traffic.over_cap_clear_hold_ms = 0;
     }
     if (!cfg.allow_cross_slot_islands) {
         std::cerr << "[cfg] planner.allowCrossSlotIslands=false: cross-cabinet borrowing disabled; "

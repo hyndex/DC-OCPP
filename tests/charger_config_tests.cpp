@@ -305,6 +305,8 @@ int main() {
     "windowMs": 5000,
     "bitsPerFrameEstimate": 140,
     "overCapDebounceMs": 2500,
+    "overCapClearRatio": 0.8,
+    "overCapClearHoldMs": 3200,
     "enforce": true
   },
   "slots": [
@@ -318,7 +320,39 @@ int main() {
         assert(cfg.can_traffic.window_ms == 5000);
         assert(cfg.can_traffic.bits_per_frame_estimate == 140);
         assert(cfg.can_traffic.over_cap_debounce_ms == 2500);
+        assert(std::fabs(cfg.can_traffic.over_cap_clear_ratio - 0.8) < 1e-9);
+        assert(cfg.can_traffic.over_cap_clear_hold_ms == 3200);
         assert(cfg.can_traffic.enforce);
+    }
+
+    // CAN traffic clear-policy clamping should reject invalid values.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "canTraffic": {
+    "maxTotalKbpsPerInterface": 18.5,
+    "windowMs": 5000,
+    "bitsPerFrameEstimate": 140,
+    "overCapDebounceMs": 2500,
+    "overCapClearRatio": 4.2,
+    "overCapClearHoldMs": -50,
+    "enforce": true
+  },
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(std::fabs(cfg.can_traffic.over_cap_clear_ratio - 0.99) < 1e-9);
+        assert(cfg.can_traffic.over_cap_clear_hold_ms == 0);
     }
 
     // Composite schedule defaults should follow connector capability when no explicit key is configured.
@@ -359,6 +393,31 @@ int main() {
         const auto patched = nlohmann::json::parse(load_and_patch_ocpp_config(cfg));
         assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitAmps"].get<double>() - 123.0) < 1e-9);
         assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitWatts"].get<double>() - 45000.0) < 1e-9);
+    }
+
+    // Dynamic final-voltage margin percentages should parse and normalize.
+    {
+        const auto dir = make_temp_dir();
+        const auto path = write_file(
+            dir, "charger.json",
+            R"JSON(
+{
+  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
+  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
+  "planner": {
+    "finalVoltageMarginLowPct": 0.09,
+    "finalVoltageMarginHighPct": 0.05
+  },
+  "connectors": [ { "id": 1, "plcId": 0 } ],
+  "slots": [
+    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
+      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
+  ]
+}
+)JSON");
+        const auto cfg = load_charger_config(path);
+        assert(std::fabs(cfg.planner_final_voltage_margin_low_pct - 0.05) < 1e-9);
+        assert(std::fabs(cfg.planner_final_voltage_margin_high_pct - 0.09) < 1e-9);
     }
 
     std::cout << "charger_config_tests passed\n";

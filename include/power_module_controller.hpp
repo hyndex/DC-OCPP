@@ -67,6 +67,8 @@ struct ModuleCanTrafficPolicy {
     int window_ms{10000};
     int bits_per_frame_estimate{150};
     int over_cap_debounce_ms{5000};
+    double over_cap_clear_ratio{0.85};
+    int over_cap_clear_hold_ms{5000};
     bool enforce{true};
 };
 

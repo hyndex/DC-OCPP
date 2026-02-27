@@ -132,6 +132,10 @@ private:
         double present_power_kw{0.0};
         double ev_target_voltage_v{0.0};
         double ev_target_current_a{0.0};
+        // Last known valid EV target from PLC telemetry (used as bounded cache during transient
+        // ev_target_recent drops while HLC power stage is still active).
+        double last_valid_ev_target_voltage_v{0.0};
+        double last_valid_ev_target_current_a{0.0};
         double energy_kwh{0.0};
         double freq_hz{0.0};
         can_contract::RelayStatus last_relay{};
@@ -152,6 +156,8 @@ private:
         bool last_present_payload_valid{false};
         std::chrono::steady_clock::time_point last_ev_targets_rx{};
         std::chrono::steady_clock::time_point last_ev_targets_strict_rx{};
+        std::chrono::steady_clock::time_point last_valid_ev_target_rx{};
+        std::chrono::steady_clock::time_point last_target_cache_log{};
         std::chrono::steady_clock::time_point last_relay_tx{};
         std::chrono::steady_clock::time_point last_evse_present_update{};
         std::chrono::steady_clock::time_point last_cp_rx{};

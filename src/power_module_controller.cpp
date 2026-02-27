@@ -77,6 +77,7 @@ constexpr double MAXWELL_LIMIT_MISMATCH_REL_DELTA = 0.35;
 constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MARGIN_V = 40.0;
 constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MIN_V = 80.0;
 constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MAX_V = 1000.0;
+constexpr double MAXWELL_OUTPUT_POWER_RATIO_MIN = 0.10;
 constexpr auto MAXWELL_VOLTAGE_LIMIT_RETRY_INTERVAL = std::chrono::milliseconds(500);
 constexpr auto MAXWELL_SET_REJECT_LOG_INTERVAL = std::chrono::seconds(2);
 constexpr auto MODULE_IDLE_STATUS_POLL_INTERVAL = std::chrono::milliseconds(800);
@@ -229,7 +230,7 @@ int popcount(uint8_t v) {
 std::chrono::milliseconds telemetry_stale_interval(const ModuleSpec& spec) {
     int ms = spec.telemetry_stale_ms;
     if (ms <= 0) {
-        const int fallback = std::max(2000, spec.poll_interval_ms * 3);
+        const int fallback = std::max(3000, spec.poll_interval_ms * 4);
         ms = fallback;
     }
     return std::chrono::milliseconds(ms);
@@ -460,6 +461,8 @@ private:
         int window_ms{10000};
         int bits_per_frame_estimate{150};
         int over_cap_debounce_ms{5000};
+        double over_cap_clear_ratio{0.85};
+        int over_cap_clear_hold_ms{5000};
         bool enforce{true};
         std::deque<BitEvent> observed_events;
         std::deque<BitEvent> reserved_events;
@@ -473,6 +476,7 @@ private:
         std::chrono::steady_clock::time_point last_budget_drop{};
         std::chrono::steady_clock::time_point control_backlog_since{};
         std::chrono::steady_clock::time_point over_cap_since{};
+        std::chrono::steady_clock::time_point under_cap_since{};
         bool overload_latched{false};
         bool overcap_log_latched{false};
         std::chrono::steady_clock::time_point last_log{};
@@ -540,6 +544,7 @@ private:
     static void refresh_overcap_locked(IfaceState& st, const std::chrono::steady_clock::time_point& now) {
         const double observed_kbps = window_kbps(st, st.observed_bits);
         if (observed_kbps > st.max_total_kbps) {
+            st.under_cap_since = std::chrono::steady_clock::time_point{};
             if (st.over_cap_since.time_since_epoch().count() == 0) {
                 st.over_cap_since = now;
             } else if (!st.overload_latched && st.enforce &&
@@ -548,8 +553,24 @@ private:
             }
             return;
         }
-        if (!st.overload_latched) {
+        if (st.overload_latched) {
+            const double clear_threshold = st.max_total_kbps * std::clamp(st.over_cap_clear_ratio, 0.5, 0.99);
+            if (observed_kbps <= clear_threshold) {
+                if (st.under_cap_since.time_since_epoch().count() == 0) {
+                    st.under_cap_since = now;
+                } else if ((now - st.under_cap_since) >=
+                           std::chrono::milliseconds(std::max(0, st.over_cap_clear_hold_ms))) {
+                    st.overload_latched = false;
+                    st.overcap_log_latched = false;
+                    st.over_cap_since = std::chrono::steady_clock::time_point{};
+                    st.under_cap_since = std::chrono::steady_clock::time_point{};
+                }
+            } else {
+                st.under_cap_since = std::chrono::steady_clock::time_point{};
+            }
+        } else {
             st.over_cap_since = std::chrono::steady_clock::time_point{};
+            st.under_cap_since = std::chrono::steady_clock::time_point{};
         }
     }
 
@@ -560,6 +581,8 @@ private:
         st.window_ms = std::max(1000, default_policy_.window_ms);
         st.bits_per_frame_estimate = std::max(80, default_policy_.bits_per_frame_estimate);
         st.over_cap_debounce_ms = std::max(0, default_policy_.over_cap_debounce_ms);
+        st.over_cap_clear_ratio = std::clamp(default_policy_.over_cap_clear_ratio, 0.50, 0.99);
+        st.over_cap_clear_hold_ms = std::max(0, default_policy_.over_cap_clear_hold_ms);
         st.enforce = default_policy_.enforce;
         (void)iface;
         st.plc_reserve_kbps = 0.0;
@@ -1191,17 +1214,33 @@ public:
                                                   : (spec_.rated_current_a > 0.0 && voltage_v > 1.0
                                                          ? (spec_.rated_current_a * voltage_v) / 1000.0
                                                          : 0.0);
+                bool can_send_power_cmd = false;
                 double power_ratio = 0.0;
                 if (sp.power_kw > 0.0 && rated_power_kw > 0.0) {
-                    power_ratio = std::clamp(sp.power_kw / rated_power_kw, 0.0, 1.0);
-                    if ((power_ratio <= 0.0 || power_ratio >= 1.0) &&
-                        (last_power_ratio_clamp_log_.time_since_epoch().count() == 0 ||
-                         (now - last_power_ratio_clamp_log_) >= std::chrono::seconds(2))) {
-                        EVLOG_warning << "MXR module " << spec_.id
-                                      << " output power command clamped (req_kW=" << sp.power_kw
-                                      << " rated_kW=" << rated_power_kw
-                                      << " ratio=" << power_ratio << ")";
-                        last_power_ratio_clamp_log_ = now;
+                    const double requested_ratio = sp.power_kw / rated_power_kw;
+                    if (requested_ratio < MAXWELL_OUTPUT_POWER_RATIO_MIN) {
+                        if (last_power_ratio_clamp_log_.time_since_epoch().count() == 0 ||
+                            (now - last_power_ratio_clamp_log_) >= std::chrono::seconds(2)) {
+                            EVLOG_info << "MXR module " << spec_.id
+                                       << " skipping 0x0020 output-power write below protocol floor"
+                                       << " (req_kW=" << sp.power_kw
+                                       << " rated_kW=" << rated_power_kw
+                                       << " ratio=" << requested_ratio
+                                       << " min_ratio=" << MAXWELL_OUTPUT_POWER_RATIO_MIN << ")";
+                            last_power_ratio_clamp_log_ = now;
+                        }
+                    } else {
+                        power_ratio = std::clamp(requested_ratio, MAXWELL_OUTPUT_POWER_RATIO_MIN, 1.0);
+                        if (power_ratio >= 1.0 &&
+                            (last_power_ratio_clamp_log_.time_since_epoch().count() == 0 ||
+                             (now - last_power_ratio_clamp_log_) >= std::chrono::seconds(2))) {
+                            EVLOG_warning << "MXR module " << spec_.id
+                                          << " output power command clamped (req_kW=" << sp.power_kw
+                                          << " rated_kW=" << rated_power_kw
+                                          << " ratio=" << power_ratio << ")";
+                            last_power_ratio_clamp_log_ = now;
+                        }
+                        can_send_power_cmd = true;
                     }
                 } else if (sp.power_kw > 0.0 &&
                            (last_missing_rated_power_log_.time_since_epoch().count() == 0 ||
@@ -1210,10 +1249,12 @@ public:
                                 << " missing rated power/current for 0x0020 scaling; forcing power ratio=0";
                     last_missing_rated_power_log_ = now;
                 }
-                attempted_control = true;
-                if (send_set_float(0x0020, static_cast<float>(power_ratio))) {
-                    last_sent_.power_kw = sp.power_kw;
-                    sent_control = true;
+                if (can_send_power_cmd) {
+                    attempted_control = true;
+                    if (send_set_float(0x0020, static_cast<float>(power_ratio))) {
+                        last_sent_.power_kw = sp.power_kw;
+                        sent_control = true;
+                    }
                 }
             }
             last_off_keepalive_tx_ = std::chrono::steady_clock::time_point{};
@@ -1713,13 +1754,18 @@ private:
                 last_status_update_ = now;
                 const bool module_off = (val & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0;
                 const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
-                bool fault = severe;
-                if (!fault && desired_.enable &&
+                const bool startup_stalled = !severe && desired_.enable &&
                     startup_load_requested(desired_.current_a, desired_.power_kw) &&
                     enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
-                    (now - enable_requested_at_) > MAXWELL_START_TIMEOUT) {
-                    fault = true;
+                    (now - enable_requested_at_) > MAXWELL_START_TIMEOUT;
+                if (startup_stalled &&
+                    (last_start_stall_log_.time_since_epoch().count() == 0 ||
+                     (now - last_start_stall_log_) >= std::chrono::seconds(2))) {
+                    EVLOG_warning << "MXR module " << spec_.id
+                                  << " still reports OFF after startup request; keeping module in recovery state";
+                    last_start_stall_log_ = now;
                 }
+                const bool fault = severe;
                 telemetry_.fault = fault;
                 uint8_t bit = 0x01;
                 if (spec_.slot_index >= 0 && spec_.slot_index < 8) {
@@ -1796,6 +1842,7 @@ private:
     std::chrono::steady_clock::time_point last_missing_rated_current_log_{};
     std::chrono::steady_clock::time_point last_missing_rated_power_log_{};
     std::chrono::steady_clock::time_point last_power_ratio_clamp_log_{};
+    std::chrono::steady_clock::time_point last_start_stall_log_{};
     std::chrono::steady_clock::time_point last_current_recheck_tx_{};
     std::chrono::steady_clock::time_point last_current_dip_log_{};
     std::chrono::steady_clock::time_point last_current_dip_warn_{};
@@ -2560,26 +2607,27 @@ public:
             return;
         }
         const auto& indices = it->second;
-        int enabled = 0;
+        int active_count = 0;
         for (auto idx : indices) {
             if (idx >= modules_.size()) continue;
-            const auto& spec = modules_[idx].spec;
+            const auto& mod = modules_[idx];
+            if (!mod.driver) continue;
+            const auto& spec = mod.spec;
             const bool selected = (spec.slot_index >= 0 && spec.slot_index < 8) &&
                                   (((req.mask >> spec.slot_index) & 0x1) != 0);
             if (req.enable && selected) {
-                enabled++;
+                active_count++;
             }
         }
-        const double current_per_module = (enabled > 0) ? (req.current_a / static_cast<double>(enabled)) : 0.0;
-        const double power_per_module = (enabled > 0) ? (req.power_kw / static_cast<double>(enabled)) : 0.0;
+        const double current_per_module =
+            (active_count > 0) ? (req.current_a / static_cast<double>(active_count)) : 0.0;
+        const double power_per_module = (active_count > 0) ? (req.power_kw / static_cast<double>(active_count)) : 0.0;
         for (auto idx : indices) {
             if (idx >= modules_.size()) continue;
             auto& mod = modules_[idx];
             const bool selected = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8) &&
                                   (((req.mask >> mod.spec.slot_index) & 0x1) != 0);
-            const bool iface_overload =
-                !mod.spec.can_interface.empty() && CanTrafficGovernor::instance().overload_latched(mod.spec.can_interface);
-            const bool active = req.enable && selected && !iface_overload;
+            const bool active = req.enable && selected && mod.driver;
             ModuleSetpoint sp;
             sp.enable = active;
             sp.voltage_v = req.voltage_v;
@@ -2635,11 +2683,6 @@ public:
             const uint8_t bit = (mod.spec.slot_index >= 0 && mod.spec.slot_index < 8)
                                     ? static_cast<uint8_t>(1U << static_cast<uint8_t>(mod.spec.slot_index))
                                     : 0x00;
-            if (iface_status.overload_latched) {
-                snap.fault_mask |= bit;
-                any_fresh = true;
-                continue;
-            }
             if (fresh) {
                 if (healthy) {
                     if (telem.healthy_mask) {
@@ -2727,14 +2770,17 @@ public:
                 continue;
             }
             const size_t start = poll_rr_cursor_by_iface_[kv.first] % indices.size();
-            for (size_t i = 0; i < indices.size(); ++i) {
+            const bool iface_overloaded = kv.first != "__no_iface__" &&
+                                          CanTrafficGovernor::instance().overload_latched(kv.first);
+            const size_t poll_budget = iface_overloaded ? std::min<size_t>(indices.size(), 1) : indices.size();
+            for (size_t i = 0; i < poll_budget; ++i) {
                 const size_t pos = (start + i) % indices.size();
                 auto& mod = modules_[indices[pos]];
                 if (mod.driver) {
                     mod.driver->poll();
                 }
             }
-            poll_rr_cursor_by_iface_[kv.first] = (start + 1) % indices.size();
+            poll_rr_cursor_by_iface_[kv.first] = (start + poll_budget) % indices.size();
         }
     }
 
