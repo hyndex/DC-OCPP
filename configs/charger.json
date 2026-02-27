@@ -94,10 +94,10 @@
       "ccw": 2,
       "modules": [
         {
-          "address": 1,
-          "group": 1,
-          "id": "M1_0",
-          "mn": "MN_1_0",
+          "address": 3,
+          "group": 2,
+          "id": "M2_0",
+          "mn": "MN_2_0",
           "ratedPowerKW": 30,
           "ratedCurrentA": 100,
           "sendOutputCurrent": true,
@@ -119,10 +119,10 @@
       "ccw": 1,
       "modules": [
         {
-          "address": 3,
-          "group": 2,
-          "id": "M2_0",
-          "mn": "MN_2_0",
+          "address": 1,
+          "group": 1,
+          "id": "M1_0",
+          "mn": "MN_1_0",
           "ratedPowerKW": 30,
           "ratedCurrentA": 100,
           "sendOutputCurrent": true,
