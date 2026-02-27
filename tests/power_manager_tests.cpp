@@ -413,44 +413,6 @@ int main() {
     assert(mc_home_it != plan_pass_local.mc_commands.end());
     assert(mc_home_it->second == ContactorState::Open);
 
-    // Active HLC phase: use dynamic final-voltage margin (4% -> 3.5%) instead of only fixed volts.
-    PlannerConfig cfg_margin = cfg;
-    cfg_margin.allow_cross_slot_islands = false;
-    cfg_margin.module_power_kw = 30.0;
-    cfg_margin.grid_limit_kw = 60.0;
-    cfg_margin.max_modules_per_gun = 1;
-    cfg_margin.voltage_margin_v = 2.0;
-    cfg_margin.final_voltage_margin_high_pct = 0.04;
-    cfg_margin.final_voltage_margin_low_pct = 0.035;
-    PowerManager pm_margin(cfg_margin);
-    std::vector<Slot> margin_slots;
-    Slot margin_slot;
-    margin_slot.id = 1;
-    margin_slot.gun_id = 1;
-    margin_slot.mc_id = "MC_1";
-    margin_slot.gc_id = "GC_1";
-    margin_slot.cw_id = 1;
-    margin_slot.ccw_id = 1;
-    margin_slot.modules = {"M1"};
-    margin_slots.push_back(margin_slot);
-    pm_margin.set_slots(margin_slots);
-    std::vector<ModuleState> margin_mods;
-    margin_mods.push_back(make_module("M1", 1, true));
-    pm_margin.update_modules(margin_mods);
-    std::vector<GunState> margin_guns;
-    auto gm = make_gun(1, 25.0, 60.0, true);
-    gm.slot_id = 1;
-    gm.ev_req_voltage_v = 800.0;
-    gm.v_meas_v = 760.0;
-    gm.voltage_guard_active = false;
-    margin_guns.push_back(gm);
-    pm_margin.update_guns(margin_guns);
-    const auto plan_margin = pm_margin.compute_plan();
-    assert(plan_margin.guns.size() == 1);
-    const double expected_pct_margin = 0.04 - ((0.04 - 0.035) * (760.0 / 800.0));
-    const double expected_vset = 800.0 - (800.0 * expected_pct_margin);
-    assert(std::fabs(plan_margin.guns.front().voltage_set_v - expected_vset) < 0.6);
-
     std::cout << "power_manager_tests passed\n";
     return 0;
 }

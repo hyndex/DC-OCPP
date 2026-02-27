@@ -89,10 +89,10 @@ constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(8);
 constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(8);
 constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
 constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
-// Reduce command churn once modules are tracking requested setpoints.
-constexpr int MODULE_STABLE_CONTROL_REFRESH_FACTOR = 4;
-constexpr int MODULE_STABLE_CONTROL_REFRESH_MIN_MS = 2000;
-constexpr int MODULE_STABLE_CONTROL_REFRESH_MAX_MS = 5000;
+// Keep steady-state control refresh aligned with configured cmdIntervalMs.
+constexpr int MODULE_STABLE_CONTROL_REFRESH_FACTOR = 1;
+constexpr int MODULE_STABLE_CONTROL_REFRESH_MIN_MS = 500;
+constexpr int MODULE_STABLE_CONTROL_REFRESH_MAX_MS = 2000;
 constexpr double MODULE_TRACKING_CURRENT_RATIO = 0.80;
 constexpr double MODULE_TRACKING_CURRENT_MARGIN_A = 1.5;
 // Planner issues commands at 50 ms cadence; suppress identical repeats inside this window.

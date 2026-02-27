@@ -257,10 +257,6 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.gc_open_current_a = planner_value("gcOpenCurrentA", cfg.gc_open_current_a);
     cfg.ramp_step_a = planner_value("rampStepA", cfg.ramp_step_a);
     cfg.planner_voltage_margin_v = planner_value("voltageMarginV", cfg.planner_voltage_margin_v);
-    cfg.planner_final_voltage_margin_low_pct =
-        planner_value("finalVoltageMarginLowPct", cfg.planner_final_voltage_margin_low_pct);
-    cfg.planner_final_voltage_margin_high_pct =
-        planner_value("finalVoltageMarginHighPct", cfg.planner_final_voltage_margin_high_pct);
     cfg.planner_current_margin_a = planner_value("currentMarginA", cfg.planner_current_margin_a);
     cfg.planner_voltage_guard_band_v = planner_value("voltageGuardBandV", cfg.planner_voltage_guard_band_v);
     cfg.planner_ramp_up_min_a_per_s = planner_value("rampUpMinAps", cfg.planner_ramp_up_min_a_per_s);
@@ -346,17 +342,6 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     }
     if (cfg.planner_voltage_margin_v < 0.0) {
         cfg.planner_voltage_margin_v = 0.0;
-    }
-    if (!std::isfinite(cfg.planner_final_voltage_margin_low_pct)) {
-        cfg.planner_final_voltage_margin_low_pct = 0.035;
-    }
-    if (!std::isfinite(cfg.planner_final_voltage_margin_high_pct)) {
-        cfg.planner_final_voltage_margin_high_pct = 0.04;
-    }
-    cfg.planner_final_voltage_margin_low_pct = std::clamp(cfg.planner_final_voltage_margin_low_pct, 0.0, 0.20);
-    cfg.planner_final_voltage_margin_high_pct = std::clamp(cfg.planner_final_voltage_margin_high_pct, 0.0, 0.20);
-    if (cfg.planner_final_voltage_margin_high_pct < cfg.planner_final_voltage_margin_low_pct) {
-        std::swap(cfg.planner_final_voltage_margin_high_pct, cfg.planner_final_voltage_margin_low_pct);
     }
     if (cfg.planner_current_margin_a < 0.0) {
         cfg.planner_current_margin_a = 0.0;

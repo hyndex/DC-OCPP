@@ -115,10 +115,6 @@ struct PlannerConfig {
     double mc_open_current_a{1.0};
     double gc_open_current_a{1.0};
     double voltage_margin_v{2.0};
-    // Dynamic headroom envelope used in active HLC power phase.
-    // Margin ramps between high->low as measured voltage approaches target.
-    double final_voltage_margin_low_pct{0.035};
-    double final_voltage_margin_high_pct{0.04};
     double current_margin_a{0.2};
     double voltage_guard_band_v{10.0};
     double ramp_up_min_a_per_s{20.0};
@@ -198,7 +194,6 @@ private:
                                                  const std::map<int, double>& budgets,
                                                 const std::map<int, int>& ideal,
                                                  int healthy_modules) const;
-    double compute_voltage_margin_v(const GunState& g, double v_ceiling_v) const;
     Plan build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                     const std::map<int, int>& modules_per_gun,
                     const std::set<int>& reserved_slots,

@@ -139,10 +139,6 @@ struct ChargerConfig {
     double gc_open_current_a{1.0};
     double ramp_step_a{10.0};
     double planner_voltage_margin_v{2.0};
-    // Dynamic final-stage voltage headroom relative to EV target voltage.
-    // Applied during active HLC power phase to reduce near-target oscillation.
-    double planner_final_voltage_margin_low_pct{0.035};
-    double planner_final_voltage_margin_high_pct{0.04};
     double planner_current_margin_a{0.2};
     double planner_voltage_guard_band_v{10.0};
     double planner_ramp_up_min_a_per_s{20.0};

@@ -720,8 +720,6 @@ void OcppAdapter::initialize_slots() {
     pcfg.gc_open_current_a = cfg_.gc_open_current_a;
     pcfg.ramp_step_a = cfg_.ramp_step_a;
     pcfg.voltage_margin_v = cfg_.planner_voltage_margin_v;
-    pcfg.final_voltage_margin_low_pct = cfg_.planner_final_voltage_margin_low_pct;
-    pcfg.final_voltage_margin_high_pct = cfg_.planner_final_voltage_margin_high_pct;
     pcfg.current_margin_a = cfg_.planner_current_margin_a;
     pcfg.voltage_guard_band_v = cfg_.planner_voltage_guard_band_v;
     pcfg.ramp_up_min_a_per_s = cfg_.planner_ramp_up_min_a_per_s;

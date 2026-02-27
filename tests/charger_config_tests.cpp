@@ -395,31 +395,6 @@ int main() {
         assert(std::fabs(patched["Internal"]["CompositeScheduleDefaultLimitWatts"].get<double>() - 45000.0) < 1e-9);
     }
 
-    // Dynamic final-voltage margin percentages should parse and normalize.
-    {
-        const auto dir = make_temp_dir();
-        const auto path = write_file(
-            dir, "charger.json",
-            R"JSON(
-{
-  "chargePoint": { "id": "cfg-test", "centralSystemURI": "ws://localhost" },
-  "ocpp": { "Core": { "NumberOfConnectors": 1 } },
-  "planner": {
-    "finalVoltageMarginLowPct": 0.09,
-    "finalVoltageMarginHighPct": 0.05
-  },
-  "connectors": [ { "id": 1, "plcId": 0 } ],
-  "slots": [
-    { "id": 1, "gunId": 1, "cw": 1, "ccw": 1, "gc": "GC_1", "mc": "MC_1",
-      "modules": [ { "id": "M1_0", "type": "maxwell-mxr", "address": 0, "group": 0 } ] }
-  ]
-}
-)JSON");
-        const auto cfg = load_charger_config(path);
-        assert(std::fabs(cfg.planner_final_voltage_margin_low_pct - 0.05) < 1e-9);
-        assert(std::fabs(cfg.planner_final_voltage_margin_high_pct - 0.09) < 1e-9);
-    }
-
     std::cout << "charger_config_tests passed\n";
     return 0;
 }

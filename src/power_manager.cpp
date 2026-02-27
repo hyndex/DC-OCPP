@@ -360,33 +360,6 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
     return n_modules;
 }
 
-double PowerManager::compute_voltage_margin_v(const GunState& g, double v_ceiling_v) const {
-    double margin_v = std::max(0.0, cfg_.voltage_margin_v);
-    if (v_ceiling_v <= 0.0) {
-        return margin_v;
-    }
-    // Keep precharge/non-HLC phases on the fixed margin policy.
-    if (g.voltage_guard_active) {
-        return margin_v;
-    }
-    const double pct_low = std::clamp(cfg_.final_voltage_margin_low_pct, 0.0, 0.20);
-    const double pct_high = std::clamp(cfg_.final_voltage_margin_high_pct, 0.0, 0.20);
-    const double high = std::max(pct_low, pct_high);
-    const double low = std::min(pct_low, pct_high);
-    if (high <= 0.0) {
-        return margin_v;
-    }
-
-    double proximity = 0.0;
-    if (g.v_meas_v > 0.0) {
-        proximity = std::clamp(g.v_meas_v / std::max(1.0, v_ceiling_v), 0.0, 1.0);
-    }
-    const double pct = high - ((high - low) * proximity);
-    const double pct_margin_v = v_ceiling_v * pct;
-    margin_v = std::max(margin_v, pct_margin_v);
-    return std::max(0.0, margin_v);
-}
-
 double PowerManager::apply_voltage_guard(const GunState& g, double i_target_a, double v_ceiling_v) const {
     if (i_target_a <= 0.0) {
         return 0.0;
@@ -586,7 +559,7 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         double v_ceiling = g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : cfg_.default_voltage_v;
         if (v_ceiling < min_v) v_ceiling = min_v;
         if (v_ceiling > max_v) v_ceiling = max_v;
-        const double v_margin = compute_voltage_margin_v(g, v_ceiling);
+        const double v_margin = std::max(0.0, cfg_.voltage_margin_v);
         double v_target = std::max(min_v, v_ceiling - v_margin);
         if (v_target > max_v) v_target = max_v;
         island.p_set_kw = p_set;
@@ -891,9 +864,8 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
                 }
                 i_target = std::max(0.0, i_target - std::max(0.0, cfg_.current_margin_a));
                 const double v_ceiling_for_guard =
-                    g_state->ev_req_voltage_v > 0.0
-                        ? g_state->ev_req_voltage_v
-                        : (v_target + compute_voltage_margin_v(*g_state, v_target));
+                    g_state->ev_req_voltage_v > 0.0 ? g_state->ev_req_voltage_v
+                                                    : (v_target + std::max(0.0, cfg_.voltage_margin_v));
                 i_target = apply_voltage_guard(*g_state, i_target, v_ceiling_for_guard);
                 const bool emergency_drop = !g_state->safety_ok || g_state->gc_welded || g_state->mc_welded;
                 i_target = apply_current_ramp(gid, *g_state, i_target, emergency_drop, now);
