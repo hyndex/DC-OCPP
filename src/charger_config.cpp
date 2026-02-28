@@ -57,6 +57,25 @@ std::string normalize_autocharge_source(std::string s) {
     return s;
 }
 
+std::string normalize_measurement_source_policy(std::string s) {
+    s = trim_copy(std::move(s));
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s.empty()) {
+        return "strictmeasured";
+    }
+    if (s == "strict_measured") {
+        return "strictmeasured";
+    }
+    if (s == "allowestimated") {
+        return "allowestimated";
+    }
+    if (s != "strictmeasured" && s != "allowestimated") {
+        return "strictmeasured";
+    }
+    return s;
+}
+
 PlcRelayMode parse_plc_relay_mode(std::string s) {
     s = trim_copy(std::move(s));
     std::transform(s.begin(), s.end(), s.begin(),
@@ -118,13 +137,13 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             mc.silent_mode = m.value("silentMode", -1);
             mc.rated_power_kw = m.value("ratedPowerKW", 0.0);
             mc.rated_current_a = m.value("ratedCurrentA", 0.0);
-            mc.poll_interval_ms = m.value("pollMs", 500);
-            mc.cmd_interval_ms = m.value("cmdIntervalMs", 500);
+            mc.poll_interval_ms = m.value("pollMs", 200);
+            mc.cmd_interval_ms = m.value("cmdIntervalMs", 200);
             mc.poll_budget_fps = m.value("pollBudgetFps", 0);
             mc.telemetry_stale_ms = m.value("telemetryStaleMs", 0);
             mc.broadcast = m.value("broadcast", false);
             mc.probe_on_startup = m.value("probeOnStartup", true);
-            mc.readback_limits = m.value("readbackLimits", false);
+            mc.readback_limits = m.value("readbackLimits", true);
             mc.send_output_current = m.value("sendOutputCurrent", false);
             mc.send_output_power = m.value("sendOutputPower", false);
             slot.modules.push_back(mc);
@@ -246,6 +265,15 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     cfg.telemetry_timeout_ms = timeouts.value("telemetryTimeoutMs", cfg.telemetry_timeout_ms);
     cfg.plc_present_warn_ms = timeouts.value("plcPresentWarnMs", cfg.plc_present_warn_ms);
     cfg.plc_limits_warn_ms = timeouts.value("plcLimitsWarnMs", cfg.plc_limits_warn_ms);
+    cfg.hlc_target_hold_ms = timeouts.value("hlcTargetHoldMs", cfg.hlc_target_hold_ms);
+    cfg.request_loss_debounce_ms = timeouts.value("requestLossDebounceMs", cfg.request_loss_debounce_ms);
+    cfg.target_fresh_hold_ms = timeouts.value("targetFreshHoldMs", cfg.target_fresh_hold_ms);
+    cfg.delivery_loss_detect_ms = timeouts.value("deliveryLossDetectMs", cfg.delivery_loss_detect_ms);
+    cfg.delivery_loss_recovery_ms = timeouts.value("deliveryLossRecoveryMs", cfg.delivery_loss_recovery_ms);
+    cfg.delivery_loss_escalation_ms = timeouts.value("deliveryLossEscalationMs", cfg.delivery_loss_escalation_ms);
+    cfg.active_current_hold_ms = timeouts.value("activeCurrentHoldMs", cfg.active_current_hold_ms);
+    cfg.measurement_source_policy = normalize_measurement_source_policy(
+        timeouts.value("measurementSourcePolicy", cfg.measurement_source_policy));
     cfg.allow_cross_slot_islands = planner_value("allowCrossSlotIslands", cfg.allow_cross_slot_islands);
     cfg.max_modules_per_gun = planner_value("maxModulesPerGun", cfg.max_modules_per_gun);
     cfg.min_modules_per_active_gun = planner_value("minModulesPerActiveGun", cfg.min_modules_per_active_gun);
@@ -337,6 +365,28 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
     if (cfg.telemetry_timeout_ms <= 0) {
         cfg.telemetry_timeout_ms = 2000;
     }
+    if (cfg.hlc_target_hold_ms <= 0) {
+        cfg.hlc_target_hold_ms = 300;
+    }
+    if (cfg.request_loss_debounce_ms <= 0) {
+        cfg.request_loss_debounce_ms = 300;
+    }
+    if (cfg.target_fresh_hold_ms <= 0) {
+        cfg.target_fresh_hold_ms = 300;
+    }
+    if (cfg.delivery_loss_detect_ms <= 0) {
+        cfg.delivery_loss_detect_ms = 300;
+    }
+    if (cfg.delivery_loss_recovery_ms <= 0) {
+        cfg.delivery_loss_recovery_ms = 500;
+    }
+    if (cfg.delivery_loss_escalation_ms <= 0) {
+        cfg.delivery_loss_escalation_ms = 1800;
+    }
+    if (cfg.active_current_hold_ms <= 0) {
+        cfg.active_current_hold_ms = 250;
+    }
+    cfg.measurement_source_policy = normalize_measurement_source_policy(cfg.measurement_source_policy);
     if (cfg.tie_close_max_delta_v < 0.0) {
         cfg.tie_close_max_delta_v = 0.0;
     }

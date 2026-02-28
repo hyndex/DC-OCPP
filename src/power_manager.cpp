@@ -75,6 +75,23 @@ int PowerManager::count_healthy_modules_in_slot(int slot_id) const {
     return healthy;
 }
 
+int PowerManager::count_available_modules_in_slot(int slot_id) const {
+    int available = 0;
+    for (const auto& kv : modules_) {
+        const auto& mod = kv.second;
+        if (mod.slot_id != slot_id) {
+            continue;
+        }
+        const bool capability_ready = !mod.capability_fresh || mod.available_power_kw > 0.0 || mod.available_current_a > 0.0;
+        // `module_off` is an operational state (normal before first enable), not a health fault.
+        const bool usable = mod.healthy && !mod.severe_fault && capability_ready;
+        if (usable) {
+            available++;
+        }
+    }
+    return available;
+}
+
 int PowerManager::ideal_modules_for_gun(const GunState& g, double p_budget) const {
     if (p_budget <= 0.0) {
         return 0;
@@ -126,7 +143,9 @@ std::vector<std::string> PowerManager::select_modules_for_slot(const Slot& slot,
         const auto it = modules_.find(mod_id);
         if (it == modules_.end()) return;
         const auto& m = it->second;
-        if (!m.healthy) {
+        const bool capability_ready = !m.capability_fresh || m.available_power_kw > 0.0 || m.available_current_a > 0.0;
+        const bool usable = m.healthy && !m.severe_fault && capability_ready;
+        if (!usable) {
             plan.mn_commands[m.mn_id] = ContactorState::Open;
             return;
         }
@@ -154,7 +173,7 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
     slots.push_back(g.slot_id);
     claimed_slots.insert(g.slot_id);
 
-    if (!cfg_.allow_cross_slot_islands || n_needed <= count_healthy_modules_in_slot(g.slot_id)) {
+    if (!cfg_.allow_cross_slot_islands || n_needed <= count_available_modules_in_slot(g.slot_id)) {
         // Local-only operation: keep ownership on the home slot.
         // This keeps the home gun's right-side tie open unless additional cabinets are
         // explicitly borrowed for extra power.
@@ -163,7 +182,7 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
 
     int cw_edge = g.slot_id;
     int ccw_edge = g.slot_id;
-    int available = count_healthy_modules_in_slot(g.slot_id);
+    int available = count_available_modules_in_slot(g.slot_id);
     int remaining = std::max(0, n_needed - available);
     int cw_steps = 0;
     int ccw_steps = 0;
@@ -177,7 +196,7 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
                 if (slot_lookup_.count(candidate) && !claimed_slots.count(candidate) &&
                     !active_home_slots.count(candidate) &&
                     (!reserved_slots.count(candidate) || candidate == g.slot_id)) {
-                    const int healthy = count_healthy_modules_in_slot(candidate);
+                    const int healthy = count_available_modules_in_slot(candidate);
                     slots.insert(slots.begin(), candidate);
                     ccw_edge = candidate;
                     claimed_slots.insert(candidate);
@@ -199,7 +218,7 @@ std::vector<int> PowerManager::build_island_slots_for_gun(const GunState& g, int
                 if (slot_lookup_.count(candidate) && !claimed_slots.count(candidate) &&
                     !active_home_slots.count(candidate) &&
                     (!reserved_slots.count(candidate) || candidate == g.slot_id)) {
-                    const int healthy = count_healthy_modules_in_slot(candidate);
+                    const int healthy = count_available_modules_in_slot(candidate);
                     slots.push_back(candidate);
                     cw_edge = candidate;
                     claimed_slots.insert(candidate);
@@ -246,14 +265,13 @@ std::vector<std::string> PowerManager::assign_modules_for_island(const std::vect
 
 std::map<int, double> PowerManager::compute_power_budgets(const std::vector<int>& active,
                                                           const std::map<int, double>& req_limited,
-                                                          int healthy_modules) const {
+                                                          double total_available_power_kw) const {
     std::map<int, double> budgets;
-    if (active.empty() || healthy_modules <= 0) {
+    if (active.empty() || total_available_power_kw <= 0.0) {
         return budgets;
     }
 
-    const double p_module_total = healthy_modules * cfg_.module_power_kw;
-    const double system_cap = std::min(p_module_total, cfg_.grid_limit_kw);
+    const double system_cap = std::min(total_available_power_kw, cfg_.grid_limit_kw);
 
     double total_req = 0.0;
     for (auto gid : active) {
@@ -315,13 +333,13 @@ std::map<int, double> PowerManager::compute_power_budgets(const std::vector<int>
 std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int>& active,
                                                            const std::map<int, double>& budgets,
                                                            const std::map<int, int>& ideal,
-                                                           int healthy_modules) const {
+                                                           int available_modules) const {
     std::map<int, int> n_modules = ideal;
     int total = 0;
     for (auto gid : active) {
         total += n_modules[gid];
     }
-    if (total <= healthy_modules) {
+    if (total <= available_modules) {
         return n_modules;
     }
 
@@ -353,9 +371,9 @@ std::map<int, int> PowerManager::compute_module_allocation(const std::vector<int
     };
 
     // First reduce down to per-gun minimums, then below if still over-subscribed.
-    while (total > healthy_modules && reduce_once(true)) {
+    while (total > available_modules && reduce_once(true)) {
     }
-    while (total > healthy_modules && reduce_once(false)) {
+    while (total > available_modules && reduce_once(false)) {
     }
     return n_modules;
 }
@@ -388,7 +406,15 @@ double PowerManager::apply_current_ramp(int gun_id, const GunState& g, double i_
                                         std::chrono::steady_clock::time_point now) {
     auto& st = ramp_state_by_gun_[gun_id];
     if (!st.initialized) {
-        st.current_a = std::max(0.0, g.i_set_a);
+        double anchor_a = std::max(0.0, g.i_set_a);
+        const double measured_a = std::max(0.0, g.i_meas_a);
+        const double mismatch_thresh = std::max(1.0, std::max(anchor_a, measured_a) * 0.2);
+        if (measured_a > 0.0 && (g.delivery_lost || std::fabs(anchor_a - measured_a) > mismatch_thresh)) {
+            anchor_a = std::min(anchor_a, measured_a + 1.0);
+        } else if (anchor_a <= 0.0 && measured_a > 0.0) {
+            anchor_a = measured_a;
+        }
+        st.current_a = std::max(0.0, anchor_a);
         st.rate_a_per_s = 0.0;
         st.initialized = true;
         st.last_update = now;
@@ -471,6 +497,51 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
                               std::chrono::steady_clock::time_point now) {
     Plan plan = blank_plan();
     next_island_id_ = 1;
+    auto module_available_power_kw = [&](const std::string& module_id) -> double {
+        const auto it = modules_.find(module_id);
+        if (it == modules_.end()) {
+            return 0.0;
+        }
+        const auto& mod = it->second;
+        if (!mod.healthy || mod.severe_fault) {
+            return 0.0;
+        }
+        if (mod.available_power_kw > 0.0) {
+            return mod.available_power_kw;
+        }
+        if (mod.capability_fresh && mod.available_current_a <= 0.0) {
+            return 0.0;
+        }
+        return cfg_.module_power_kw;
+    };
+    auto module_available_current_a = [&](const std::string& module_id) -> double {
+        const auto it = modules_.find(module_id);
+        if (it == modules_.end()) {
+            return 0.0;
+        }
+        const auto& mod = it->second;
+        if (!mod.healthy || mod.severe_fault) {
+            return 0.0;
+        }
+        if (mod.available_current_a > 0.0) {
+            return mod.available_current_a;
+        }
+        return 0.0;
+    };
+    auto selected_power_cap_kw = [&](const std::vector<std::string>& selected) -> double {
+        double cap_kw = 0.0;
+        for (const auto& mid : selected) {
+            cap_kw += module_available_power_kw(mid);
+        }
+        return cap_kw;
+    };
+    auto selected_current_cap_a = [&](const std::vector<std::string>& selected) -> double {
+        double cap_a = 0.0;
+        for (const auto& mid : selected) {
+            cap_a += module_available_current_a(mid);
+        }
+        return cap_a;
+    };
 
     std::set<int> active_home_slots;
     for (auto gid : active) {
@@ -550,7 +621,7 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         island.gun_id = gid;
         island.module_ids = selected;
 
-        const double p_cap_modules = assigned * cfg_.module_power_kw;
+        const double p_cap_modules = std::max(0.0, selected_power_cap_kw(selected));
         const double p_budget = budgets.at(gid);
         const double p_set = std::min({p_budget, p_cap_modules,
                                        g.gun_power_limit_kw > 0.0 ? g.gun_power_limit_kw : p_cap_modules});
@@ -576,9 +647,13 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         if (g.gun_current_limit_a > 0.0) {
             i_target = std::min(i_target, g.gun_current_limit_a);
         }
+        const double module_cap_current_a = selected_current_cap_a(selected);
+        if (module_cap_current_a > 0.0) {
+            i_target = std::min(i_target, module_cap_current_a);
+        }
         i_target = std::max(0.0, i_target - std::max(0.0, cfg_.current_margin_a));
         i_target = apply_voltage_guard(g, i_target, v_ceiling);
-        const bool emergency_drop = !g.safety_ok || g.gc_welded || g.mc_welded;
+        const bool emergency_drop = !g.safety_ok || g.gc_welded || g.mc_welded || g.delivery_lost;
         i_target = apply_current_ramp(gid, g, i_target, emergency_drop, now);
         dispatch.current_limit_a = i_target;
         dispatch.p_set_kw = std::min(dispatch.p_set_kw, (dispatch.current_limit_a * v_safe) / 1000.0);
@@ -712,31 +787,42 @@ Plan PowerManager::compute_plan() {
         }
     }
 
-    int healthy_modules = 0;
-    for (const auto& m : modules_) {
-        if (m.second.healthy) {
-            healthy_modules++;
+    int available_modules = 0;
+    double total_available_power_kw = 0.0;
+    for (const auto& kv : modules_) {
+        const auto& mod = kv.second;
+        const bool capability_ready =
+            !mod.capability_fresh || mod.available_power_kw > 0.0 || mod.available_current_a > 0.0;
+        const bool usable = mod.healthy && !mod.severe_fault && capability_ready;
+        if (!usable) {
+            continue;
+        }
+        available_modules++;
+        if (mod.available_power_kw > 0.0) {
+            total_available_power_kw += mod.available_power_kw;
+        } else {
+            total_available_power_kw += cfg_.module_power_kw;
         }
     }
 
     std::map<int, double> req_limited;
     for (auto gid : active) {
         const auto& g = guns_.at(gid);
-        double req = std::max(0.0, g.ev_req_power_kw);
+        double req = g.delivery_lost ? 0.0 : std::max(0.0, g.ev_req_power_kw);
         const double gun_cap = g.gun_power_limit_kw > 0.0 ? g.gun_power_limit_kw : req;
         req = std::min(req, gun_cap);
         req_limited[gid] = req;
     }
 
     std::map<int, double> budgets;
-    if (healthy_modules <= 0) {
+    if (available_modules <= 0 || total_available_power_kw <= 0.0) {
         // No healthy modules available: still return a deterministic plan for the active guns with
         // 0 modules/power assigned so upstream logic can reflect the constraint.
         for (auto gid : active) {
             budgets[gid] = 0.0;
         }
     } else {
-        budgets = compute_power_budgets(active, req_limited, healthy_modules);
+        budgets = compute_power_budgets(active, req_limited, total_available_power_kw);
     }
     if (budgets.empty()) {
         return blank_plan();
@@ -748,9 +834,9 @@ Plan PowerManager::compute_plan() {
         ideal_modules[gid] = ideal_modules_for_gun(guns_.at(gid), p);
     }
 
-    auto modules_per_gun = compute_module_allocation(active, budgets, ideal_modules, healthy_modules);
+    auto modules_per_gun = compute_module_allocation(active, budgets, ideal_modules, available_modules);
     std::set<int> full_island_guns;
-    if (healthy_modules > 0 && active.size() == 1 && cfg_.allow_cross_slot_islands) {
+    if (available_modules > 0 && active.size() == 1 && cfg_.allow_cross_slot_islands) {
         const int gid = active.front();
         const auto g_it = guns_.find(gid);
         const int home_slot = g_it != guns_.end() ? g_it->second.slot_id : 0;
@@ -761,7 +847,7 @@ Plan PowerManager::compute_plan() {
                 break;
             }
         }
-        if (!reserved_block && modules_per_gun[gid] >= healthy_modules) {
+        if (!reserved_block && modules_per_gun[gid] >= available_modules) {
             full_island_guns.insert(gid);
         }
     }
@@ -852,7 +938,22 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
                 }
 
                 const double v_target = island_it->v_set_v;
-                const double p_cap = prev * cfg_.module_power_kw;
+                double p_cap = 0.0;
+                for (const auto& mid : desired_modules) {
+                    const auto mit = modules_.find(mid);
+                    if (mit == modules_.end()) {
+                        continue;
+                    }
+                    const auto& mod = mit->second;
+                    if (!mod.healthy || mod.severe_fault) {
+                        continue;
+                    }
+                    if (mod.available_power_kw > 0.0) {
+                        p_cap += mod.available_power_kw;
+                    } else if (!mod.capability_fresh || mod.available_current_a > 0.0) {
+                        p_cap += cfg_.module_power_kw;
+                    }
+                }
                 const double p_set = std::min({dispatch.p_budget_kw, p_cap,
                                                g_state->gun_power_limit_kw > 0.0
                                                    ? g_state->gun_power_limit_kw
@@ -862,12 +963,28 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
                 if (g_state->gun_current_limit_a > 0.0) {
                     i_target = std::min(i_target, g_state->gun_current_limit_a);
                 }
+                double module_cap_current_a = 0.0;
+                for (const auto& mid : desired_modules) {
+                    const auto mit = modules_.find(mid);
+                    if (mit == modules_.end()) {
+                        continue;
+                    }
+                    const auto& mod = mit->second;
+                    if (!mod.healthy || mod.severe_fault) {
+                        continue;
+                    }
+                    module_cap_current_a += std::max(0.0, mod.available_current_a);
+                }
+                if (module_cap_current_a > 0.0) {
+                    i_target = std::min(i_target, module_cap_current_a);
+                }
                 i_target = std::max(0.0, i_target - std::max(0.0, cfg_.current_margin_a));
                 const double v_ceiling_for_guard =
                     g_state->ev_req_voltage_v > 0.0 ? g_state->ev_req_voltage_v
                                                     : (v_target + std::max(0.0, cfg_.voltage_margin_v));
                 i_target = apply_voltage_guard(*g_state, i_target, v_ceiling_for_guard);
-                const bool emergency_drop = !g_state->safety_ok || g_state->gc_welded || g_state->mc_welded;
+                const bool emergency_drop =
+                    !g_state->safety_ok || g_state->gc_welded || g_state->mc_welded || g_state->delivery_lost;
                 i_target = apply_current_ramp(gid, *g_state, i_target, emergency_drop, now);
                 dispatch.p_set_kw = p_set;
                 dispatch.current_limit_a = i_target;
@@ -918,7 +1035,7 @@ bool PowerManager::validate_plan(const Plan& plan) const {
                 return false;
             }
             auto mit = modules_.find(mid);
-            if (mit == modules_.end() || !mit->second.healthy) {
+            if (mit == modules_.end() || !mit->second.healthy || mit->second.severe_fault) {
                 return false;
             }
         }

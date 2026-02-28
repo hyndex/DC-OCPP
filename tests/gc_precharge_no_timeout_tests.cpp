@@ -14,6 +14,7 @@ static ChargerConfig make_cfg() {
     ChargerConfig cfg{};
     cfg.charge_point_id = "gc-precharge-no-timeout-test";
     cfg.connectors = {ConnectorConfig{.id = 1}};
+    cfg.require_auth_for_precharge = false;
     cfg.precharge_voltage_tolerance_v = 50.0;
     cfg.switch_max_current_a = 2.0;
     cfg.tie_close_max_delta_v = 20.0;
@@ -80,8 +81,17 @@ int main() {
         std::cerr << "gc_precharge_no_timeout_tests failed: missing power command\n";
         return 1;
     }
-    if (!cmd0->gc_closed) {
-        std::cerr << "gc_precharge_no_timeout_tests failed: expected GC closed at precharge arm\n";
+    if (cmd0->module_count <= 0) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: expected module assignment in precharge\n";
+        return 1;
+    }
+    if (cmd0->voltage_set_v <= 50.0) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: invalid precharge voltage command V_set="
+                  << cmd0->voltage_set_v << "\n";
+        return 1;
+    }
+    if (cmd0->gc_closed) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: expected GC gating before precharge convergence\n";
         return 1;
     }
     if (cmd0->current_limit_a > cfg.precharge_max_current_a + 1e-6) {
@@ -135,6 +145,79 @@ int main() {
         if (OcppAdapter::TestHook::sessions(adapter_over_i_short).find(1) ==
             OcppAdapter::TestHook::sessions(adapter_over_i_short).end()) {
             std::cerr << "gc_precharge_no_timeout_tests failed: brief precharge overcurrent transient latched fault\n";
+            return 1;
+        }
+    }
+
+    // Precharge with no-energy gating (e.g. auth-pending transition) must still keep a valid non-zero
+    // voltage command while current remains clamped. Regresses "module stuck around ~200V, V_set=0" failures.
+    auto hw_pending_auth = std::make_shared<TestHardware>(cfg);
+    OcppAdapter adapter_pending_auth(cfg, hw_pending_auth);
+    seed_session(adapter_pending_auth, 1, "sess-pending-auth");
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_pending_auth));
+        auto& sessions = OcppAdapter::TestHook::sessions(adapter_pending_auth);
+        auto it = sessions.find(1);
+        if (it != sessions.end()) {
+            it->second.authorized = false;
+        }
+    }
+    auto pending_auth = make_status(/*present_v=*/200.0, /*target_v=*/355.0, /*target_i=*/1.2);
+    pending_auth.authorization_granted = false;
+    pending_auth.relay_closed = false;
+    const int module_slot_id = cfg.slots.empty() ? 1 : cfg.slots.front().id;
+    auto verify_precharge_nonzero_voltage = [&](const char* phase) -> bool {
+        const auto cmd = hw_pending_auth->last_power_command(1);
+        if (!cmd.has_value()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: missing power command (" << phase << ")\n";
+            return false;
+        }
+        if (cmd->module_count > 0 && cmd->voltage_set_v <= 50.0) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: zero/low precharge voltage cmd (" << phase
+                      << ") V_set=" << cmd->voltage_set_v << " module_count=" << cmd->module_count << "\n";
+            return false;
+        }
+        if (cmd->current_limit_a > cfg.precharge_max_current_a + 1e-6) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: precharge current limit exceeded (" << phase
+                      << ") I_lim=" << cmd->current_limit_a << "\n";
+            return false;
+        }
+        const auto mreq = OcppAdapter::TestHook::last_module_command_for_slot(adapter_pending_auth, module_slot_id);
+        if (!mreq.has_value()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: missing module command (" << phase << ")\n";
+            return false;
+        }
+        if (mreq->enable && mreq->voltage_v <= 50.0) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: module voltage collapsed in precharge (" << phase
+                      << ") V_mod=" << mreq->voltage_v << "\n";
+            return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < 6; ++i) {
+        pending_auth.last_target_update = std::chrono::steady_clock::now();
+        pending_auth.last_telemetry = std::chrono::steady_clock::now();
+        hw_pending_auth->set_status_override(1, pending_auth);
+        OcppAdapter::TestHook::apply_power_plan(adapter_pending_auth);
+        if (!verify_precharge_nonzero_voltage("auth_pending")) {
+            return 1;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_pending_auth));
+        auto& sessions = OcppAdapter::TestHook::sessions(adapter_pending_auth);
+        auto it = sessions.find(1);
+        if (it != sessions.end()) {
+            it->second.authorized = true;
+        }
+    }
+    pending_auth.authorization_granted = true;
+    for (int i = 0; i < 6; ++i) {
+        pending_auth.last_target_update = std::chrono::steady_clock::now();
+        pending_auth.last_telemetry = std::chrono::steady_clock::now();
+        hw_pending_auth->set_status_override(1, pending_auth);
+        OcppAdapter::TestHook::apply_power_plan(adapter_pending_auth);
+        if (!verify_precharge_nonzero_voltage("auth_granted")) {
             return 1;
         }
     }
@@ -207,6 +290,59 @@ int main() {
         stage_mreq->power_kw > 1e-6) {
         std::cerr << "gc_precharge_no_timeout_tests failed: early HLC stage kept module warmup enabled\n";
         return 1;
+    }
+
+    // CP=B handshake window with high present voltage must not trip StuckVoltage before precharge begins.
+    auto hw_cp_b = std::make_shared<TestHardware>(cfg);
+    OcppAdapter adapter_cp_b(cfg, hw_cp_b);
+    seed_session(adapter_cp_b, 1, "sess-cp-b");
+    auto cp_b = make_status(355.0, 355.0, 2.0);
+    cp_b.cp_state = 'B';
+    cp_b.hlc_stage = 2; // handshake, not precharge
+    cp_b.hlc_precharge_active = false;
+    cp_b.hlc_power_ready = false;
+    cp_b.relay_closed = false;
+    cp_b.target_voltage_v.reset();
+    cp_b.target_current_a.reset();
+    cp_b.last_target_update = std::chrono::steady_clock::time_point{};
+    cp_b.last_telemetry = std::chrono::steady_clock::now();
+    hw_cp_b->set_status_override(1, cp_b);
+    OcppAdapter::TestHook::set_stuck_output_voltage_since(adapter_cp_b, 1,
+                                                          std::chrono::steady_clock::now() -
+                                                              std::chrono::seconds(13));
+    OcppAdapter::TestHook::apply_power_plan(adapter_cp_b);
+    if (OcppAdapter::TestHook::local_hw_disabled(adapter_cp_b, 1)) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: CP=B handshake tripped local HW disable\n";
+        return 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_cp_b));
+        if (OcppAdapter::TestHook::sessions(adapter_cp_b).find(1) ==
+            OcppAdapter::TestHook::sessions(adapter_cp_b).end()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: CP=B handshake cleared session\n";
+            return 1;
+        }
+    }
+    cp_b.cp_state = 'C';
+    cp_b.hlc_stage = 8;
+    cp_b.hlc_precharge_active = true;
+    cp_b.target_voltage_v = 355.0;
+    cp_b.target_current_a = 2.0;
+    cp_b.last_target_update = std::chrono::steady_clock::now();
+    cp_b.last_telemetry = std::chrono::steady_clock::now();
+    hw_cp_b->set_status_override(1, cp_b);
+    OcppAdapter::TestHook::apply_power_plan(adapter_cp_b);
+    if (OcppAdapter::TestHook::local_hw_disabled(adapter_cp_b, 1)) {
+        std::cerr << "gc_precharge_no_timeout_tests failed: precharge transition latched StuckVoltage\n";
+        return 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(adapter_cp_b));
+        if (OcppAdapter::TestHook::sessions(adapter_cp_b).find(1) ==
+            OcppAdapter::TestHook::sessions(adapter_cp_b).end()) {
+            std::cerr << "gc_precharge_no_timeout_tests failed: precharge transition cleared session\n";
+            return 1;
+        }
     }
 
     // Separate scenario: voltage never rises to target => precharge timeout fault should clear the session.

@@ -131,7 +131,11 @@ static GunStatus make_dc_status(bool plugged_in, bool relay_closed,
     st.present_power_w = plugged_in ? std::optional<double>(target_v * target_i) : std::optional<double>(0.0);
 
     st.relay_closed = relay_closed;
-    st.last_telemetry = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    st.last_telemetry = now;
+    if (plugged_in && (st.target_voltage_v.has_value() || st.target_current_a.has_value())) {
+        st.last_target_update = now;
+    }
     return st;
 }
 

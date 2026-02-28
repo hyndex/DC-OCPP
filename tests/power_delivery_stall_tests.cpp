@@ -157,14 +157,14 @@ int main() {
         }
     }
 
-    // Persistent low measured current should be tracked diagnostically without force-clamping commands.
+    // Persistent low measured current should trigger delivery-loss clamp, but must not hard-fault the session.
     auto no_cap_cfg = make_cfg();
     auto no_cap_hw = std::make_shared<TestHardware>(no_cap_cfg);
     OcppAdapter no_cap_adapter(no_cap_cfg, no_cap_hw);
     seed_session(no_cap_adapter, 1);
     auto no_cap_st = make_status(370.0, 384.0, 51.0);
     no_cap_st.relay_closed = true;
-    no_cap_st.present_current_a = 7.0;
+    no_cap_st.present_current_a = 1.0;
     no_cap_st.last_target_update = std::chrono::steady_clock::now();
     no_cap_hw->set_status_override(1, no_cap_st);
     for (int i = 0; i < 14; ++i) {
@@ -183,13 +183,13 @@ int main() {
         }
     }
     const auto no_diag_cmd = no_cap_hw->last_power_command(1);
-    if (!no_diag_cmd.has_value() || no_diag_cmd->current_limit_a <= 20.0) {
-        std::cerr << "Power delivery stall test failed: persistent underdelivery unexpectedly clamped connector current\n";
+    if (!no_diag_cmd.has_value() || no_diag_cmd->current_limit_a > 5.0) {
+        std::cerr << "Power delivery stall test failed: persistent underdelivery did not clamp connector current\n";
         return 1;
     }
     const auto no_diag_mreq = OcppAdapter::TestHook::last_module_command_for_slot(no_cap_adapter, 1);
-    if (!no_diag_mreq.has_value() || no_diag_mreq->current_a <= 20.0) {
-        std::cerr << "Power delivery stall test failed: persistent underdelivery unexpectedly clamped module current\n";
+    if (!no_diag_mreq.has_value() || no_diag_mreq->current_a > 5.0) {
+        std::cerr << "Power delivery stall test failed: persistent underdelivery did not clamp module current\n";
         return 1;
     }
 
@@ -218,8 +218,8 @@ int main() {
         }
     }
 
-    // Root-cause regression: if session metadata drops while CP/HLC power phase is still active, do not
-    // collapse requested/module current to 0A once short target holds expire.
+    // If session metadata and fresh targets disappear while CP/HLC still indicate power phase,
+    // output must collapse after bounded hold (no stale multi-second current command).
     auto continuity_cfg = make_cfg();
     auto continuity_hw = std::make_shared<TestHardware>(continuity_cfg);
     OcppAdapter continuity_adapter(continuity_cfg, continuity_hw);
@@ -238,8 +238,7 @@ int main() {
         std::lock_guard<std::mutex> lock(OcppAdapter::TestHook::session_mutex(continuity_adapter));
         OcppAdapter::TestHook::sessions(continuity_adapter).erase(1);
     }
-    // Keep this beyond the historical ~16s collapse point (target_age + continuity seed expiry)
-    // to verify that continuity hold does not drop to 0A under active CP/HLC power context.
+    // Keep this well beyond hold windows to verify stale-demand collapse is enforced.
     std::this_thread::sleep_for(std::chrono::milliseconds(18500));
     continuity_st.target_voltage_v.reset();
     continuity_st.target_current_a.reset();
@@ -248,14 +247,14 @@ int main() {
     continuity_hw->set_status_override(1, continuity_st);
     OcppAdapter::TestHook::apply_power_plan(continuity_adapter);
     const auto continuity_cmd_during = continuity_hw->last_power_command(1);
-    if (!continuity_cmd_during.has_value() || continuity_cmd_during->current_limit_a < 0.5) {
-        std::cerr << "Power delivery stall test failed: session/target gap collapsed connector current unexpectedly\n";
+    if (!continuity_cmd_during.has_value() || continuity_cmd_during->current_limit_a > 1e-6) {
+        std::cerr << "Power delivery stall test failed: session/target gap did not collapse connector current\n";
         return 1;
     }
     const auto continuity_mreq_during =
         OcppAdapter::TestHook::last_module_command_for_slot(continuity_adapter, 1);
-    if (!continuity_mreq_during.has_value() || continuity_mreq_during->current_a < 0.5) {
-        std::cerr << "Power delivery stall test failed: session/target gap collapsed module current unexpectedly\n";
+    if (!continuity_mreq_during.has_value() || continuity_mreq_during->current_a > 1e-6) {
+        std::cerr << "Power delivery stall test failed: session/target gap did not collapse module current\n";
         return 1;
     }
 
@@ -276,7 +275,7 @@ int main() {
         return 1;
     }
     zero_jitter_st.target_current_a = 0.0;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 2; ++i) {
         zero_jitter_st.last_telemetry = std::chrono::steady_clock::now();
         zero_jitter_st.last_target_update = std::chrono::steady_clock::now();
         zero_jitter_hw->set_status_override(1, zero_jitter_st);
@@ -291,7 +290,7 @@ int main() {
             std::cerr << "Power delivery stall test failed: 0A jitter collapsed module current too early\n";
             return 1;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(3200));
     zero_jitter_st.last_telemetry = std::chrono::steady_clock::now();

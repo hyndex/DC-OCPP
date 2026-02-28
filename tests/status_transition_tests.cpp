@@ -101,15 +101,17 @@ int main() {
         return 1;
     }
 
-    // Case 3: CP unknown but HLC power stage reached: treat as SuspendedEVSE.
+    // Case 3: CP unknown in power stage without canonical request validity: treat as SuspendedEV.
     st.hlc_stage = 9;
     st.hlc_power_ready = true;
     st.target_current_a = 10.0;
+    st.target_voltage_v = 400.0;
+    st.last_target_update = std::chrono::steady_clock::now();
     OcppAdapter::TestHook::update_connector_state(adapter, 1, st,
                                                   true, true, true, false, false, false, false, false);
     state = OcppAdapter::TestHook::connector_state(adapter, 1);
-    if (state != ConnectorState::SuspendedEVSE) {
-        std::cerr << "status_transition_tests failed: expected SuspendedEVSE when HLC power stage reached\n";
+    if (state != ConnectorState::SuspendedEV) {
+        std::cerr << "status_transition_tests failed: expected SuspendedEV when CP is not power-ready\n";
         return 1;
     }
 

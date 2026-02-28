@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "plc_can.hpp"
+#include "charging_request.hpp"
 
 #include <everest/logging.hpp>
 
@@ -1965,30 +1966,51 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
     double pv = 0.0;
     double pc = 0.0;
     double pp_kw = 0.0;
+    MeasurementSource pv_src = MeasurementSource::Unknown;
+    MeasurementSource pc_src = MeasurementSource::Unknown;
+    MeasurementSource pp_src = MeasurementSource::Unknown;
     if (meter_ok) {
         pv = st.last_meter.voltage_v;
         pc = st.last_meter.current_a;
         pp_kw = st.last_meter.power_kw;
+        pv_src = MeasurementSource::Meter;
+        pc_src = MeasurementSource::Meter;
+        pp_src = MeasurementSource::Meter;
     } else if (evse_present_fresh) {
         pv = st.present_voltage_v;
         pc = st.present_current_a;
         pp_kw = st.present_power_kw;
+        pv_src = MeasurementSource::PlcPresent;
+        pc_src = MeasurementSource::PlcPresent;
+        pp_src = MeasurementSource::PlcPresent;
     } else if (ev_targets_fresh) {
         // PLC telemetry provides target V/I; use these as a fallback estimate when no present reading is available.
         pv = effective_target_voltage_v;
         pc = effective_target_current_a;
         pp_kw = (pv > 0.0 && pc > 0.0) ? (pv * pc) / 1000.0 : 0.0;
+        pv_src = MeasurementSource::EstimatedTarget;
+        pc_src = MeasurementSource::EstimatedTarget;
+        pp_src = MeasurementSource::EstimatedTarget;
     } else {
         pv = st.present_voltage_v;
         pc = st.present_current_a;
         pp_kw = st.present_power_kw;
+        pv_src = MeasurementSource::Unknown;
+        pc_src = MeasurementSource::Unknown;
+        pp_src = MeasurementSource::Unknown;
     }
     if (pp_kw <= 0.0 && pv > 0.0 && pc > 0.0) {
         pp_kw = (pv * pc) / 1000.0;
+        if (pp_src == MeasurementSource::Unknown && pv_src == pc_src) {
+            pp_src = pv_src;
+        }
     }
     gs.present_voltage_v = pv;
     gs.present_current_a = pc;
     gs.present_power_w = pp_kw * 1000.0;
+    gs.present_voltage_source = pv_src;
+    gs.present_current_source = pc_src;
+    gs.present_power_source = pp_src;
     gs.last_target_update = ev_targets_from_cache ? now : st.last_ev_targets_rx;
     if (ev_targets_fresh) {
         gs.target_voltage_v = effective_target_voltage_v;
@@ -2146,12 +2168,30 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
         const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
         const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_targets_fresh = ev_targets_fresh_raw || (hlc_power_phase && cp_power_ready && target_cache_valid);
+        const double effective_target_voltage_v =
+            ev_targets_fresh_raw ? st.ev_target_voltage_v
+                                 : (target_cache_valid ? st.last_valid_ev_target_voltage_v : st.ev_target_voltage_v);
         const double effective_target_current_a =
             ev_targets_fresh_raw ? st.ev_target_current_a
                                  : (target_cache_valid ? st.last_valid_ev_target_current_a : st.ev_target_current_a);
-        const bool ev_requesting =
-            ev_targets_fresh && cp_power_ready && effective_target_current_a > kEvTargetRequestThresholdA &&
-            !st.hlc_charge_complete;
+        GunStatus req_status{};
+        req_status.plugged_in = st.plugged_in;
+        req_status.comm_fault = false;
+        req_status.cp_fault = false;
+        req_status.hlc_charge_complete = st.hlc_charge_complete;
+        req_status.lock_engaged = true;
+        req_status.cp_state = cp_state;
+        req_status.hlc_stage = st.hlc_stage;
+        req_status.hlc_power_ready = hlc_power_phase;
+        if (ev_targets_fresh) {
+            req_status.target_current_a = std::max(0.0, effective_target_current_a);
+            req_status.target_voltage_v = std::max(0.0, effective_target_voltage_v);
+            req_status.last_target_update = now;
+        }
+        const bool ev_requesting = derive_ev_power_request(
+                                       req_status, now, std::chrono::milliseconds(telemetry_timeout_ms_),
+                                       false, kHlcMinPowerStage, kEvTargetRequestThresholdA)
+                                       .valid;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }
@@ -2187,8 +2227,7 @@ void PlcCanHardware::apply_power_command(const PowerCommand& cmd) {
                                << " cp_connected=" << (cp_connected ? "1" : "0")
                                << " cp_power=" << (cp_power_ready ? "1" : "0")
                                << " targetI=" << effective_target_current_a
-                               << " targetV="
-                               << (ev_targets_fresh_raw ? st.ev_target_voltage_v : st.last_valid_ev_target_voltage_v)
+                               << " targetV=" << effective_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");
                     last_ts = now;
                 }
@@ -2284,12 +2323,30 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
         const bool cp_connected = cp_connected_raw || (!cp_fresh && hlc_fresh && st.hlc_stage > 0);
         const bool cp_power_ready = cp_fresh && cp_allows_power(cp_state);
         const bool ev_targets_fresh = ev_targets_fresh_raw || (hlc_power_phase && cp_power_ready && target_cache_valid);
+        const double effective_target_voltage_v =
+            ev_targets_fresh_raw ? st.ev_target_voltage_v
+                                 : (target_cache_valid ? st.last_valid_ev_target_voltage_v : st.ev_target_voltage_v);
         const double effective_target_current_a =
             ev_targets_fresh_raw ? st.ev_target_current_a
                                  : (target_cache_valid ? st.last_valid_ev_target_current_a : st.ev_target_current_a);
-        const bool ev_requesting =
-            ev_targets_fresh && cp_power_ready && effective_target_current_a > kEvTargetRequestThresholdA &&
-            !st.hlc_charge_complete;
+        GunStatus req_status{};
+        req_status.plugged_in = st.plugged_in;
+        req_status.comm_fault = false;
+        req_status.cp_fault = false;
+        req_status.hlc_charge_complete = st.hlc_charge_complete;
+        req_status.lock_engaged = true;
+        req_status.cp_state = cp_state;
+        req_status.hlc_stage = st.hlc_stage;
+        req_status.hlc_power_ready = hlc_power_phase;
+        if (ev_targets_fresh) {
+            req_status.target_current_a = std::max(0.0, effective_target_current_a);
+            req_status.target_voltage_v = std::max(0.0, effective_target_voltage_v);
+            req_status.last_target_update = now;
+        }
+        const bool ev_requesting = derive_ev_power_request(
+                                       req_status, now, std::chrono::milliseconds(telemetry_timeout_ms_),
+                                       false, kHlcMinPowerStage, kEvTargetRequestThresholdA)
+                                       .valid;
         if (ev_requesting) {
             st.last_hlc_active = now;
         }
@@ -2325,8 +2382,7 @@ void PlcCanHardware::apply_power_allocation(std::int32_t connector, int modules)
                                << " cp_connected=" << (cp_connected ? "1" : "0")
                                << " cp_power=" << (cp_power_ready ? "1" : "0")
                                << " targetI=" << effective_target_current_a
-                               << " targetV="
-                               << (ev_targets_fresh_raw ? st.ev_target_voltage_v : st.last_valid_ev_target_voltage_v)
+                               << " targetV=" << effective_target_voltage_v
                                << " relays_closed=" << (relays_closed ? "1" : "0");
                     last_ts = now;
                 }

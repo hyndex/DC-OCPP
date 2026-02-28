@@ -105,7 +105,7 @@
           "type": "maxwell-mxr",
           "inputMode": 3,
           "pollMs": 100,
-          "cmdIntervalMs": 500,
+          "cmdIntervalMs": 200,
           "telemetryStaleMs": 3000
         }
       ]
@@ -130,7 +130,7 @@
           "type": "maxwell-mxr",
           "inputMode": 3,
           "pollMs": 100,
-          "cmdIntervalMs": 500,
+          "cmdIntervalMs": 200,
           "telemetryStaleMs": 3000
         }
       ]

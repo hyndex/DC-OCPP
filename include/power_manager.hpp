@@ -56,6 +56,14 @@ struct ModuleState {
     bool healthy{true};
     bool enabled{false};
     double temperature_c{0.0};
+    double available_current_a{0.0};
+    double available_power_kw{0.0};
+    bool module_off{false};
+    bool severe_fault{false};
+    bool power_limited{false};
+    bool temp_derated{false};
+    bool ac_limited{false};
+    bool capability_fresh{false};
 };
 
 struct GunState {
@@ -78,6 +86,9 @@ struct GunState {
     double i_meas_a{0.0};
     double v_meas_v{0.0};
     double i_set_a{0.0};
+    double module_cap_current_a{0.0};
+    double module_cap_power_kw{0.0};
+    bool delivery_lost{false};
     double connector_temp_c{0.0};
     bool plugged_in{false};
     bool reserved{false};
@@ -177,6 +188,7 @@ private:
     std::vector<int> active_guns() const;
     Plan blank_plan() const;
     const Slot* find_slot(int slot_id) const;
+    int count_available_modules_in_slot(int slot_id) const;
     int count_healthy_modules_in_slot(int slot_id) const;
     int ideal_modules_for_gun(const GunState& g, double p_budget) const;
     std::vector<std::string> select_modules_for_slot(const Slot& slot, int n_needed, Plan& plan,
@@ -189,11 +201,11 @@ private:
                                                        const std::vector<std::string>& preferred = {}) const;
     std::map<int, double> compute_power_budgets(const std::vector<int>& active,
                                                 const std::map<int, double>& req_limited,
-                                                int healthy_modules) const;
+                                                double total_available_power_kw) const;
     std::map<int, int> compute_module_allocation(const std::vector<int>& active,
                                                  const std::map<int, double>& budgets,
                                                 const std::map<int, int>& ideal,
-                                                 int healthy_modules) const;
+                                                 int available_modules) const;
     Plan build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
                     const std::map<int, int>& modules_per_gun,
                     const std::set<int>& reserved_slots,

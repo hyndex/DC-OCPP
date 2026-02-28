@@ -105,3 +105,41 @@
 - [x] Add log/trace replay harness for field regression (ingest representative traces into TestHardware)
 - [x] Add HIL/Ops validation runbook for TLS + maintenance + CCS2 DC end-to-end checks
 - [ ] Execute HIL validation against real CSMS + PLC timing (site-specific)
+
+## Stage 18 - Canonical Request + Delivery-Loss + Dynamic Capability Hardening
+- [x] Add shared canonical EV request utility (`include/charging_request.hpp`) and use in adapter + PLC relay gating
+- [x] Tighten stale-request holds from multi-second windows to production defaults (`hlcTargetHoldMs`, `requestLossDebounceMs`, `targetFreshHoldMs`)
+- [x] Convert underdelivery from log-only to control clamp path (0A clamp + pause mode + continuity cancel)
+- [x] Add measurement provenance enum to `GunStatus` and tag PLC outputs (`Meter`, `PlcPresent`, `EstimatedTarget`)
+- [x] Enforce strict measured-source policy in adapter control path (estimated target cannot sustain protection logic)
+- [x] Extend module snapshots with dynamic capability (`available_current_a`, `available_power_kw`, 0x0040 limit bits, module off)
+- [x] Consume dynamic module capability in planner capacity and current/power clamp logic
+- [x] Add measured-aware ramp anchor (`i_meas_a`, `delivery_lost`, module capability inputs)
+- [x] Tighten module-current hold policy to active/idle windows (active 200-250 ms, idle 500-800 ms)
+- [x] Update production config defaults (`pollMs`/`cmdIntervalMs` to 200 ms, `readbackLimits=true`) and add new hardening knobs
+- [x] Update targeted tests for canonical state semantics (`status_transition_tests`) and run targeted suite
+- [ ] Add dedicated delivery-supervisor state machine module (`delivery_supervisor.*`) with explicit states/reason taxonomy
+- [ ] Add explicit immediate-read trigger hooks for module 0x0040/0x0003 on delivery-loss event
+- [ ] Run full test matrix + long HIL soak and close residual behavior gaps
+- [ ] Publish full production hardening design docs (state diagram, timing diagram, failure matrix, rollout flags)
+
+## Stage 19 - Module API Compliance (docs/modules -> runtime drivers)
+- [x] Complete protocol-to-code audit for Maxwell MXR, ENR/UUGreen, and Tonhe command/status maps
+- [x] Fix cross-protocol capability decoding in slot snapshots (remove Maxwell-bit assumptions for non-Maxwell drivers)
+- [x] Add protocol-specific capability flags in driver telemetry (`module_off`, `power_limited`, `temp_derated`, `ac_limited`)
+- [x] Add ENR/UUGreen dynamic current-capability support (poll/read command `104`, parse `114` fallback, propagate to availability)
+- [x] Preserve per-protocol severe-fault masks while exporting non-fatal derating states to planner/adapter
+- [x] Keep module-off/derate semantics conservative under stale/missing capability data (safe fallback behavior)
+- [x] Publish module API compliance matrix doc (`docs/modules/API_COMPLIANCE_MATRIX.md`)
+- [x] Compile full target graph (`cmake --build build -j6`)
+- [x] Run targeted smoke checks (`status_transition_tests` passed)
+- [ ] Resolve planner simulation regressions currently failing in tree (`precharge_default_module_policy_sim_tests`, `two_car_split_charging_sim_tests`, `power_delivery_stall_tests`)
+- [ ] Validate live multi-protocol behavior on hardware (Maxwell/ENR/Tonhe) with fresh logs and 5+ minute sessions
+
+## Stage 20 - Live session immediate-stop regression (CP=B -> precharge)
+- [x] Correlate live capture (`live_autocharge_20260228T090915Z`) across PLC/DC-OCPP/CAN; identify first abort event
+- [x] Confirm stop trigger path was local fault (`planner_StuckVoltage`) before effective precharge progression
+- [x] Patch forced-fault gating: run stuck-voltage/current watchdog only in true idle/off state (CP=A, unplugged, no HLC session)
+- [x] Add targeted regression test to prevent CP=B handshake false StuckVoltage fault before precharge
+- [ ] Build and run targeted regression binary (`gc_precharge_no_timeout_tests`)
+- [ ] Re-run live 5-minute charge capture with fresh logs and verify no immediate stop

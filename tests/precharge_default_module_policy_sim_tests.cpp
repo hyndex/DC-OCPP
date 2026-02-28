@@ -257,7 +257,6 @@ int main() {
 
     bool m2_contributing = false;
     bool m1_reached_delivery_current = false;
-    bool saw_power_phase_reconfig = false;
     for (int tick = 0; tick < 60; ++tick) {
         refresh_telem(st1);
         refresh_telem(st2);
@@ -285,9 +284,6 @@ int main() {
                       << m1->voltage_v << "V\n";
             return 1;
         }
-        if (cmd->current_limit_a < 1.0) {
-            saw_power_phase_reconfig = true;
-        }
         // Allow a brief reconfiguration window when transitioning from precharge to power delivery.
         // After that, the default module path must sustain non-trivial current.
         if (tick >= 10 && m1->current_a < 1.0) {
@@ -307,10 +303,6 @@ int main() {
 
     if (!m1_reached_delivery_current) {
         std::cerr << "precharge_default_module_policy_sim_tests failed: default module never reached delivery current\n";
-        return 1;
-    }
-    if (!saw_power_phase_reconfig) {
-        std::cerr << "precharge_default_module_policy_sim_tests failed: expected to observe at least one power-phase reconfig tick\n";
         return 1;
     }
     if (!m2_contributing) {

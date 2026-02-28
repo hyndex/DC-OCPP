@@ -30,6 +30,14 @@ enum class EvseNoEnergyMode : std::uint8_t {
     Paused = 1,
 };
 
+enum class MeasurementSource : std::uint8_t {
+    Unknown = 0,
+    Meter = 1,
+    Module = 2,
+    PlcPresent = 3,
+    EstimatedTarget = 4,
+};
+
 struct AuthToken {
     std::string id_token;
     AuthTokenSource source{AuthTokenSource::RFID};
@@ -65,6 +73,9 @@ struct GunStatus {
     std::optional<double> present_voltage_v;
     std::optional<double> present_current_a;
     std::optional<double> present_power_w;
+    MeasurementSource present_voltage_source{MeasurementSource::Unknown};
+    MeasurementSource present_current_source{MeasurementSource::Unknown};
+    MeasurementSource present_power_source{MeasurementSource::Unknown};
     std::optional<double> evse_max_voltage_v;
     std::optional<double> evse_max_current_a;
     std::optional<double> evse_max_power_kw;

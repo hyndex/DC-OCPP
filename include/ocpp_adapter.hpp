@@ -220,6 +220,11 @@ public:
             return it != adapter.local_hw_disable_.end() && it->second;
         }
 
+        static void set_stuck_output_voltage_since(OcppAdapter& adapter, std::int32_t connector,
+                                                   const std::chrono::steady_clock::time_point& since) {
+            adapter.stuck_output_voltage_since_[connector] = since;
+        }
+
         static std::string local_hw_disable_reason(OcppAdapter& adapter, std::int32_t connector) {
             std::lock_guard<std::mutex> lock(adapter.state_mutex_);
             const auto it = adapter.local_hw_disable_reason_.find(connector);
@@ -403,6 +408,7 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> module_missing_since_;
     std::map<int, std::chrono::steady_clock::time_point> stuck_output_voltage_since_;
     std::map<int, std::chrono::steady_clock::time_point> stuck_output_current_since_;
+    std::map<int, std::chrono::steady_clock::time_point> stuck_output_idle_since_;
     std::map<int, std::chrono::steady_clock::time_point> last_module_health_ok_;
     std::map<int, std::string> last_local_fault_reason_;
     std::map<int, AuthorizationState> auth_state_cache_;
@@ -420,6 +426,7 @@ private:
     std::map<int, uint64_t> status_event_seq_;
     std::map<int, std::string> stop_origin_hint_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_since_;
+    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_confirmed_since_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_log_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};

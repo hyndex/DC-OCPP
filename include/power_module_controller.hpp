@@ -57,6 +57,13 @@ struct ModuleHealthSnapshot {
     double voltage_v{0.0};
     double current_a{0.0};
     double power_kw{0.0};
+    bool limit_fresh{false};
+    double available_current_a{0.0};
+    double available_power_kw{0.0};
+    bool module_off{false};
+    bool module_power_limited{false};
+    bool module_temp_derated{false};
+    bool module_ac_limited{false};
     bool can_budget_limited{false};
     bool can_overload_latched{false};
     double can_total_kbps{0.0};
