@@ -24,11 +24,12 @@ Slot make_slot(int id, int cw, int ccw) {
     return s;
 }
 
-ModuleState make_module(const std::string& id, int slot, bool healthy = true) {
+ModuleState make_module(const std::string& id, int slot, bool healthy = true, double rated_current_a = 0.0) {
     ModuleState m;
     m.id = id;
     m.slot_id = slot;
     m.mn_id = "MN_" + std::to_string(slot) + "_" + id.back();
+    m.rated_current_a = rated_current_a;
     m.healthy = healthy;
     m.enabled = false;
     return m;
@@ -411,6 +412,66 @@ int main() {
     const auto mc_home_it = plan_pass_local.mc_commands.find("MC_1");
     assert(mc_home_it != plan_pass_local.mc_commands.end());
     assert(mc_home_it->second == ContactorState::Open);
+    for (const auto& kv : plan_pass_local.mc_commands) {
+        assert(kv.second == ContactorState::Open);
+    }
+
+    // Borrow case: close only donor-side bridge ties needed to reach borrowed modules.
+    // No unrelated idle ties should close.
+    PowerManager pm3_bridge(cfg3);
+    pm3_bridge.set_slots(module_slots);
+    pm3_bridge.update_modules(module_only);
+    guns3.clear();
+    g1 = make_gun(1, 31.0, 240.0, true); // needs one borrowed module
+    g1.slot_id = 1;
+    guns3.push_back(g1);
+    pm3_bridge.update_guns(guns3);
+    const auto plan_bridge = pm3_bridge.compute_plan();
+    const auto mc1 = plan_bridge.mc_commands.find("MC_1");
+    const auto mc2 = plan_bridge.mc_commands.find("MC_2");
+    const auto mc3 = plan_bridge.mc_commands.find("MC_3");
+    const auto mc4 = plan_bridge.mc_commands.find("MC_4");
+    assert(mc1 != plan_bridge.mc_commands.end());
+    assert(mc2 != plan_bridge.mc_commands.end());
+    assert(mc3 != plan_bridge.mc_commands.end());
+    assert(mc4 != plan_bridge.mc_commands.end());
+    assert(mc1->second == ContactorState::Open);   // home boundary stays open
+    assert(mc4->second == ContactorState::Closed); // donor bridge closes (4 -> 1)
+    assert(mc2->second == ContactorState::Open);   // unrelated idle tie stays open
+    assert(mc3->second == ContactorState::Open);   // unrelated idle tie stays open
+
+    // Current-aware single-module allocation:
+    // - 22.5kW at 500V => 45A => one 100A module is enough.
+    // - 22.5kW at 200V => 112.5A => requires two modules despite power < 30kW.
+    PlannerConfig cfg_current = cfg;
+    cfg_current.allow_cross_slot_islands = true;
+    cfg_current.module_power_kw = 30.0;
+    cfg_current.max_modules_per_gun = 2;
+    PowerManager pm_current(cfg_current);
+    pm_current.set_slots(module_slots);
+    std::vector<ModuleState> current_mods;
+    for (const auto& s : module_slots) {
+        current_mods.push_back(make_module(s.modules[0], s.id, true, 100.0));
+    }
+    pm_current.update_modules(current_mods);
+
+    std::vector<GunState> current_guns;
+    auto g_current = make_gun(1, 22.5, 60.0, true);
+    g_current.slot_id = 1;
+    g_current.ev_req_voltage_v = 500.0;
+    current_guns.push_back(g_current);
+    pm_current.update_guns(current_guns);
+    auto plan_current_high_v = pm_current.compute_plan();
+    assert(!plan_current_high_v.guns.empty());
+    assert(plan_current_high_v.guns.front().modules_assigned == 1);
+
+    g_current.ev_req_voltage_v = 200.0;
+    current_guns.clear();
+    current_guns.push_back(g_current);
+    pm_current.update_guns(current_guns);
+    auto plan_current_low_v = pm_current.compute_plan();
+    assert(!plan_current_low_v.guns.empty());
+    assert(plan_current_low_v.guns.front().modules_assigned == 2);
 
     std::cout << "power_manager_tests passed\n";
     return 0;

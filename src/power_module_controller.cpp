@@ -54,109 +54,37 @@ constexpr uint8_t MAXWELL_TYPE_FLOAT = 0x41;
 constexpr uint8_t MAXWELL_TYPE_INT = 0x42;
 constexpr uint8_t MAXWELL_OK = 0xF0;
 constexpr uint8_t MAXWELL_CONTROLLER_ADDR = 0xF0;
+// Maxwell MXR absolute current command register (0x001B) expects a scaled integer.
+// Raw value = current[A] * 1024.
+constexpr double MAXWELL_ABSOLUTE_CURRENT_SCALE = 1024.0;
+// MXR current limit point (0x0022) is proportional and can exceed 1.0 on modules
+// whose max-current capability is above nominal rated-current reference.
+constexpr float MAXWELL_CURRENT_LIMIT_RATIO_MAX = 3.5f;
 // Severe faults that should mark modules unusable.
+// Keep current-imbalance (bit 17) out of hard-fault masking; it can be transient.
 constexpr uint32_t MAXWELL_ALARM_SEVERE_MASK =
     (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14) |
-    (1u << 16) | (1u << 17) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
+    (1u << 16) | (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31);
 constexpr uint8_t MAXWELL_ALARM_ONOFF_BIT = 22; // 0=On, 1=Off per V1.50 table.
 // Maxwell V1.50 (Table 1 + response format) reports read/write failures via non-F0 status,
 // while actionable module fault semantics are exposed through the 0x0040 alarm/status bits.
-// Use a wider confirmation window so transient response errors do not immediately trip modules.
-constexpr int MAXWELL_STATUS_ERROR_DEBOUNCE_COUNT = 12;
-constexpr auto MAXWELL_STATUS_ERROR_DEBOUNCE_TIME = std::chrono::milliseconds(3000);
-constexpr auto MAXWELL_START_TIMEOUT = std::chrono::seconds(8);
-constexpr auto MAXWELL_CURRENT_DIP_RECHECK_GAP = std::chrono::milliseconds(80);
-constexpr int MAXWELL_CURRENT_DIP_PERSIST_COUNT = 2;
-constexpr auto MAXWELL_CURRENT_DIP_PERSIST_TIME = std::chrono::milliseconds(500);
-constexpr auto MAXWELL_CURRENT_DIP_LOG_INTERVAL = std::chrono::seconds(2);
-constexpr auto MAXWELL_LIMIT_READBACK_SETTLE_TIME = std::chrono::milliseconds(2500);
-constexpr int MAXWELL_LIMIT_MISMATCH_CONFIRM_COUNT = 6;
-constexpr auto MAXWELL_LIMIT_MISMATCH_CONFIRM_TIME = std::chrono::milliseconds(5000);
-constexpr double MAXWELL_LIMIT_MISMATCH_ABS_DELTA = 0.25;
-constexpr double MAXWELL_LIMIT_MISMATCH_REL_DELTA = 0.35;
-constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MARGIN_V = 40.0;
-constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MIN_V = 80.0;
-constexpr double MAXWELL_VOLTAGE_UPPER_LIMIT_MAX_V = 1000.0;
-constexpr auto MAXWELL_VOLTAGE_LIMIT_RETRY_INTERVAL = std::chrono::milliseconds(500);
-constexpr auto MAXWELL_SET_REJECT_LOG_INTERVAL = std::chrono::seconds(2);
+// Non-F0 samples are dropped and must not drive control.
 constexpr auto MODULE_IDLE_STATUS_POLL_INTERVAL = std::chrono::milliseconds(800);
 constexpr auto MODULE_IDLE_TELEMETRY_POLL_INTERVAL = std::chrono::milliseconds(1500);
-// Keep OFF-command keepalive sparse in lab to avoid unnecessary command churn on inactive modules.
-constexpr auto MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL = std::chrono::milliseconds(10000);
-constexpr auto MODULE_OFF_STATE_RETRY_INTERVAL = std::chrono::milliseconds(2000);
-constexpr auto RECTIFIER_START_TIMEOUT = std::chrono::seconds(8);
-constexpr auto TONHE_START_TIMEOUT = std::chrono::seconds(8);
-constexpr double MODULE_START_FAULT_MIN_CURRENT_A = 0.5;
-constexpr double MODULE_START_FAULT_MIN_POWER_KW = 0.2;
-// Reduce command churn once modules are tracking requested setpoints.
-constexpr int MODULE_STABLE_CONTROL_REFRESH_FACTOR = 4;
-constexpr int MODULE_STABLE_CONTROL_REFRESH_MIN_MS = 2000;
-constexpr int MODULE_STABLE_CONTROL_REFRESH_MAX_MS = 5000;
-constexpr double MODULE_TRACKING_CURRENT_RATIO = 0.80;
-constexpr double MODULE_TRACKING_CURRENT_MARGIN_A = 1.5;
-// Planner issues commands at 50 ms cadence; suppress identical repeats inside this window.
-constexpr auto MODULE_COMMAND_CACHE_WINDOW = std::chrono::milliseconds(120);
-constexpr double MODULE_COMMAND_CACHE_EPS_V = 0.05;
-constexpr double MODULE_COMMAND_CACHE_EPS_A = 0.05;
-constexpr double MODULE_COMMAND_CACHE_EPS_KW = 0.05;
-constexpr int MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS = 180;
-// Keep last valid current telemetry through short module/CAN jitter windows.
-constexpr int MODULE_CURRENT_VALID_HOLD_WINDOWS = 8;
-constexpr int MODULE_CURRENT_VALID_HOLD_MIN_MS = 800;
-constexpr int MODULE_CURRENT_VALID_HOLD_MAX_MS = 6000;
-
-inline bool startup_load_requested(double current_a, double power_kw) {
-    return current_a > MODULE_START_FAULT_MIN_CURRENT_A ||
-           power_kw > MODULE_START_FAULT_MIN_POWER_KW;
-}
+// Keep periodic OFF commands short and deterministic (EVerest-style periodic control/keepalive).
+constexpr auto MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL = std::chrono::milliseconds(2000);
+// During active charging, refresh command stream at <=250 ms even if configuration is slower.
+constexpr int MODULE_ACTIVE_CONTROL_MAX_REFRESH_MS = 250;
+constexpr int MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS = 100;
 
 inline std::chrono::milliseconds current_priority_poll_interval(std::chrono::milliseconds poll_interval) {
     return std::chrono::milliseconds(
         std::max<int64_t>(MODULE_CURRENT_PRIORITY_MIN_INTERVAL_MS, poll_interval.count()));
 }
 
-inline std::chrono::milliseconds current_valid_hold_window(std::chrono::milliseconds poll_interval) {
-    const int64_t raw_ms = poll_interval.count() * MODULE_CURRENT_VALID_HOLD_WINDOWS;
-    const int hold_ms = static_cast<int>(
-        std::clamp<int64_t>(raw_ms, MODULE_CURRENT_VALID_HOLD_MIN_MS, MODULE_CURRENT_VALID_HOLD_MAX_MS));
-    return std::chrono::milliseconds(hold_ms);
-}
-
-inline std::chrono::milliseconds control_refresh_interval(const ModuleSpec& spec, bool stable_tracking) {
-    const int base_ms = std::max(500, spec.cmd_interval_ms);
-    if (!stable_tracking) {
-        return std::chrono::milliseconds(base_ms);
-    }
-    const int64_t scaled_ms = static_cast<int64_t>(base_ms) * MODULE_STABLE_CONTROL_REFRESH_FACTOR;
-    const int stable_ms = static_cast<int>(std::clamp<int64_t>(scaled_ms,
-                                                                MODULE_STABLE_CONTROL_REFRESH_MIN_MS,
-                                                                MODULE_STABLE_CONTROL_REFRESH_MAX_MS));
-    return std::chrono::milliseconds(stable_ms);
-}
-
-inline bool module_current_tracking(double measured_a, double requested_a) {
-    const double requested = std::max(0.0, requested_a);
-    if (requested <= 0.5) {
-        return true;
-    }
-    const double threshold = (requested <= 2.0)
-                                 ? 0.5
-                                 : std::max(MODULE_TRACKING_CURRENT_MARGIN_A,
-                                            requested * MODULE_TRACKING_CURRENT_RATIO);
-    return measured_a >= threshold;
-}
-
-inline bool finite_approx_equal(double lhs, double rhs, double eps) {
-    return std::isfinite(lhs) && std::isfinite(rhs) && std::fabs(lhs - rhs) <= eps;
-}
-
-inline bool same_command_request(const ModuleCommandRequest& lhs, const ModuleCommandRequest& rhs) {
-    return lhs.slot_id == rhs.slot_id &&
-           lhs.mask == rhs.mask &&
-           lhs.enable == rhs.enable &&
-           finite_approx_equal(lhs.voltage_v, rhs.voltage_v, MODULE_COMMAND_CACHE_EPS_V) &&
-           finite_approx_equal(lhs.current_a, rhs.current_a, MODULE_COMMAND_CACHE_EPS_A) &&
-           finite_approx_equal(lhs.power_kw, rhs.power_kw, MODULE_COMMAND_CACHE_EPS_KW);
+inline std::chrono::milliseconds control_refresh_interval(const ModuleSpec& spec, bool /*stable_tracking*/) {
+    const int base_ms = std::max(100, spec.cmd_interval_ms);
+    return std::chrono::milliseconds(std::min(base_ms, MODULE_ACTIVE_CONTROL_MAX_REFRESH_MS));
 }
 
 constexpr uint32_t RECTIFIER_STATUS_IGNORE_MASK =
@@ -995,21 +923,13 @@ public:
         if (!channel_ || !channel_->valid() || spec_.address < 0) {
             return;
         }
-        const auto control_retry_interval = std::chrono::milliseconds(std::max(100, spec_.cmd_interval_ms));
-        const bool control_retry_due =
-            last_control_attempt_.time_since_epoch().count() == 0 ||
-            (now - last_control_attempt_) >= control_retry_interval;
         const bool enable_edge_on = sp.enable && !last_sent_.enable;
         const bool enable_edge_off = !sp.enable && last_sent_.enable;
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         // Keep command granularity aligned with the 0.1A EV/PLC contract.
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
-        const bool power_changed = std::fabs(sp.power_kw - last_sent_.power_kw) > 0.1;
-        const bool power_control_active = spec_.send_output_power;
-        const bool power_changed_effective = power_control_active && power_changed;
         const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
-                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0) ||
-                                      (!std::isfinite(sp.power_kw) || sp.power_kw < 0.0);
+                                      (!std::isfinite(sp.current_a) || sp.current_a < 0.0);
         if (invalid_setpoint) {
             const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
                                     ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
@@ -1032,35 +952,18 @@ public:
             return;
         }
 
-        const bool have_recent_status =
-            last_status_update_.time_since_epoch().count() != 0 &&
-            (now - last_status_update_) <= telemetry_stale_interval(spec_);
-        const bool module_off_known = have_recent_status;
-        const bool module_off =
-            have_recent_status && ((telemetry_.alarms & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0);
-        const bool severe_alarm_active = (telemetry_.alarms & MAXWELL_ALARM_SEVERE_MASK) != 0;
-        const bool steady_tracking =
-            sp.enable && have_recent_status && !module_off && !severe_alarm_active &&
-            module_current_tracking(telemetry_.current_a, sp.current_a);
-        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, false);
+        const bool periodic_refresh =
+            last_tx_.time_since_epoch().count() == 0 || (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
              (now - last_off_keepalive_tx_) >= MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL);
-        const bool off_state_unconfirmed = module_off_known && !module_off;
-        const bool off_retry_due =
-            last_off_retry_tx_.time_since_epoch().count() == 0 ||
-            (now - last_off_retry_tx_) >= MODULE_OFF_STATE_RETRY_INTERVAL;
-        const bool need_off_command =
-            !sp.enable &&
-            (off_keepalive_due || ((enable_edge_off || off_state_unconfirmed) && off_retry_due));
+        const bool need_off_command = !sp.enable && (enable_edge_off || off_keepalive_due);
+        const bool use_absolute_current_cmd = spec_.send_output_current;
 
-        const bool control_update_due = sp.enable &&
-                                        (enable_edge_on ||
-                                         (control_retry_due &&
-                                          (voltage_changed || current_changed || power_changed_effective ||
-                                           periodic_refresh)));
+        const bool control_update_due =
+            sp.enable && (enable_edge_on || voltage_changed || current_changed || periodic_refresh);
 
         const bool should_send = control_update_due || need_off_command;
 
@@ -1070,7 +973,6 @@ public:
 
         const double voltage_v = sp.voltage_v > 0.0 ? sp.voltage_v : 0.0;
         const double current_a = sp.current_a > 0.0 ? sp.current_a : 0.0;
-        bool sent_control = false;
         bool attempted_control = false;
 
         const bool need_input_mode = spec_.input_mode >= 0;
@@ -1086,33 +988,28 @@ public:
             };
             const uint32_t commanded_input_mode =
                 (spec_.input_mode == 2) ? 2U : ((spec_.input_mode == 3) ? 3U : 1U);
-            const auto mode_interval =
-                std::chrono::milliseconds(std::max<int64_t>(5000, std::max(200, spec_.cmd_interval_ms) * 5));
+            const auto mode_interval = std::chrono::milliseconds(5000);
             const bool mode_stale = (now - last_input_mode_tx_) >= mode_interval;
             const bool mismatch = input_mode_reported_ && !input_mode_matches(telemetry_.input_mode);
-            // Avoid pushing mode writes before the first readback is available. This prevents noisy
-            // startup retries; once readback is known, enforce configured mode with bounded retries.
             if (mode_stale && mismatch) {
                 attempted_control = true;
                 if (send_set_int(0x0046, commanded_input_mode)) {
                     last_input_mode_tx_ = now;
-                    sent_control = true;
                 }
             }
         }
 
         if (sp.enable) {
-            last_off_retry_tx_ = std::chrono::steady_clock::time_point{};
-            // Start once when transitioning to enable, and retry during periodic updates if the module still reports OFF.
-            // Keep retrying startup while status is still OFF or status readback is not yet available.
-            // This closes the gap where one startup command is lost on CAN and no retry is sent.
-            const bool startup_retry = periodic_refresh && (!have_recent_status || module_off);
-            if (enable_edge_on || startup_retry) {
+            if (enable_edge_on || periodic_refresh) {
                 attempted_control = true;
                 if (send_set_int(0x0030, 0x00000000)) { // startup
                     last_sent_.enable = true;
-                    sent_control = true;
                 }
+            }
+            if (enable_edge_on) {
+                // Clear any stale ratio/current session limit before writing the active setpoint stream.
+                attempted_control = true;
+                (void)send_set_float(0x0022, 1.0f); // max current ratio
             }
             const double rated_current = spec_.rated_current_a > 0.0
                                              ? spec_.rated_current_a
@@ -1120,129 +1017,77 @@ public:
                                                     ? (spec_.rated_power_kw * 1000.0) / voltage_v
                                                     : 0.0);
             float frac = 0.0f;
-            if (current_a <= 0.0) {
-                frac = 0.0f;
-            } else if (rated_current > 0.0) {
-                frac = static_cast<float>(std::clamp(current_a / rated_current, 0.0, 1.0));
-            } else {
-                // Fail safe: do not drive current if rated current is unknown at low bus voltage.
-                frac = 0.0f;
-                if (current_a > 0.0 &&
-                    (last_missing_rated_current_log_.time_since_epoch().count() == 0 ||
-                     (now - last_missing_rated_current_log_) >= std::chrono::seconds(2))) {
-                    EVLOG_error << "MXR module " << spec_.id
-                                << " missing rated current at low voltage; forcing current ratio=0";
-                    last_missing_rated_current_log_ = now;
-                }
-            }
-            // For MXR, avoid driving both 0x0022 (limit ratio) and 0x001B (absolute current)
-            // in the same cycle; mixed current-control paths can cause unstable low-current behavior.
-            const bool use_limit_ratio = !spec_.send_output_current;
-            if (use_limit_ratio && (enable_edge_on || (control_retry_due && (current_changed || periodic_refresh)))) {
-                attempted_control = true;
-                if (send_set_float(0x0022, frac)) {
-                    last_limit_fraction_ = frac;
-                    last_limit_set_tx_ = now;
-                    last_sent_.current_a = sp.current_a;
-                    sent_control = true;
-                }
-            }
-            if (voltage_v > 0.0 && (enable_edge_on || voltage_changed || voltage_set_rejected_)) {
-                const double upper_limit_target_v = std::clamp(
-                    std::max(voltage_v + MAXWELL_VOLTAGE_UPPER_LIMIT_MARGIN_V, voltage_v * 1.05),
-                    MAXWELL_VOLTAGE_UPPER_LIMIT_MIN_V,
-                    MAXWELL_VOLTAGE_UPPER_LIMIT_MAX_V);
-                const bool upper_limit_retry_due =
-                    last_voltage_upper_limit_tx_.time_since_epoch().count() == 0 ||
-                    (now - last_voltage_upper_limit_tx_) >= MAXWELL_VOLTAGE_LIMIT_RETRY_INTERVAL;
-                const bool upper_limit_changed = std::fabs(upper_limit_target_v - last_voltage_upper_limit_v_) > 1.0;
-                if ((upper_limit_changed || voltage_set_rejected_) && upper_limit_retry_due) {
-                    attempted_control = true;
-                    if (send_set_float(0x0023, static_cast<float>(upper_limit_target_v))) {
-                        last_voltage_upper_limit_tx_ = now;
-                        last_voltage_upper_limit_v_ = upper_limit_target_v;
-                        sent_control = true;
+            if (!use_absolute_current_cmd) {
+                if (current_a <= 0.0) {
+                    frac = 0.0f;
+                } else if (rated_current > 0.0) {
+                    frac = static_cast<float>(std::clamp(current_a / rated_current,
+                                                         0.0,
+                                                         static_cast<double>(MAXWELL_CURRENT_LIMIT_RATIO_MAX)));
+                } else {
+                    // Fail safe: do not drive ratio current if rated current is unknown at low bus voltage.
+                    frac = 0.0f;
+                    if (current_a > 0.0 &&
+                        (last_missing_rated_current_log_.time_since_epoch().count() == 0 ||
+                        (now - last_missing_rated_current_log_) >= std::chrono::seconds(2))) {
+                        EVLOG_error << "MXR module " << spec_.id
+                                    << " missing rated current at low voltage; forcing current ratio=0";
+                        last_missing_rated_current_log_ = now;
                     }
                 }
             }
-            if (enable_edge_on || (control_retry_due && (voltage_changed || periodic_refresh))) {
+            auto send_voltage = [&]() {
+                if (voltage_v <= 0.0) {
+                    return;
+                }
+                if (!(enable_edge_on || voltage_changed || periodic_refresh)) {
+                    return;
+                }
                 attempted_control = true;
                 if (send_set_float(0x0021, static_cast<float>(voltage_v))) {
                     last_sent_.voltage_v = sp.voltage_v;
-                    sent_control = true;
                 }
-            }
-            if (spec_.send_output_current &&
-                (enable_edge_on || (control_retry_due && (current_changed || periodic_refresh)))) {
-                const double clamped_a = std::clamp(sp.current_a, 0.0, 4096.0);
-                const uint32_t val = static_cast<uint32_t>(clamped_a * 1024.0);
+            };
+            auto send_current_limit = [&]() {
+                if (!(enable_edge_on || current_changed || periodic_refresh)) {
+                    return;
+                }
                 attempted_control = true;
-                if (send_set_int(0x001B, val)) {
-                    last_set_output_current_a_ = sp.current_a;
-                    last_limit_set_tx_ = now;
+                bool sent = false;
+                if (use_absolute_current_cmd) {
+                    const double raw_d = std::llround(std::max(0.0, current_a) * MAXWELL_ABSOLUTE_CURRENT_SCALE);
+                    const uint32_t raw =
+                        static_cast<uint32_t>(std::clamp(raw_d, 0.0, static_cast<double>(std::numeric_limits<uint32_t>::max())));
+                    sent = send_set_int(0x001B, raw);
+                } else {
+                    sent = send_set_float(0x0022, frac);
+                }
+                if (sent) {
                     last_sent_.current_a = sp.current_a;
-                    sent_control = true;
                 }
-            }
-            if (spec_.send_output_power &&
-                (enable_edge_on || (control_retry_due && (power_changed || periodic_refresh)))) {
-                const double rated_power_kw = spec_.rated_power_kw > 0.0
-                                                  ? spec_.rated_power_kw
-                                                  : (spec_.rated_current_a > 0.0 && voltage_v > 1.0
-                                                         ? (spec_.rated_current_a * voltage_v) / 1000.0
-                                                         : 0.0);
-                double power_ratio = 0.0;
-                if (sp.power_kw > 0.0 && rated_power_kw > 0.0) {
-                    power_ratio = std::clamp(sp.power_kw / rated_power_kw, 0.0, 1.0);
-                    if ((power_ratio <= 0.0 || power_ratio >= 1.0) &&
-                        (last_power_ratio_clamp_log_.time_since_epoch().count() == 0 ||
-                         (now - last_power_ratio_clamp_log_) >= std::chrono::seconds(2))) {
-                        EVLOG_warning << "MXR module " << spec_.id
-                                      << " output power command clamped (req_kW=" << sp.power_kw
-                                      << " rated_kW=" << rated_power_kw
-                                      << " ratio=" << power_ratio << ")";
-                        last_power_ratio_clamp_log_ = now;
-                    }
-                } else if (sp.power_kw > 0.0 &&
-                           (last_missing_rated_power_log_.time_since_epoch().count() == 0 ||
-                            (now - last_missing_rated_power_log_) >= std::chrono::seconds(2))) {
-                    EVLOG_error << "MXR module " << spec_.id
-                                << " missing rated power/current for 0x0020 scaling; forcing power ratio=0";
-                    last_missing_rated_power_log_ = now;
-                }
-                attempted_control = true;
-                if (send_set_float(0x0020, static_cast<float>(power_ratio))) {
-                    last_sent_.power_kw = sp.power_kw;
-                    sent_control = true;
-                }
+            };
+
+            // Write ordering to reduce transients:
+            // raising demand: V first, then I-limit; lowering demand: I-limit first, then V.
+            if (sp.current_a + 0.1 < last_sent_.current_a) {
+                send_current_limit();
+                send_voltage();
+            } else {
+                send_voltage();
+                send_current_limit();
             }
             last_off_keepalive_tx_ = std::chrono::steady_clock::time_point{};
         } else {
             if (need_off_command) {
                 last_off_keepalive_tx_ = now;
-                last_off_retry_tx_ = now;
                 attempted_control = true;
                 if (send_set_int(0x0030, 0x00010000)) { // shutdown
                     last_sent_ = ModuleSetpoint{};
-                    pending_current_recheck_ = false;
-                    current_dip_confirm_count_ = 0;
-                    current_dip_since_ = std::chrono::steady_clock::time_point{};
-                    limit_mismatch_count_ = 0;
-                    limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
-                    last_limit_fraction_ = 0.0;
-                    last_set_output_current_a_ = 0.0;
-                    voltage_set_rejected_ = false;
-                    sent_control = true;
                 }
             }
         }
+
         if (attempted_control) {
-            last_control_attempt_ = now;
-        }
-        // Advance refresh timing only when we actually attempted/sent module control traffic.
-        // This prevents non-actionable planner deltas (e.g. power_kw while send_output_power=false)
-        // from starving periodic current/voltage keepalive commands.
-        if (sent_control || attempted_control) {
             last_tx_ = now;
         }
     }
@@ -1283,11 +1128,10 @@ public:
             const auto current_overdue_interval = current_priority_poll_interval(poll_interval);
             if (due(last_poll_current_, current_overdue_interval) && send_read(0x0002)) {
                 last_poll_current_ = now;
-                poll_rr_cursor_ = 3; // continue RR after the "current" task
                 sent_priority_current = true;
             }
         }
-        if (direct && !sent_priority_current) {
+        if (direct) {
             constexpr int kPollTaskCount = 7;
             const auto probe_interval = std::chrono::milliseconds(1000);
             const auto input_interval = std::chrono::milliseconds(1000);
@@ -1308,7 +1152,7 @@ public:
                     }
                     break;
                 case 2: // current
-                    if (run_context && due(last_poll_current_, poll_interval)) {
+                    if (!sent_priority_current && run_context && due(last_poll_current_, poll_interval)) {
                         sent = send_read(0x0002);
                         if (sent) last_poll_current_ = now;
                     }
@@ -1400,7 +1244,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((raw >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((raw >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(raw & 0xFF);
-        if (reg == 0x0021 || reg == 0x0022 || reg == 0x0023 || reg == 0x0020 || reg == 0x0046) {
+        if (reg == 0x001B || reg == 0x0021 || reg == 0x0022 || reg == 0x0046) {
             EVLOG_debug << "MXR tx set-float module=" << spec_.id
                         << " can_id=0x" << hex_u32(frame.can_id & CAN_EFF_MASK, 8)
                         << " reg=0x" << hex_u32(reg, 4)
@@ -1423,7 +1267,7 @@ private:
         frame.data[5] = static_cast<uint8_t>((value >> 16) & 0xFF);
         frame.data[6] = static_cast<uint8_t>((value >> 8) & 0xFF);
         frame.data[7] = static_cast<uint8_t>(value & 0xFF);
-        if (reg == 0x001B || reg == 0x0030) {
+        if (reg == 0x0030 || reg == 0x001B) {
             EVLOG_debug << "MXR tx set-int module=" << spec_.id
                         << " can_id=0x" << hex_u32(frame.can_id & CAN_EFF_MASK, 8)
                         << " reg=0x" << hex_u32(reg, 4)
@@ -1489,221 +1333,32 @@ private:
         const uint8_t status = frame.data[1];
         const uint16_t reg = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
         if (status != MAXWELL_OK) {
-            if (type == MAXWELL_TYPE_FLOAT && reg == 0x0021) {
-                const float attempted_v = decode_float_be(&frame.data[4]);
-                if (std::isfinite(attempted_v)) {
-                    last_rejected_voltage_v_ = static_cast<double>(attempted_v);
-                }
-                voltage_set_rejected_ = true;
-                if (last_set_reject_log_.time_since_epoch().count() == 0 ||
-                    (now - last_set_reject_log_) >= MAXWELL_SET_REJECT_LOG_INTERVAL) {
-                    EVLOG_warning << "MXR module " << spec_.id
-                                  << " rejected voltage setpoint reg=0x0021 status=0x"
-                                  << std::hex << static_cast<int>(status) << std::dec
-                                  << " attempted_V=" << last_rejected_voltage_v_
-                                  << "V; will retry with raised reg=0x0023 upper limit";
-                    last_set_reject_log_ = now;
-                }
-            }
-            if (status_error_since_.time_since_epoch().count() == 0) {
-                status_error_since_ = now;
-            }
-            status_error_count_++;
-            const bool persistent_status_error =
-                status_error_count_ >= MAXWELL_STATUS_ERROR_DEBOUNCE_COUNT &&
-                (now - status_error_since_) >= MAXWELL_STATUS_ERROR_DEBOUNCE_TIME;
-            if (persistent_status_error && !status_error_latched_) {
-                EVLOG_warning << "MXR module " << spec_.id
-                              << " persistent non-F0 responses (status=0x"
-                              << std::hex << static_cast<int>(status) << std::dec
-                              << ", reg=0x" << std::hex << reg << std::dec
-                              << ", count=" << status_error_count_
-                              << "); waiting for stable 0x0040 alarm evidence before faulting";
-                status_error_latched_ = true;
-            }
             return;
         }
-        if (status_error_latched_) {
-            EVLOG_info << "MXR module " << spec_.id << " response status recovered to F0";
-            status_error_latched_ = false;
-        }
-        status_error_since_ = std::chrono::steady_clock::time_point{};
-        status_error_count_ = 0;
         if (type == MAXWELL_TYPE_FLOAT) {
             const float val = decode_float_be(&frame.data[4]);
             if (!std::isfinite(val)) {
                 telemetry_.last_update = now;
                 return;
             }
-            if (reg == 0x0021) {
-                // Successful acceptance of output-voltage setpoint.
-                voltage_set_rejected_ = false;
-            } else if (reg == 0x0023) {
-                // Keep latest accepted over-voltage threshold to avoid unnecessary rewrites.
-                last_voltage_upper_limit_v_ = std::max(0.0, static_cast<double>(val));
-            } else if (reg == 0x0001) {
+            if (reg == 0x0001) {
                 if (val >= -0.1f && val <= 2000.0f) {
                     telemetry_.voltage_v = std::max(0.0, static_cast<double>(val));
                     telemetry_.last_voltage_update = now;
                 }
             } else if (reg == 0x0002) {
                 if (val >= -0.1f && val <= 500.0f) {
-                    const double measured_current_a = std::max(0.0, static_cast<double>(val));
+                    telemetry_.current_a = std::max(0.0, static_cast<double>(val));
                     telemetry_.last_current_update = now;
-                    const double expected_current_a = std::max(0.0, desired_.current_a);
-                    const bool severe_alarm_active = (telemetry_.alarms & MAXWELL_ALARM_SEVERE_MASK) != 0;
-                    const bool startup_complete =
-                        desired_.enable && enable_requested_at_.time_since_epoch().count() != 0 &&
-                        (now - enable_requested_at_) > std::chrono::milliseconds(1500);
-                    const double suspicious_thresh_a = std::max(3.0, expected_current_a * 0.70);
-                    const bool was_tracking_expected =
-                        telemetry_.current_a >= suspicious_thresh_a;
-                    const bool low_sample = measured_current_a < suspicious_thresh_a;
-                    const bool dip_context_active =
-                        startup_complete && !severe_alarm_active && expected_current_a >= 5.0;
-                    const bool suspicious_single_sample_drop =
-                        dip_context_active && was_tracking_expected && low_sample;
-
-                    if (pending_current_recheck_) {
-                        // Second sample after a suspicious dip: classify as transient/persistent.
-                        pending_current_recheck_ = false;
-                        if (dip_context_active && low_sample) {
-                            if (current_dip_since_.time_since_epoch().count() == 0) {
-                                current_dip_since_ = now;
-                            }
-                            current_dip_confirm_count_ = std::min(current_dip_confirm_count_ + 1, 1000);
-                            const auto dip_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                    now - current_dip_since_)
-                                                    .count();
-                            const bool dip_persistent =
-                                current_dip_confirm_count_ >= MAXWELL_CURRENT_DIP_PERSIST_COUNT &&
-                                dip_ms >= MAXWELL_CURRENT_DIP_PERSIST_TIME.count();
-                            if (dip_persistent) {
-                                telemetry_.current_a = measured_current_a;
-                            }
-                            if (dip_persistent &&
-                                (last_current_dip_warn_.time_since_epoch().count() == 0 ||
-                                 (now - last_current_dip_warn_) >= MAXWELL_CURRENT_DIP_LOG_INTERVAL)) {
-                                EVLOG_warning << "MXR module " << spec_.id
-                                              << " low output current classified persistent"
-                                              << " (set=" << expected_current_a
-                                              << "A measured=" << measured_current_a
-                                              << "A confirm_samples=" << current_dip_confirm_count_
-                                              << " duration_ms=" << dip_ms << ")";
-                                last_current_dip_warn_ = now;
-                            }
-                        } else {
-                            if (current_dip_confirm_count_ > 0 &&
-                                (last_current_dip_recovery_log_.time_since_epoch().count() == 0 ||
-                                 (now - last_current_dip_recovery_log_) >= MAXWELL_CURRENT_DIP_LOG_INTERVAL)) {
-                                EVLOG_info << "MXR module " << spec_.id
-                                           << " low output current classified transient and recovered"
-                                           << " (set=" << expected_current_a
-                                           << "A measured=" << measured_current_a
-                                           << "A)";
-                                last_current_dip_recovery_log_ = now;
-                            }
-                            current_dip_confirm_count_ = 0;
-                            current_dip_since_ = std::chrono::steady_clock::time_point{};
-                        }
-                    } else if (suspicious_single_sample_drop) {
-                        if ((now - last_current_recheck_tx_) >= MAXWELL_CURRENT_DIP_RECHECK_GAP) {
-                            send_read(0x0002);
-                            last_current_recheck_tx_ = now;
-                            pending_current_recheck_ = true;
-                            if (last_current_dip_log_.time_since_epoch().count() == 0 ||
-                                (now - last_current_dip_log_) >= MAXWELL_CURRENT_DIP_LOG_INTERVAL) {
-                                EVLOG_debug << "MXR module " << spec_.id
-                                            << " suspicious current dip sample (set=" << expected_current_a
-                                            << "A measured=" << measured_current_a
-                                            << "A), scheduling immediate re-read";
-                                last_current_dip_log_ = now;
-                            }
-                            // Keep the previous current sample until one more read confirms the dip.
-                        } else {
-                            // Keep prior sample while waiting for the immediate re-read to avoid
-                            // propagating one-shot telemetry dips to higher layers.
-                        }
-                    } else {
-                        telemetry_.current_a = measured_current_a;
-                        if (current_dip_confirm_count_ > 0 && measured_current_a >= suspicious_thresh_a &&
-                            (last_current_dip_recovery_log_.time_since_epoch().count() == 0 ||
-                             (now - last_current_dip_recovery_log_) >= MAXWELL_CURRENT_DIP_LOG_INTERVAL)) {
-                            EVLOG_info << "MXR module " << spec_.id
-                                       << " low output current recovered"
-                                       << " (set=" << expected_current_a
-                                       << "A measured=" << measured_current_a << "A)";
-                            last_current_dip_recovery_log_ = now;
-                        }
-                        current_dip_confirm_count_ = 0;
-                        current_dip_since_ = std::chrono::steady_clock::time_point{};
-                    }
                 }
             } else if (reg == 0x0004) {
                 if (val >= -50.0f && val <= 200.0f) {
                     telemetry_.temperature_c = static_cast<double>(val);
                 }
             } else if (reg == 0x0003) {
-                if (val >= -0.1f && val <= 1.5f) {
-                    telemetry_.current_limit_point = std::clamp(static_cast<double>(val), 0.0, 1.0);
-                    if (!spec_.readback_limits) {
-                        limit_mismatch_count_ = 0;
-                        limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
-                    } else {
-                        const bool settling =
-                            last_limit_set_tx_.time_since_epoch().count() != 0 &&
-                            (now - last_limit_set_tx_) < MAXWELL_LIMIT_READBACK_SETTLE_TIME;
-                        const double expected_frac_from_ratio = std::clamp(last_limit_fraction_, 0.0, 1.0);
-                        bool have_expected = expected_frac_from_ratio > 0.0;
-                        double expected_best = expected_frac_from_ratio;
-                        double expected_frac_from_current = -1.0;
-                        if (spec_.send_output_current && spec_.rated_current_a > 0.5 &&
-                            last_set_output_current_a_ > 0.0) {
-                            expected_frac_from_current =
-                                std::clamp(last_set_output_current_a_ / spec_.rated_current_a, 0.0, 1.0);
-                            if (!have_expected ||
-                                std::fabs(telemetry_.current_limit_point - expected_frac_from_current) <
-                                    std::fabs(telemetry_.current_limit_point - expected_best)) {
-                                expected_best = expected_frac_from_current;
-                            }
-                            have_expected = true;
-                        }
-
-                        if (settling || !have_expected) {
-                            limit_mismatch_count_ = 0;
-                            limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
-                        } else {
-                            const double diff = std::fabs(telemetry_.current_limit_point - expected_best);
-                            const double denom = std::max(0.1, std::fabs(expected_best));
-                            const bool mismatch = diff > MAXWELL_LIMIT_MISMATCH_ABS_DELTA &&
-                                                  (diff / denom) > MAXWELL_LIMIT_MISMATCH_REL_DELTA;
-                            if (mismatch) {
-                                if (limit_mismatch_since_.time_since_epoch().count() == 0) {
-                                    limit_mismatch_since_ = now;
-                                }
-                                limit_mismatch_count_++;
-                                if (limit_mismatch_count_ >= MAXWELL_LIMIT_MISMATCH_CONFIRM_COUNT &&
-                                    (now - limit_mismatch_since_) >= MAXWELL_LIMIT_MISMATCH_CONFIRM_TIME) {
-                                    EVLOG_warning << "MXR module " << spec_.id
-                                                  << " persistent current-limit readback mismatch"
-                                                  << " (read=" << telemetry_.current_limit_point
-                                                  << " expected_best=" << expected_best
-                                                  << " expected_0022=" << expected_frac_from_ratio
-                                                  << " expected_001B="
-                                                  << (expected_frac_from_current >= 0.0
-                                                          ? expected_frac_from_current
-                                                          : expected_frac_from_ratio)
-                                                  << " diff=" << diff
-                                                  << " count=" << limit_mismatch_count_ << ")";
-                                    limit_mismatch_count_ = 0;
-                                    limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
-                                }
-                            } else {
-                                limit_mismatch_count_ = 0;
-                                limit_mismatch_since_ = std::chrono::steady_clock::time_point{};
-                            }
-                        }
-                    }
+                if (val >= -0.1f && val <= (MAXWELL_CURRENT_LIMIT_RATIO_MAX + 0.5f)) {
+                    telemetry_.current_limit_point =
+                        std::clamp(static_cast<double>(val), 0.0, static_cast<double>(MAXWELL_CURRENT_LIMIT_RATIO_MAX));
                 }
             }
         } else if (type == MAXWELL_TYPE_INT) {
@@ -1711,22 +1366,14 @@ private:
             if (reg == 0x0040) {
                 telemetry_.alarms = val;
                 last_status_update_ = now;
-                const bool module_off = (val & (1u << MAXWELL_ALARM_ONOFF_BIT)) != 0;
                 const bool severe = (val & MAXWELL_ALARM_SEVERE_MASK) != 0;
-                bool fault = severe;
-                if (!fault && desired_.enable &&
-                    startup_load_requested(desired_.current_a, desired_.power_kw) &&
-                    enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
-                    (now - enable_requested_at_) > MAXWELL_START_TIMEOUT) {
-                    fault = true;
-                }
-                telemetry_.fault = fault;
+                telemetry_.fault = severe;
                 uint8_t bit = 0x01;
                 if (spec_.slot_index >= 0 && spec_.slot_index < 8) {
                     bit = static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index));
                 }
-                telemetry_.healthy_mask = fault ? 0x00 : bit;
-                telemetry_.fault_mask = fault ? bit : 0x00;
+                telemetry_.healthy_mask = severe ? 0x00 : bit;
+                telemetry_.fault_mask = severe ? bit : 0x00;
             } else if (reg == 0x0043) {
                 telemetry_.reported_group = static_cast<uint16_t>((val >> 16) & 0xFFFF);
                 telemetry_.reported_address = static_cast<uint16_t>(val & 0xFFFF);
@@ -1776,9 +1423,7 @@ private:
     std::chrono::steady_clock::time_point enable_requested_at_{};
     std::chrono::steady_clock::time_point last_status_update_{};
     std::chrono::steady_clock::time_point last_tx_{};
-    std::chrono::steady_clock::time_point last_control_attempt_{};
     std::chrono::steady_clock::time_point last_off_keepalive_tx_{};
-    std::chrono::steady_clock::time_point last_off_retry_tx_{};
     std::chrono::steady_clock::time_point last_poll_voltage_{};
     std::chrono::steady_clock::time_point last_poll_current_{};
     std::chrono::steady_clock::time_point last_poll_temp_{};
@@ -1794,28 +1439,6 @@ private:
     std::optional<uint8_t> resolved_group_{};
     std::chrono::steady_clock::time_point last_probe_tx_{};
     std::chrono::steady_clock::time_point last_missing_rated_current_log_{};
-    std::chrono::steady_clock::time_point last_missing_rated_power_log_{};
-    std::chrono::steady_clock::time_point last_power_ratio_clamp_log_{};
-    std::chrono::steady_clock::time_point last_current_recheck_tx_{};
-    std::chrono::steady_clock::time_point last_current_dip_log_{};
-    std::chrono::steady_clock::time_point last_current_dip_warn_{};
-    std::chrono::steady_clock::time_point last_current_dip_recovery_log_{};
-    std::chrono::steady_clock::time_point current_dip_since_{};
-    std::chrono::steady_clock::time_point status_error_since_{};
-    std::chrono::steady_clock::time_point last_limit_set_tx_{};
-    std::chrono::steady_clock::time_point limit_mismatch_since_{};
-    std::chrono::steady_clock::time_point last_voltage_upper_limit_tx_{};
-    std::chrono::steady_clock::time_point last_set_reject_log_{};
-    double last_limit_fraction_{0.0};
-    double last_set_output_current_a_{0.0};
-    double last_voltage_upper_limit_v_{0.0};
-    double last_rejected_voltage_v_{0.0};
-    int current_dip_confirm_count_{0};
-    int limit_mismatch_count_{0};
-    int status_error_count_{0};
-    bool status_error_latched_{false};
-    bool pending_current_recheck_{false};
-    bool voltage_set_rejected_{false};
 };
 
 class RectifierModuleDriver : public ModuleDriver {
@@ -1879,22 +1502,14 @@ public:
             return;
         }
 
-        const bool have_recent_status =
-            last_status_update_.time_since_epoch().count() != 0 &&
-            (now - last_status_update_) <= telemetry_stale_interval(spec_);
-        const bool module_off_known = have_recent_status;
-        const bool module_off = have_recent_status && ((last_status_bits_ & (1u << 25)) != 0);
-        const bool steady_tracking =
-            sp.enable && have_recent_status && !module_off && !telemetry_.fault &&
-            module_current_tracking(telemetry_.current_a, sp.current_a);
-        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, false);
+        const bool periodic_refresh =
+            last_tx_.time_since_epoch().count() == 0 || (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
              (now - last_off_keepalive_tx_) >= MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL);
-        const bool need_off_command =
-            !sp.enable && (enable_edge_off || (module_off_known && !module_off) || off_keepalive_due);
+        const bool need_off_command = !sp.enable && (enable_edge_off || off_keepalive_due);
 
         const bool should_send =
             enable_edge_on || (sp.enable && (voltage_changed || current_changed || periodic_refresh)) ||
@@ -1910,27 +1525,40 @@ public:
         bool sent_control = false;
 
         if (sp.enable) {
-            // Retry startup until status becomes available and ON.
-            const bool startup_retry = periodic_refresh && (!have_recent_status || module_off);
+            const bool startup_retry = periodic_refresh;
             if (enable_edge_on || startup_retry) {
                 if (send_set(4, 0)) { // power on
                     last_sent_.enable = true;
                     sent_control = true;
                 }
             }
-            if (enable_edge_on || voltage_changed || periodic_refresh) {
+            const auto send_voltage = [&]() {
+                if (!(enable_edge_on || voltage_changed || periodic_refresh)) {
+                    return;
+                }
                 const uint32_t mv = static_cast<uint32_t>(std::clamp(voltage_v * 1000.0, 0.0, 4.0e9));
                 if (send_set(2, mv)) { // voltage reference
                     last_sent_.voltage_v = sp.voltage_v;
                     sent_control = true;
                 }
-            }
-            if (enable_edge_on || current_changed || periodic_refresh) {
+            };
+            const auto send_current_limit = [&]() {
+                if (!(enable_edge_on || current_changed || periodic_refresh)) {
+                    return;
+                }
                 const uint32_t ma = static_cast<uint32_t>(std::clamp(current_a * 1000.0, 0.0, 4.0e9));
                 if (send_set(3, ma)) { // current limit
                     last_sent_.current_a = sp.current_a;
                     sent_control = true;
                 }
+            };
+            // Match the Maxwell CC/CV sequencing rule to reduce transients.
+            if (sp.current_a + 0.1 < last_sent_.current_a) {
+                send_current_limit();
+                send_voltage();
+            } else {
+                send_voltage();
+                send_current_limit();
             }
             last_off_keepalive_tx_ = std::chrono::steady_clock::time_point{};
         } else {
@@ -2174,14 +1802,7 @@ private:
                 telemetry_.alarms = val;
                 last_status_bits_ = val;
                 last_status_update_ = now;
-                const bool module_off = (val & (1u << 25)) != 0;
                 bool fault = (val & RECTIFIER_STATUS_FAULT_MASK) != 0;
-                if (!fault && desired_.enable &&
-                    startup_load_requested(desired_.current_a, desired_.power_kw) &&
-                    enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
-                    (now - enable_requested_at_) > RECTIFIER_START_TIMEOUT) {
-                    fault = true;
-                }
                 const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
                                         ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
                                         : 0x00;
@@ -2257,20 +1878,14 @@ public:
         const bool voltage_changed = std::fabs(sp.voltage_v - last_sent_.voltage_v) > 0.5;
         // Keep command granularity aligned with the 0.1A EV/PLC contract.
         const bool current_changed = std::fabs(sp.current_a - last_sent_.current_a) > 0.1;
-        const bool module_off = last_state_ != TONHE_STATE_ON;
-        const bool have_recent_status =
-            telemetry_.last_update.time_since_epoch().count() != 0 &&
-            (now - telemetry_.last_update) <= telemetry_stale_interval(spec_);
-        const bool steady_tracking =
-            sp.enable && have_recent_status && !module_off && !telemetry_.fault &&
-            module_current_tracking(telemetry_.current_a, sp.current_a);
-        const auto cmd_refresh_interval = control_refresh_interval(spec_, steady_tracking);
-        const bool periodic_refresh = (now - last_tx_) >= cmd_refresh_interval;
+        const auto cmd_refresh_interval = control_refresh_interval(spec_, false);
+        const bool periodic_refresh =
+            last_tx_.time_since_epoch().count() == 0 || (now - last_tx_) >= cmd_refresh_interval;
         const bool off_keepalive_due =
             !sp.enable &&
             (last_off_keepalive_tx_.time_since_epoch().count() == 0 ||
              (now - last_off_keepalive_tx_) >= MODULE_OFF_COMMAND_KEEPALIVE_INTERVAL);
-        const bool need_off_command = !sp.enable && (enable_edge_off || !module_off || off_keepalive_due);
+        const bool need_off_command = !sp.enable && (enable_edge_off || off_keepalive_due);
 
         const bool invalid_setpoint = (!std::isfinite(sp.voltage_v) || sp.voltage_v < 0.0) ||
                                       (!std::isfinite(sp.current_a) || sp.current_a < 0.0);
@@ -2341,6 +1956,8 @@ private:
         frame.can_dlc = 8;
         frame.data[0] = enable ? TONHE_CMD_START : TONHE_CMD_STOP;
         frame.data[1] = 0x00;
+        // Tonhe V1.2:
+        // voltage field uses 0.1 V/bit and current field uses 0.01 A/bit.
         const uint16_t v = static_cast<uint16_t>(std::clamp(voltage_v * 10.0, 0.0, 65535.0));
         const uint16_t i = static_cast<uint16_t>(std::clamp(current_a * 100.0, 0.0, 65535.0));
         frame.data[2] = static_cast<uint8_t>(v & 0xFF);
@@ -2385,13 +2002,6 @@ private:
                      (last_pfc_fault_ != 0) ||
                      (last_ext_fault_bits_ & TONHE_EXT_FAULT_SEVERE_MASK) != 0 ||
                      (last_state_ == TONHE_STATE_FAULT_OFF);
-        const bool module_off = last_state_ != TONHE_STATE_ON;
-        if (!fault && desired_.enable &&
-            startup_load_requested(desired_.current_a, desired_.power_kw) &&
-            enable_requested_at_.time_since_epoch().count() != 0 && module_off &&
-            (now - enable_requested_at_) > TONHE_START_TIMEOUT) {
-            fault = true;
-        }
         const uint8_t bit = (spec_.slot_index >= 0 && spec_.slot_index < 8)
                                 ? static_cast<uint8_t>(1U << static_cast<uint8_t>(spec_.slot_index))
                                 : 0x00;
@@ -2463,20 +2073,6 @@ private:
 
 class PowerModuleControllerImpl {
 public:
-    struct CurrentHoldState {
-        bool valid{false};
-        double current_a{0.0};
-        int expected_count{0};
-        std::chrono::steady_clock::time_point sampled_at{};
-        std::chrono::steady_clock::time_point hold_until{};
-    };
-
-    struct LastAppliedRequestState {
-        bool valid{false};
-        ModuleCommandRequest req{};
-        std::chrono::steady_clock::time_point last_forwarded{};
-    };
-
     PowerModuleControllerImpl() = default;
     explicit PowerModuleControllerImpl(std::vector<ModuleSpec> specs) { set_modules(std::move(specs)); }
 
@@ -2498,8 +2094,6 @@ public:
         modules_.clear();
         slot_index_.clear();
         poll_rr_cursor_by_iface_.clear();
-        current_hold_by_slot_.clear();
-        last_applied_req_by_slot_.clear();
         std::set<std::string> ifaces;
         for (auto& spec : specs) {
             if (spec.type.empty()) {
@@ -2549,14 +2143,8 @@ public:
 
     void apply(const ModuleCommandRequest& req) {
         std::lock_guard<std::mutex> lock(mtx_);
-        const auto now = std::chrono::steady_clock::now();
         const auto it = slot_index_.find(req.slot_id);
         if (it == slot_index_.end()) {
-            return;
-        }
-        auto& cache = last_applied_req_by_slot_[req.slot_id];
-        if (cache.valid && same_command_request(cache.req, req) &&
-            (now - cache.last_forwarded) < MODULE_COMMAND_CACHE_WINDOW) {
             return;
         }
         const auto& indices = it->second;
@@ -2589,9 +2177,6 @@ public:
                 mod.driver->apply(sp);
             }
         }
-        cache.valid = true;
-        cache.req = req;
-        cache.last_forwarded = now;
     }
 
     ModuleHealthSnapshot snapshot(int slot_id) const {
@@ -2608,7 +2193,6 @@ public:
         double current_sum = 0.0;
         int current_expected_count = 0;
         int current_fresh_count = 0;
-        int max_poll_interval_ms = 100;
         bool any_telem = false;
         bool any_fresh = false;
         for (auto idx : it->second) {
@@ -2663,7 +2247,6 @@ public:
                 voltage_sum += telem.voltage_v;
                 voltage_count++;
                 current_expected_count++;
-                max_poll_interval_ms = std::max(max_poll_interval_ms, std::max(100, mod.spec.poll_interval_ms));
                 if (current_fresh) {
                     current_sum += telem.current_a;
                     current_fresh_count++;
@@ -2674,38 +2257,12 @@ public:
             snap.telemetry_valid = true;
             snap.voltage_v = voltage_sum / static_cast<double>(voltage_count);
         }
-        if (snap.telemetry_valid && current_expected_count > 0) {
-            auto& hold = current_hold_by_slot_[slot_id];
-            if (current_fresh_count == current_expected_count) {
-                snap.current_valid = true;
-                snap.current_a = current_sum;
-                snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
-                hold.valid = true;
-                hold.current_a = snap.current_a;
-                hold.expected_count = current_expected_count;
-                hold.sampled_at = now;
-                hold.hold_until = now + current_valid_hold_window(std::chrono::milliseconds(max_poll_interval_ms));
-            } else {
-                const int missing_count = current_expected_count - current_fresh_count;
-                const bool one_module_late = missing_count > 0 && missing_count <= 1;
-                const bool all_modules_late = missing_count == current_expected_count;
-                const bool expected_similar =
-                    hold.expected_count <= 0 || std::abs(hold.expected_count - current_expected_count) <= 1;
-                const bool hold_active = hold.valid && now <= hold.hold_until;
-                if (hold_active && expected_similar && ((one_module_late && current_fresh_count > 0) || all_modules_late)) {
-                    snap.current_valid = true;
-                    // Keep the last coherent current sample during short read gaps.
-                    snap.current_a = hold.current_a;
-                    snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
-                } else {
-                    hold.valid = false;
-                    hold.current_a = 0.0;
-                    hold.sampled_at = std::chrono::steady_clock::time_point{};
-                }
-                hold.expected_count = current_expected_count;
-            }
-        } else {
-            current_hold_by_slot_.erase(slot_id);
+        if (snap.telemetry_valid && current_expected_count > 0 && current_fresh_count > 0) {
+            // Keep telemetry resilient: use the sum of currently fresh current contributors
+            // instead of invalidating the whole slot when one module current sample is late.
+            snap.current_valid = true;
+            snap.current_a = current_sum;
+            snap.power_kw = (snap.voltage_v * snap.current_a) / 1000.0;
         }
         snap.health_valid = any_fresh;
         return snap;
@@ -2784,8 +2341,6 @@ private:
     std::vector<ModuleRuntime> modules_;
     std::map<int, std::vector<size_t>> slot_index_;
     std::map<std::string, size_t> poll_rr_cursor_by_iface_;
-    mutable std::unordered_map<int, CurrentHoldState> current_hold_by_slot_;
-    std::unordered_map<int, LastAppliedRequestState> last_applied_req_by_slot_;
     ModuleCanTrafficPolicy policy_{};
 };
 } // namespace

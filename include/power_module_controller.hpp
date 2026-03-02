@@ -33,6 +33,10 @@ struct ModuleSpec {
     bool broadcast{false}; // send via broadcast DST (0xFE or extended)
     bool probe_on_startup{true};
     bool readback_limits{false};
+    // Optional control strategy knobs:
+    // - `send_output_current=true`: drive absolute current (0x001B, raw=A*1024)
+    // - `send_output_power` is compatibility-only and ignored by runtime control.
+    // Default is ratio CCCV via 0x0021/0x0022/0x0030.
     bool send_output_current{false};
     bool send_output_power{false};
 };

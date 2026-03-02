@@ -64,6 +64,7 @@ constexpr int kTxLoopActiveMs = 10;
 constexpr int kTxLoopIdleMs = 50;
 constexpr auto kCanStatsLogInterval = std::chrono::seconds(30);
 constexpr int kCanStatsBitsPerFrameEst = 150; // extended ID, 8-byte payload; excludes bit-stuff worst-case
+constexpr auto kOfflinePlcProbeInterval = std::chrono::seconds(5);
 
 uint8_t module_relay_enable_mask(const ChargerConfig& cfg) {
     if (!cfg.plc_module_relays_enabled) {
@@ -344,6 +345,9 @@ PlcCanHardware::PlcCanHardware(const ChargerConfig& cfg) : cfg_(cfg) {
         st.relay_cmd_mask = 0;
         st.desired_relay_force_off = false;
         st.relay_force_off = false;
+        // Keep digital comms gate open by default so a freshly booted PLC can
+        // progress out of preauth even before first PLC_TLM feedback arrives.
+        st.hlc_enabled = true;
         st.relay_state_dirty = true;
         st.relay_tx_urgent = true;
         int phase_idx = 0;
@@ -492,7 +496,6 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
         std::lock_guard<std::mutex> lock(tx_retry_mutex_);
         retry = tx_retry_state_[iface];
     }
-    const auto now_tp = std::chrono::steady_clock::now();
     bool noted_backpressure = false;
     int last_errno = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -510,47 +513,22 @@ bool PlcCanHardware::send_frame_raw(const std::string& iface,
             last_errno = errno;
             note_tx_backpressure(false);
             noted_backpressure = true;
-            if (pri <= TxPriority::Control) {
+            if (pri == TxPriority::Critical && attempt == 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
-            break; // drop lower-priority frames instead of piling up
+            break;
         }
         if (n < 0 && errno == ENOBUFS) {
             last_errno = errno;
             retry.enobufs_count++;
             note_tx_backpressure(true);
             noted_backpressure = true;
-            if (pri <= TxPriority::Heartbeat) {
+            if (pri == TxPriority::Critical && attempt == 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                // If TX queue is wedged, try reopening the socket once in a while.
-                if (retry.enobufs_count >= 5) {
-                    const bool can_reopen = retry.last_reopen.time_since_epoch().count() == 0 ||
-                                            (now_tp - retry.last_reopen) > std::chrono::seconds(2);
-                    if (can_reopen) {
-                        retry.last_reopen = now_tp;
-                        {
-                            std::lock_guard<std::mutex> lock(sockets_mutex_);
-                            const auto it = sockets_.find(iface);
-                            if (it != sockets_.end()) {
-                                if (it->second >= 0) close(it->second);
-                                sockets_.erase(it);
-                            }
-                        }
-                        open_socket_for_iface(iface);
-                        {
-                            std::lock_guard<std::mutex> lock(sockets_mutex_);
-                            const auto it = sockets_.find(iface);
-                            fd = (it == sockets_.end()) ? -1 : it->second;
-                        }
-                    }
-                    retry.enobufs_count = 0;
-                    if (fd < 0) break;
-                    continue;
-                }
-            } else {
-                break; // shed telemetry/debug immediately on ENOBUFS
+                continue;
             }
+            break;
         }
         if (n < 0 && !noted_backpressure) {
             last_errno = errno;
@@ -614,6 +592,7 @@ void PlcCanHardware::rx_loop() {
 }
 
 void PlcCanHardware::tx_loop() {
+    std::map<int, std::chrono::steady_clock::time_point> offline_probe_last;
     while (running_) {
         const auto now = std::chrono::steady_clock::now();
         const uint64_t now_ms = steady_ms();
@@ -622,12 +601,38 @@ void PlcCanHardware::tx_loop() {
         const uint64_t backpressure_until = backpressure_until_ms_.load(std::memory_order_relaxed);
         const bool severe_backpressure =
             backpressure_level >= kBackpressureMaxLevel && backpressure_until > now_ms;
+        const auto offline_status_stale =
+            std::chrono::milliseconds(std::max(3000, telemetry_timeout_ms_ * 3));
         std::vector<std::string> stats_lines;
         bool active_relay_window = false;
         {
             std::unique_lock<std::mutex> lock(state_mutex_);
             for (auto& kv : connectors_) {
                 auto& st = kv.second;
+                const bool status_seen = st.last_status_rx.time_since_epoch().count() != 0;
+                const bool status_stale =
+                    !status_seen || (now - st.last_status_rx) > offline_status_stale;
+                const bool connector_idle =
+                    !st.plugged_in && !st.output_enabled && !st.regulating &&
+                    st.hlc_stage == 0 && !st.hlc_charge_complete;
+                if (status_stale && connector_idle) {
+                    // Keep offline idle PLC channels quiesced to avoid ENOBUFS storms on shared CAN.
+                    st.relay_state_dirty = false;
+                    st.relay_tx_urgent = false;
+                    const auto pit = offline_probe_last.find(kv.first);
+                    const bool probe_due = pit == offline_probe_last.end() ||
+                                           (now - pit->second) >= kOfflinePlcProbeInterval;
+                    if (probe_due && !severe_backpressure) {
+                        const int probe_backoff = std::max(backoff, 4);
+                        // Also send EVSE_SLOW during offline probing so PLC-side HLC gate/auth state
+                        // can recover from a cold boot without waiting for prior telemetry.
+                        update_fast_tx(st, now, probe_backoff, lock);
+                        update_slow_tx(st, now, probe_backoff, lock);
+                        offline_probe_last[kv.first] = now;
+                    }
+                    continue;
+                }
+                offline_probe_last.erase(kv.first);
                 const bool relays_active = (st.relay_cmd_mask & st.relay_enable_mask) != 0u;
                 const bool relays_requested = (st.desired_relay_cmd_mask & st.desired_relay_enable_mask) != 0u;
                 if (relays_active || relays_requested || st.relay_tx_urgent || st.relay_state_dirty) {
@@ -1716,8 +1721,8 @@ GunStatus PlcCanHardware::get_status(std::int32_t connector) {
 
     constexpr std::chrono::milliseconds kSafetyTripDebounceMs(200);
     constexpr std::chrono::milliseconds kCriticalTripDebounceLegacyMs(100);
-    // Relax comm debounce to reduce false positives when PLC is slow to report.
-    constexpr std::chrono::milliseconds kCommTripDebounceMs(6000);
+    // Keep comm-fault debounce long enough to ride out transient CAN backpressure without session drops.
+    constexpr std::chrono::milliseconds kCommTripDebounceMs(12000);
     const auto critical_debounce =
         use_v3_safety_confirmation ? std::chrono::milliseconds(0) : kCriticalTripDebounceLegacyMs;
     const bool safety_trip = debounced_active(!raw_safety_ok, st.safety_trip_since, kSafetyTripDebounceMs);

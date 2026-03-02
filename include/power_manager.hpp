@@ -51,6 +51,8 @@ struct ModuleState {
     bool broadcast{false};
     bool probe_on_startup{true};
     bool readback_limits{false};
+    // Optional module control strategy propagated to module drivers.
+    // Default path is ratio CCCV via 0x0021/0x0022/0x0030.
     bool send_output_current{false};
     bool send_output_power{false};
     bool healthy{true};
@@ -105,7 +107,7 @@ struct PlannerConfig {
     double connector_derate_trip_c{90.0};
     double module_derate_start_c{75.0};
     double module_derate_trip_c{85.0};
-    bool allow_cross_slot_islands{false};
+    bool allow_cross_slot_islands{true};
     int min_module_hold_ms{1000};
     int max_modules_per_gun{2};
     int min_modules_per_active_gun{1};
@@ -178,6 +180,10 @@ private:
     Plan blank_plan() const;
     const Slot* find_slot(int slot_id) const;
     int count_healthy_modules_in_slot(int slot_id) const;
+    double module_power_cap_kw(const ModuleState& m) const;
+    double estimate_total_module_power_cap_kw() const;
+    double estimate_reference_module_power_cap_kw() const;
+    double estimate_module_current_cap_a() const;
     int ideal_modules_for_gun(const GunState& g, double p_budget) const;
     std::vector<std::string> select_modules_for_slot(const Slot& slot, int n_needed, Plan& plan,
                                                      const std::vector<std::string>& preferred = {}) const;

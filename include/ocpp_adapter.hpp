@@ -510,6 +510,7 @@ private:
 
     // Debug/test visibility: last module command sent per slot (updated in planner thread).
     std::map<int, ModuleCommandRequest> last_module_command_by_slot_;
+    std::map<int, std::chrono::steady_clock::time_point> last_module_command_sent_at_;
 };
 
 } // namespace charger

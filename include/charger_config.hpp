@@ -55,8 +55,12 @@ struct ModuleConfig {
     bool broadcast{false};
     bool probe_on_startup{true};
     bool readback_limits{false};
-    bool send_output_current{false}; // send 0x001B output current command
-    bool send_output_power{false};   // send 0x0020 output power command
+    // Optional module control strategy:
+    // - `send_output_current=true` -> absolute current command (0x001B)
+    // - `send_output_power` is parsed for compatibility but ignored at runtime.
+    // Default path is voltage + current-ratio CCCV via 0x0021/0x0022/0x0030.
+    bool send_output_current{false};
+    bool send_output_power{false};
 };
 
 struct SlotMapping {

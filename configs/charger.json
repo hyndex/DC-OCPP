@@ -15,20 +15,20 @@
     {
       "id": 1,
       "plcId": 1,
-      "maxCurrentA": 200,
+      "maxCurrentA": 100,
       "maxPowerW": 60000,
       "maxVoltageV": 1000,
-      "minVoltageV": 200,
+      "minVoltageV": 50,
       "meterSource": "module",
       "requireLock": false
     },
     {
       "id": 2,
       "plcId": 2,
-      "maxCurrentA": 200,
+      "maxCurrentA": 100,
       "maxPowerW": 60000,
       "maxVoltageV": 1000,
-      "minVoltageV": 200,
+      "minVoltageV": 50,
       "meterSource": "module",
       "requireLock": false
     }
@@ -51,7 +51,7 @@
   "ocppConfig": "ocpp/v16/config.json",
   "planner": {
     "allowCrossSlotIslands": true,
-    "maxModulesPerGun": 1,
+    "maxModulesPerGun": 2,
     "minModulesPerActiveGun": 1,
     "requireAuthForPrecharge": false,
     "prechargeMaxCurrentA": 2,

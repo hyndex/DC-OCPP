@@ -75,18 +75,97 @@ int PowerManager::count_healthy_modules_in_slot(int slot_id) const {
     return healthy;
 }
 
+double PowerManager::module_power_cap_kw(const ModuleState& m) const {
+    double kw = m.rated_power_kw > 0.0 ? m.rated_power_kw : cfg_.module_power_kw;
+    if (kw <= 0.0) {
+        return 0.0;
+    }
+    // Maxwell MXR hardware limit per module.
+    return std::min(30.0, kw);
+}
+
+double PowerManager::estimate_total_module_power_cap_kw() const {
+    double total_kw = 0.0;
+    for (const auto& kv : modules_) {
+        const auto& m = kv.second;
+        if (!m.healthy) {
+            continue;
+        }
+        total_kw += module_power_cap_kw(m);
+    }
+    return total_kw;
+}
+
+double PowerManager::estimate_reference_module_power_cap_kw() const {
+    double ref_kw = 0.0;
+    for (const auto& kv : modules_) {
+        const auto& m = kv.second;
+        if (!m.healthy) {
+            continue;
+        }
+        const double cap_kw = module_power_cap_kw(m);
+        if (cap_kw <= 0.0) {
+            continue;
+        }
+        ref_kw = (ref_kw > 0.0) ? std::min(ref_kw, cap_kw) : cap_kw;
+    }
+    if (ref_kw > 0.0) {
+        return ref_kw;
+    }
+    if (cfg_.module_power_kw > 0.0) {
+        return std::min(30.0, cfg_.module_power_kw);
+    }
+    return 30.0;
+}
+
+double PowerManager::estimate_module_current_cap_a() const {
+    double cap_a = 0.0;
+    for (const auto& kv : modules_) {
+        const auto& m = kv.second;
+        if (!m.healthy) {
+            continue;
+        }
+        // Use explicit module current capability only.
+        // Deriving current from power and a guessed reference voltage can understate
+        // actual current capability and over-allocate modules.
+        const double module_cap_a = m.rated_current_a;
+        if (module_cap_a > 0.0) {
+            cap_a = (cap_a > 0.0) ? std::min(cap_a, module_cap_a) : module_cap_a;
+        }
+    }
+    return cap_a;
+}
+
 int PowerManager::ideal_modules_for_gun(const GunState& g, double p_budget) const {
     if (p_budget <= 0.0) {
         return 0;
     }
-    if (cfg_.module_power_kw <= 0.0) {
+    const double module_power_kw = estimate_reference_module_power_cap_kw();
+    if (module_power_kw <= 0.0) {
         return cfg_.min_modules_per_active_gun;
     }
-    int n = static_cast<int>(std::ceil(p_budget / cfg_.module_power_kw));
+    // Power-based module estimate is the primary allocator signal.
+    const int n_power = static_cast<int>(std::ceil(p_budget / module_power_kw));
+    int n = n_power;
+    // Current-based guard: at low voltage, EV current demand can require
+    // more modules even when kW is modest.
+    // Applied only when an explicit module current cap is configured.
+    const double module_current_cap_a = estimate_module_current_cap_a();
+    if (module_current_cap_a > 0.0) {
+        const double v_ref = std::max(cfg_.min_voltage_v_for_div,
+                                      g.ev_req_voltage_v > 0.0 ? g.ev_req_voltage_v : cfg_.default_voltage_v);
+        if (v_ref > 0.0) {
+            const double i_req_a = (p_budget * 1000.0) / v_ref;
+            if (i_req_a > 0.0) {
+                const int n_current = static_cast<int>(std::ceil(i_req_a / module_current_cap_a));
+                n = std::max(n, n_current);
+            }
+        }
+    }
     int max_by_config = std::max(1, cfg_.max_modules_per_gun);
     int max_by_cable = max_by_config;
-    if (g.gun_power_limit_kw > 0.0) {
-        max_by_cable = static_cast<int>(std::ceil(g.gun_power_limit_kw / cfg_.module_power_kw));
+    if (g.gun_power_limit_kw > 0.0 && module_power_kw > 0.0) {
+        max_by_cable = static_cast<int>(std::ceil(g.gun_power_limit_kw / module_power_kw));
         max_by_cable = std::min(max_by_cable, max_by_config);
     }
     const int min_allowed = p_budget > 0.0 ? std::max(0, cfg_.min_modules_per_active_gun) : 0;
@@ -252,7 +331,7 @@ std::map<int, double> PowerManager::compute_power_budgets(const std::vector<int>
         return budgets;
     }
 
-    const double p_module_total = healthy_modules * cfg_.module_power_kw;
+    const double p_module_total = estimate_total_module_power_cap_kw();
     const double system_cap = std::min(p_module_total, cfg_.grid_limit_kw);
 
     double total_req = 0.0;
@@ -535,7 +614,20 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
 
         const auto slots_for_g = island_slots[gid];
 
-        const auto preferred = last_module_ids_[gid];
+        std::vector<std::string> preferred;
+        std::set<std::string> preferred_seen;
+        // Keep the gun's home/default modules at highest priority.
+        for (const auto& mid : home_slot->modules) {
+            preferred.push_back(mid);
+            preferred_seen.insert(mid);
+        }
+        // Then prefer previously assigned modules to reduce chatter.
+        for (const auto& mid : last_module_ids_[gid]) {
+            if (!preferred_seen.count(mid)) {
+                preferred.push_back(mid);
+                preferred_seen.insert(mid);
+            }
+        }
         auto selected = assign_modules_for_island(slots_for_g, n_needed, plan, preferred);
         const int assigned = static_cast<int>(selected.size());
         if (assigned == 0) {
@@ -550,7 +642,14 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         island.gun_id = gid;
         island.module_ids = selected;
 
-        const double p_cap_modules = assigned * cfg_.module_power_kw;
+        double p_cap_modules = 0.0;
+        for (const auto& mod_id : selected) {
+            const auto mit = modules_.find(mod_id);
+            if (mit == modules_.end()) {
+                continue;
+            }
+            p_cap_modules += module_power_cap_kw(mit->second);
+        }
         const double p_budget = budgets.at(gid);
         const double p_set = std::min({p_budget, p_cap_modules,
                                        g.gun_power_limit_kw > 0.0 ? g.gun_power_limit_kw : p_cap_modules});
@@ -589,7 +688,7 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
     }
 
     // Canonical tie truth rule for a ring:
-    // close tie(i->i+1) iff both adjacent cabinets share the same owner.
+    // close tie(i->i+1) iff both adjacent cabinets share the same *active* owner.
     //
     // Owners:
     // - gun_id for active island members
@@ -613,7 +712,7 @@ Plan PowerManager::build_plan(const std::vector<int>& active, const std::map<int
         const auto own_it = slot_owner.find(s.id);
         if (cw_it != slot_lookup_.end() && own_it != slot_owner.end()) {
             const auto cw_owner_it = slot_owner.find(cw_it->first);
-            if (cw_owner_it != slot_owner.end() && own_it->second == cw_owner_it->second) {
+            if (cw_owner_it != slot_owner.end() && own_it->second > 0 && own_it->second == cw_owner_it->second) {
                 tie_state = ContactorState::Closed;
             }
         }
@@ -852,7 +951,14 @@ void PowerManager::apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_
                 }
 
                 const double v_target = island_it->v_set_v;
-                const double p_cap = prev * cfg_.module_power_kw;
+                double p_cap = 0.0;
+                for (const auto& mod_id : desired_modules) {
+                    const auto mit = modules_.find(mod_id);
+                    if (mit == modules_.end()) {
+                        continue;
+                    }
+                    p_cap += module_power_cap_kw(mit->second);
+                }
                 const double p_set = std::min({dispatch.p_budget_kw, p_cap,
                                                g_state->gun_power_limit_kw > 0.0
                                                    ? g_state->gun_power_limit_kw

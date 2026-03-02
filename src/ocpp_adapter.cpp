@@ -42,6 +42,7 @@ constexpr uint8_t HLC_MIN_POWER_STAGE = 9; // minimum stage indicating power del
 constexpr std::chrono::milliseconds MC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_TIMEOUT_MS(2000);
 constexpr std::chrono::milliseconds GC_OPEN_FAULT_CONFIRM_MS(1000);
+constexpr std::chrono::milliseconds MODULE_COMMAND_KEEPALIVE_MS(250);
 // Precharge current is intentionally clamped near 2 A, but real hardware can show short
 // measurement transients during contactor settle / CV-to-CI loop capture. Keep the fault
 // latch conservative enough to avoid false aborts while still catching sustained misuse.
@@ -53,12 +54,12 @@ constexpr std::chrono::milliseconds PRECHARGE_STABLE_HOLD_MS(300);
 // Avoid tripping local stall faults on short/noisy underdelivery windows.
 // EVs and module telemetry can transiently dip for a few seconds without indicating a hard fault.
 constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_TIMEOUT_MS(8000);
-constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS(6000);
-constexpr std::chrono::milliseconds POWER_DELIVERY_STALL_ESCALATION_MS(45000);
-constexpr uint8_t POWER_DELIVERY_STALL_MAX_RECOVERIES = 3;
 // Persistent module underdelivery guard:
 // if measured current remains well below offered/expected current, clamp offered current
 // to a measured-deliverable envelope and recover only after sustained tracking recovers.
+// Disabled by default to match EVerest-style simple CCCV behavior and avoid false clamping
+// when module current telemetry is delayed/noisy while the EV is still settling.
+constexpr bool ENABLE_MODULE_UNDERDELIVERY_CLAMP = false;
 constexpr std::chrono::milliseconds UNDERDELIVERY_CLAMP_ARM_MS(2500);
 constexpr std::chrono::milliseconds UNDERDELIVERY_CLAMP_RECOVERY_MS(4000);
 constexpr double UNDERDELIVERY_CLAMP_MIN_A = 1.0;
@@ -191,7 +192,7 @@ bool infer_vehicle_present(const GunStatus& status, bool has_session_hint = fals
 
 ConnectorState initial_state_from_status(const GunStatus& status) {
     const bool vehicle_present = infer_vehicle_present(status);
-    const bool fault_active = !status.safety_ok || status.cp_fault || status.comm_fault || status.isolation_fault ||
+    const bool fault_active = !status.safety_ok || status.cp_fault || status.isolation_fault ||
                               status.overtemp_fault || status.overcurrent_fault || status.gc_welded ||
                               status.mc_welded || status.earth_fault || status.estop;
     const bool meter_fault_active = status.meter_stale && status.relay_closed;
@@ -257,6 +258,12 @@ std::chrono::milliseconds telemetry_timeout(const ChargerConfig& cfg) {
     return std::chrono::milliseconds(std::max(1, cfg.telemetry_timeout_ms));
 }
 
+bool module_command_equivalent(const ModuleCommandRequest& lhs, const ModuleCommandRequest& rhs) {
+    return lhs.slot_id == rhs.slot_id && lhs.enable == rhs.enable && lhs.mask == rhs.mask &&
+           std::fabs(lhs.voltage_v - rhs.voltage_v) <= 0.5 &&
+           std::fabs(lhs.current_a - rhs.current_a) <= 0.1;
+}
+
 const Slot* find_slot(const std::vector<Slot>& slots, int id) {
     auto it = std::find_if(slots.begin(), slots.end(), [&](const Slot& s) { return s.id == id; });
     return it == slots.end() ? nullptr : &(*it);
@@ -307,7 +314,7 @@ SlotModuleSelection compute_slot_module_selection(const Plan& plan, const Slot& 
 }
 
 bool power_delivery_requested(const GunStatus& status, bool lock_required) {
-    if (!status.plugged_in || status.comm_fault || status.cp_fault) {
+    if (!status.plugged_in || status.cp_fault) {
         return false;
     }
     if (status.hlc_charge_complete) {
@@ -708,7 +715,9 @@ void OcppAdapter::initialize_slots() {
     }
 
     PlannerConfig pcfg;
-    pcfg.module_power_kw = cfg_.module_power_kw > 0.0 ? cfg_.module_power_kw : 30.0;
+    const double configured_module_kw = cfg_.module_power_kw > 0.0 ? cfg_.module_power_kw : 30.0;
+    // Maxwell MXR modules are capped at 30 kW each.
+    pcfg.module_power_kw = std::min(30.0, configured_module_kw);
     pcfg.grid_limit_kw = cfg_.grid_limit_kw > 0.0 ? cfg_.grid_limit_kw : 1000.0;
     pcfg.default_voltage_v = cfg_.default_voltage_v > 0.0 ? cfg_.default_voltage_v : 800.0;
     pcfg.allow_cross_slot_islands = cfg_.allow_cross_slot_islands;
@@ -856,7 +865,11 @@ void OcppAdapter::initialize_slots() {
                 ms.probe_on_startup = m.probe_on_startup;
                 ms.readback_limits = m.readback_limits;
                 ms.send_output_current = m.send_output_current;
-                ms.send_output_power = m.send_output_power;
+                if (m.send_output_power) {
+                    EVLOG_warning << "Module " << m.id
+                                  << " sendOutputPower=true is ignored (power is planned via module allocation only)";
+                }
+                ms.send_output_power = false;
                 module_states_.push_back(ms);
             }
         }
@@ -915,7 +928,7 @@ void OcppAdapter::initialize_slots() {
         spec.probe_on_startup = ms.probe_on_startup;
         spec.readback_limits = ms.readback_limits;
         spec.send_output_current = ms.send_output_current;
-        spec.send_output_power = ms.send_output_power;
+        spec.send_output_power = false;
         module_specs.push_back(spec);
     }
     if (missing_module_type) {
@@ -1662,7 +1675,6 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
     std::chrono::steady_clock::time_point evse_limit_ack_stale_log_ts{};
     std::chrono::steady_clock::time_point module_degraded_since{};
     std::chrono::steady_clock::time_point module_degraded_clear_since{};
-    std::chrono::steady_clock::time_point module_unavailable_since{};
     std::chrono::steady_clock::time_point suspended_no_power_since{};
     std::chrono::steady_clock::time_point suspended_no_power_log_ts{};
     bool module_degraded_latched = false;
@@ -2198,14 +2210,11 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             }
             const bool comm_fault_relevant =
                 status.plugged_in || status.relay_closed || status.hlc_stage > 0 || had_session || status.authorization_granted;
-            if (!status.safety_ok || status.estop || status.earth_fault || (comm_fault_relevant && status.comm_fault)) {
+            const bool safety_trip = !status.safety_ok || status.estop || status.earth_fault;
+            if (safety_trip) {
                 ocpp::v16::Reason stop_reason = ocpp::v16::Reason::Other;
                 if (status.estop) {
                     stop_reason = ocpp::v16::Reason::EmergencyStop;
-                } else if (status.comm_fault) {
-                    const bool power_path_active = status.relay_closed || is_hlc_precharge_phase(status) ||
-                                                   status.hlc_power_ready || status.hlc_stage >= HLC_MIN_POWER_STAGE;
-                    stop_reason = power_path_active ? ocpp::v16::Reason::PowerLoss : ocpp::v16::Reason::Other;
                 } else if (status.earth_fault) {
                     stop_reason = ocpp::v16::Reason::Other;
                 }
@@ -2221,6 +2230,16 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
                     had_session = false;
                 }
                 fault = true;
+            }
+            if (!fault && comm_fault_relevant && status.comm_fault) {
+                power_constrained_[connector] = true;
+                static std::map<int, std::chrono::steady_clock::time_point> last_comm_fault_log;
+                auto& ts = last_comm_fault_log[connector];
+                if (ts.time_since_epoch().count() == 0 || (now - ts) >= std::chrono::seconds(2)) {
+                    EVLOG_warning << "Connector " << connector
+                                  << " PLC communication degraded; keeping session alive and constraining power";
+                    ts = now;
+                }
             }
             if (!fault && status.isolation_fault) {
                 bool already_faulted = false;
@@ -2348,60 +2367,27 @@ void OcppAdapter::metering_loop(std::int32_t connector) {
             const bool module_relevant = status.plugged_in || had_session;
             const bool need_modules = module_relevant && (power_ready_hint || precharge_hint) && module_commanded &&
                                       module_capability_needed;
+            // EVerest-style behavior: do not hard-stop charging sessions from a local
+            // module-availability watchdog. Keep this as a diagnostic signal only.
             bool module_unavailable_fault = false;
-            if (!fault) {
-                if (need_modules && usable_modules == 0) {
-                    bool expired = false;
-                    {
-                        std::lock_guard<std::mutex> plan_lock(plan_mutex_);
-                        auto& ts = module_missing_since_[connector];
-                        if (ts.time_since_epoch().count() == 0) {
-                            ts = now;
-                        } else {
-                            const auto timeout_ms = std::max({2000, cfg_.precharge_timeout_ms, cfg_.telemetry_timeout_ms});
-                            if ((now - ts) > std::chrono::milliseconds(timeout_ms)) {
-                                expired = true;
-                            }
-                        }
-                    }
-                    module_unavailable_fault = expired;
-                } else {
-                    std::lock_guard<std::mutex> plan_lock(plan_mutex_);
-                    module_missing_since_.erase(connector);
+            if (!fault && need_modules && usable_modules == 0) {
+                std::lock_guard<std::mutex> plan_lock(plan_mutex_);
+                auto& ts = module_missing_since_[connector];
+                if (ts.time_since_epoch().count() == 0) {
+                    ts = now;
+                }
+                static std::map<int, std::chrono::steady_clock::time_point> last_module_missing_log;
+                auto& last_log = last_module_missing_log[connector];
+                if (last_log.time_since_epoch().count() == 0 || (now - last_log) >= std::chrono::seconds(2)) {
+                    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts).count();
+                    EVLOG_warning << "No healthy power modules available on connector " << connector
+                                  << " during precharge/power delivery; continuing and waiting for recovery"
+                                  << " age_ms=" << age_ms;
+                    last_log = now;
                 }
             } else {
                 std::lock_guard<std::mutex> plan_lock(plan_mutex_);
                 module_missing_since_.erase(connector);
-            }
-            if (!fault && module_unavailable_fault) {
-                constexpr auto kModuleUnavailableGrace = std::chrono::seconds(30);
-                if (module_unavailable_since.time_since_epoch().count() == 0) {
-                    module_unavailable_since = now;
-                }
-                if ((now - module_unavailable_since) >= kModuleUnavailableGrace) {
-                    EVLOG_error << "No healthy power modules available on connector " << connector
-                                << " for >" << std::chrono::duration_cast<std::chrono::seconds>(kModuleUnavailableGrace).count()
-                                << "s during precharge/power delivery; stopping session";
-                    finish_and_mark(ocpp::v16::Reason::PowerLoss, std::nullopt);
-                    disable_local("modules_unavailable");
-                    had_session = false;
-                    fault = true;
-                    module_unavailable_since = std::chrono::steady_clock::time_point{};
-                } else {
-                    static std::map<int, std::chrono::steady_clock::time_point> last_module_fault_log;
-                    auto& last_log = last_module_fault_log[connector];
-                    if (last_log.time_since_epoch().count() == 0 ||
-                        (now - last_log) > std::chrono::seconds(2)) {
-                        const auto age_ms =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(now - module_unavailable_since).count();
-                        EVLOG_warning << "No healthy power modules available on connector " << connector
-                                      << " during precharge/power delivery; waiting for recovery (age_ms=" << age_ms
-                                      << ")";
-                        last_log = now;
-                    }
-                }
-            } else {
-                module_unavailable_since = std::chrono::steady_clock::time_point{};
             }
             // Lock fault: if lock disengaged while plug-in/session active, treat as fault
             if (!fault && lock_required && !status.lock_engaged && (status.plugged_in || had_session)) {
@@ -4144,8 +4130,7 @@ void OcppAdapter::apply_power_plan() {
         const uint64_t prev_limit_stale = last_limit_stale_counts_[c.id];
         if (st.present_stale_events > prev_present_stale) {
             EVLOG_warning << "Connector " << c.id << " EVSE_PRESENT cadence stale events observed ("
-                          << st.present_stale_events << "); treating as comm fault";
-            st.comm_fault = true;
+                          << st.present_stale_events << "); constraining power";
             power_constrained_[c.id] = true;
             last_present_stale_counts_[c.id] = st.present_stale_events;
         }
@@ -4291,7 +4276,7 @@ void OcppAdapter::apply_power_plan() {
         g.connector_temp_c = st.connector_temp_c;
         g.gc_welded = st.gc_welded;
         g.mc_welded = st.mc_welded;
-        g.safety_ok = st.safety_ok && !st.estop && !st.earth_fault && !st.overcurrent_fault && !st.comm_fault &&
+        g.safety_ok = st.safety_ok && !st.estop && !st.earth_fault && !st.overcurrent_fault &&
                       !st.cp_fault && !st.isolation_fault && !st.overtemp_fault;
         g.plugged_in = st.plugged_in;
         g.reserved = reserved_connectors_[c.id];
@@ -4825,7 +4810,7 @@ void OcppAdapter::apply_power_plan() {
         }
 
         const bool general_fault = !st.safety_ok || st.cp_fault || meter_fault_active || welded || isolation_fault ||
-                                   thermal_fault || overcurrent_fault || comm_fault ||
+                                   thermal_fault || overcurrent_fault ||
                                    module_can_overload || forced_fault;
         uint8_t fault_bits = 0;
         if (general_fault) fault_bits |= 0x01;
@@ -5341,9 +5326,9 @@ void OcppAdapter::apply_power_plan() {
         if (info.module_unavailable_fault && info.fault_reason.empty()) info.fault_reason = "ModuleUnavailable";
         const bool hard_safety_fault =
             !info.status.safety_ok || info.status.estop || info.status.earth_fault || info.status.cp_fault;
-        info.local_fault = hard_safety_fault || forced_fault || info.module_unavailable_fault || info.module_can_overload ||
+        info.local_fault = hard_safety_fault || forced_fault || info.module_unavailable_fault ||
                            info.status.gc_welded || info.status.mc_welded || info.status.isolation_fault ||
-                           info.status.overtemp_fault || info.status.overcurrent_fault || info.status.comm_fault;
+                           info.status.overtemp_fault || info.status.overcurrent_fault;
 
         // Persist module health decision for downstream command logic.
         info.modules_healthy = module_health_ok;
@@ -6735,14 +6720,6 @@ void OcppAdapter::apply_power_plan() {
             power_delivery_stall_recovery_attempts_.erase(c.id);
         };
         bool stall_recovery_active = false;
-        auto recovery_until_it = power_delivery_stall_recovery_until_.find(c.id);
-        if (recovery_until_it != power_delivery_stall_recovery_until_.end()) {
-            if (now < recovery_until_it->second) {
-                stall_recovery_active = true;
-            } else {
-                power_delivery_stall_recovery_until_.erase(recovery_until_it);
-            }
-        }
 
         const double stall_current_req_thresh = 1.0;
         const bool stall_current_requested =
@@ -6816,32 +6793,6 @@ void OcppAdapter::apply_power_plan() {
                                           << ")";
                             last_log = now;
                         }
-                        auto& attempts = power_delivery_stall_recovery_attempts_[c.id];
-                        if (attempts < POWER_DELIVERY_STALL_MAX_RECOVERIES) {
-                            attempts++;
-                            power_delivery_stall_recovery_until_[c.id] = now + POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS;
-                            stall_recovery_active = true;
-                            ts = now;
-                            EVLOG_warning << "Entering no-energy recovery window for connector " << c.id
-                                          << " attempt=" << static_cast<int>(attempts) << "/"
-                                          << static_cast<int>(POWER_DELIVERY_STALL_MAX_RECOVERIES)
-                                          << " pause_ms=" << POWER_DELIVERY_STALL_RECOVERY_PAUSE_MS.count();
-                        } else if (stall_age >= POWER_DELIVERY_STALL_ESCALATION_MS) {
-                            local_fault = true;
-                            if (info.fault_reason.empty()) {
-                                info.fault_reason = "PowerDeliveryStalled";
-                            }
-                            EVLOG_error << "Power delivery stall exceeded escalation window on connector " << c.id
-                                        << " stall_ms="
-                                        << std::chrono::duration_cast<std::chrono::milliseconds>(stall_age).count()
-                                        << " timeout_ms="
-                                        << std::chrono::duration_cast<std::chrono::milliseconds>(timeout_ms).count()
-                                        << " attempts=" << static_cast<int>(attempts);
-                        } else {
-                            // Keep session alive a bit longer before hard-faulting after max retries.
-                            power_delivery_stall_recovery_until_[c.id] = now + std::chrono::milliseconds(1000);
-                            stall_recovery_active = true;
-                        }
                     }
                 }
             } else {
@@ -6855,7 +6806,28 @@ void OcppAdapter::apply_power_plan() {
             if (tie_mode && gc_closed_effective) {
                 current_valid = snap_it != snapshots.end() && snap_it->second.island_telem_complete;
             }
-            const bool safe_to_open = !gc_closed_effective || (current_valid && std::fabs(meas_i) < gc_open_thresh);
+            const bool no_modules_requested = dispatch.modules_assigned <= 0;
+            const bool flow_measured = meas_i_abs >= kFlowingCurrentA;
+            const bool flow_present =
+                present_fresh && (present_i_abs >= kFlowingCurrentA || present_p_abs >= kFlowingPowerW);
+            const bool flow_seen = flow_measured || flow_present;
+            const bool telemetry_proves_low_current = current_valid && std::fabs(meas_i) < gc_open_thresh;
+            const bool no_module_no_flow = no_modules_requested && !flow_seen;
+            const bool safe_to_open =
+                !gc_closed_effective || telemetry_proves_low_current || no_module_no_flow;
+            if (gc_closed_effective && no_module_no_flow && !telemetry_proves_low_current) {
+                static std::map<int, std::chrono::steady_clock::time_point> last_no_module_open_log;
+                auto& last_log = last_no_module_open_log[c.id];
+                if (last_log.time_since_epoch().count() == 0 || (now - last_log) >= std::chrono::seconds(1)) {
+                    EVLOG_info << "Connector " << c.id
+                               << " forcing GC open with no modules assigned and no flow evidence"
+                               << " meas_I=" << meas_i
+                               << " present_I=" << status.present_current_a.value_or(0.0)
+                               << " present_P=" << status.present_power_w.value_or(0.0)
+                               << " present_fresh=" << (present_fresh ? "1" : "0");
+                    last_log = now;
+                }
+            }
             if (!safe_to_open) {
                 gc_closed_cmd = true;
                 gc_open_pending_[c.id] = true;
@@ -7091,7 +7063,8 @@ void OcppAdapter::apply_power_plan() {
             current_underdelivery_cap_recovery_since_.erase(connector_id);
             current_underdelivery_cap_log_.erase(connector_id);
         };
-        if (allow_energy_home && limits.max_current_a && limits.max_current_a.value() > 0.0) {
+        if (ENABLE_MODULE_UNDERDELIVERY_CLAMP && allow_energy_home && limits.max_current_a &&
+            limits.max_current_a.value() > 0.0) {
             const auto target_timeout = telemetry_timeout(cfg_);
             const bool target_recent = status.last_target_update.time_since_epoch().count() != 0 &&
                                        (now - status.last_target_update) <= target_timeout;
@@ -7487,7 +7460,17 @@ void OcppAdapter::apply_power_plan() {
             mreq.voltage_v = voltage_v;
             mreq.current_a = current_a;
             mreq.power_kw = power_kw;
-            module_controller_->apply_command(mreq);
+            const auto last_cmd_it = last_module_command_by_slot_.find(slot.id);
+            const bool changed = (last_cmd_it == last_module_command_by_slot_.end()) ||
+                                 !module_command_equivalent(last_cmd_it->second, mreq);
+            const auto last_sent_it = last_module_command_sent_at_.find(slot.id);
+            const bool keepalive_due =
+                (last_sent_it == last_module_command_sent_at_.end()) ||
+                (now - last_sent_it->second) >= MODULE_COMMAND_KEEPALIVE_MS;
+            if (changed || keepalive_due) {
+                module_controller_->apply_command(mreq);
+                last_module_command_sent_at_[slot.id] = now;
+            }
             last_module_command_by_slot_[slot.id] = mreq;
         }
     }
@@ -7627,6 +7610,7 @@ void OcppAdapter::apply_zero_power_plan() {
             mreq.power_kw = 0.0;
             module_controller_->apply_command(mreq);
             last_module_command_by_slot_[slot.id] = mreq;
+            last_module_command_sent_at_[slot.id] = std::chrono::steady_clock::now();
         }
     }
 }
