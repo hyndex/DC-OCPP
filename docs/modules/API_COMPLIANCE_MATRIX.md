@@ -11,8 +11,8 @@ This matrix maps `docs/modules` protocol requirements to the current runtime imp
 ## Maxwell MXR (V1.50)
 Implemented:
 - Read telemetry: `0x0001` voltage, `0x0002` current, `0x0003` current-limit point, `0x0004` temp.
-- Control: `0x0021` voltage set, `0x0022` current-ratio set, optional `0x001B` absolute current set,
-  optional `0x0020` power-ratio set, `0x0030` start/stop, `0x0023` voltage upper limit.
+- Control: `0x0021` voltage set, `0x0030` start/stop, and current set via `0x001B` (default) or `0x0022` (when configured).
+- Not used in current runtime control path: `0x0020` power-ratio set, `0x0023` voltage upper limit set.
 - Status/capability: `0x0040` alarm/status, `0x0043` address/group, `0x004B` input mode.
 - Alarm bit export: bit22 module off, bit23 power-limited, bit24 temp-derated, bit25 AC-limited.
 - Dynamic capability export: `current_limit_point` + derived `current_capability_a`.
@@ -26,7 +26,6 @@ Primary references:
 Implemented:
 - Read telemetry: command `0` voltage, `1` current, `30` inlet temp, `8` status.
 - Control: command `2` voltage reference, `3` current limit, `4` on/off.
-- Optional mode/config reads: `62`, `89`, `95`, `96`, `101`.
 - Dynamic capability:
   - Poll/read command `104` (current capability).
   - Parse command `114` response (current + capability) as fallback.
@@ -43,7 +42,7 @@ Primary references:
 
 ## Tonhe
 Implemented:
-- Downlink: `PGN 000600h` start/stop + V/I setpoints, `PGN 00AA00h` input-mode config.
+- Downlink control: `PGN 000600h` start/stop + V/I setpoints.
 - Uplink parse: `PGN 000100h` state/voltage/current/fault, `PGN 000B00h` AC info/temp,
   `PGN 009100h` extended status/fault.
 - Capability export:
@@ -51,6 +50,7 @@ Implemented:
   - `ac_limited` from ext bit8 (input power limit).
   - `temp_derated` from ext bit9 (power limit due to overtemperature).
   - `power_limited` derived from `ac_limited || temp_derated`.
+- Not used in runtime control path: `PGN 00AA00h` input-mode config writes.
 
 Primary reference:
 - `docs/modules/TonHe CAN communication between charging module and monitor TONHE V1.2.pdf`

@@ -5,8 +5,8 @@ Workflow:
 1) Scan bus for MXR modules (address + group).
 2) User selects one module from discovered list.
 3) User enters voltage (V), current (A), and duration (s).
-4) Script drives module with ratio-based current command (0x0022) and
-   prints telemetry every 2 seconds.
+4) Script drives module with absolute current command (0x001B) by default
+   (or ratio command 0x0022 when selected) and prints telemetry every 2 seconds.
 
 Protocol mapping follows the in-tree Maxwell driver in
 src/power_module_controller.cpp.
@@ -700,8 +700,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--current-control",
         choices=["ratio", "absolute"],
-        default="ratio",
-        help="Current-control mode: ratio uses 0x0022, absolute uses 0x001B (default: ratio)",
+        default="absolute",
+        help="Current-control mode: ratio uses 0x0022, absolute uses 0x001B (default: absolute)",
     )
     parser.add_argument(
         "--ratio-max",

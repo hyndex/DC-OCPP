@@ -51,7 +51,7 @@ struct ModuleState {
     bool broadcast{false};
     bool probe_on_startup{true};
     bool readback_limits{false};
-    bool send_output_current{false};
+    bool send_output_current{true};
     bool send_output_power{false};
     bool healthy{true};
     bool enabled{false};
@@ -167,56 +167,16 @@ public:
     Plan compute_plan();
 
 private:
-    struct CurrentRampState {
-        double current_a{0.0};
-        double rate_a_per_s{0.0};
-        bool initialized{false};
-        std::chrono::steady_clock::time_point last_update{};
-    };
-
     PlannerConfig cfg_;
     std::vector<Slot> slots_;
     std::map<std::string, ModuleState> modules_;
     std::map<int, GunState> guns_;
     int next_island_id_{1};
     std::map<int, Slot> slot_lookup_;
-    std::map<int, int> last_modules_assigned_;
-    std::map<int, std::vector<std::string>> last_module_ids_;
-    std::map<int, std::chrono::steady_clock::time_point> last_alloc_change_;
-    std::map<int, CurrentRampState> ramp_state_by_gun_;
 
     std::vector<int> active_guns() const;
     Plan blank_plan() const;
     const Slot* find_slot(int slot_id) const;
-    int count_available_modules_in_slot(int slot_id) const;
-    int count_healthy_modules_in_slot(int slot_id) const;
-    int ideal_modules_for_gun(const GunState& g, double p_budget) const;
-    std::vector<std::string> select_modules_for_slot(const Slot& slot, int n_needed, Plan& plan,
-                                                     const std::vector<std::string>& preferred = {}) const;
-    std::vector<int> build_island_slots_for_gun(const GunState& g, int n_needed,
-                                                const std::set<int>& active_home_slots,
-                                                const std::set<int>& reserved_slots,
-                                                std::set<int>& claimed_slots) const;
-    std::vector<std::string> assign_modules_for_island(const std::vector<int>& slot_ids, int n_needed, Plan& plan,
-                                                       const std::vector<std::string>& preferred = {}) const;
-    std::map<int, double> compute_power_budgets(const std::vector<int>& active,
-                                                const std::map<int, double>& req_limited,
-                                                double total_available_power_kw) const;
-    std::map<int, int> compute_module_allocation(const std::vector<int>& active,
-                                                 const std::map<int, double>& budgets,
-                                                const std::map<int, int>& ideal,
-                                                 int available_modules) const;
-    Plan build_plan(const std::vector<int>& active, const std::map<int, double>& budgets,
-                    const std::map<int, int>& modules_per_gun,
-                    const std::set<int>& reserved_slots,
-                    const std::set<int>& full_island_guns,
-                    std::chrono::steady_clock::time_point now);
-    double apply_voltage_guard(const GunState& g, double i_target_a, double v_ceiling_v) const;
-    double apply_current_ramp(int gun_id, const GunState& g, double i_target_a, bool emergency_drop,
-                              std::chrono::steady_clock::time_point now);
-    void prune_inactive_ramp_state(const std::vector<int>& active);
-    void apply_hysteresis(Plan& plan, std::chrono::steady_clock::time_point now);
-    bool validate_plan(const Plan& plan) const;
 };
 
 } // namespace charger

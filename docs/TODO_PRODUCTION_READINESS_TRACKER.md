@@ -68,7 +68,7 @@ Status legend: `[x] done`, `[~] in progress / partial`, `[ ] pending`.
 - [ ] Re-validate with fresh live session capture that auth latency and precharge-to-delivery transition are stable.
 
 ## Stage 8: Config Baseline Hardening
-- [x] Runtime defaults: `pollMs=200`, `cmdIntervalMs=200`, `readbackLimits=true`, `sendOutputPower=false`.
+- [x] Runtime defaults: `pollMs=200`, `cmdIntervalMs=200`, `readbackLimits=true`, `sendOutputCurrent=true`, `sendOutputPower=false`.
 - [x] Deployed `configs/charger.json` updated to `cmdIntervalMs=200`.
 - [~] Example configs still include conservative `1000 ms` values (kept for legacy examples; not production baseline).
 

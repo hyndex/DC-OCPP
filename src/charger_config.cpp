@@ -137,14 +137,14 @@ SlotMapping parse_slot_mapping(const nlohmann::json& slot_json, int idx_fallback
             mc.silent_mode = m.value("silentMode", -1);
             mc.rated_power_kw = m.value("ratedPowerKW", 0.0);
             mc.rated_current_a = m.value("ratedCurrentA", 0.0);
-            mc.poll_interval_ms = m.value("pollMs", 200);
-            mc.cmd_interval_ms = m.value("cmdIntervalMs", 200);
+            mc.poll_interval_ms = m.value("pollMs", 500);
+            mc.cmd_interval_ms = m.value("cmdIntervalMs", 500);
             mc.poll_budget_fps = m.value("pollBudgetFps", 0);
             mc.telemetry_stale_ms = m.value("telemetryStaleMs", 0);
             mc.broadcast = m.value("broadcast", false);
             mc.probe_on_startup = m.value("probeOnStartup", true);
-            mc.readback_limits = m.value("readbackLimits", true);
-            mc.send_output_current = m.value("sendOutputCurrent", false);
+            mc.readback_limits = m.value("readbackLimits", false);
+            mc.send_output_current = m.value("sendOutputCurrent", true);
             mc.send_output_power = m.value("sendOutputPower", false);
             slot.modules.push_back(mc);
         }
@@ -366,25 +366,25 @@ ChargerConfig load_charger_config(const fs::path& config_path) {
         cfg.telemetry_timeout_ms = 2000;
     }
     if (cfg.hlc_target_hold_ms <= 0) {
-        cfg.hlc_target_hold_ms = 300;
+        cfg.hlc_target_hold_ms = 12000;
     }
     if (cfg.request_loss_debounce_ms <= 0) {
-        cfg.request_loss_debounce_ms = 300;
+        cfg.request_loss_debounce_ms = 12000;
     }
     if (cfg.target_fresh_hold_ms <= 0) {
-        cfg.target_fresh_hold_ms = 300;
+        cfg.target_fresh_hold_ms = 12000;
     }
     if (cfg.delivery_loss_detect_ms <= 0) {
-        cfg.delivery_loss_detect_ms = 300;
+        cfg.delivery_loss_detect_ms = 2500;
     }
     if (cfg.delivery_loss_recovery_ms <= 0) {
-        cfg.delivery_loss_recovery_ms = 500;
+        cfg.delivery_loss_recovery_ms = 6000;
     }
     if (cfg.delivery_loss_escalation_ms <= 0) {
-        cfg.delivery_loss_escalation_ms = 1800;
+        cfg.delivery_loss_escalation_ms = 45000;
     }
     if (cfg.active_current_hold_ms <= 0) {
-        cfg.active_current_hold_ms = 250;
+        cfg.active_current_hold_ms = 800;
     }
     cfg.measurement_source_policy = normalize_measurement_source_policy(cfg.measurement_source_policy);
     if (cfg.tie_close_max_delta_v < 0.0) {

@@ -322,27 +322,10 @@ private:
     std::map<int, double> last_power_w_;
     std::map<int, double> last_current_limit_a_;
     std::map<int, double> last_requested_power_kw_;
-    std::map<int, double> last_ev_target_power_kw_;
     std::map<int, double> last_ev_target_voltage_v_;
     std::map<int, std::chrono::steady_clock::time_point> last_ev_target_voltage_seen_;
     std::map<int, double> last_ev_target_current_a_;
     std::map<int, std::chrono::steady_clock::time_point> last_ev_target_current_seen_;
-    struct PowerRequestContinuityState {
-        enum class HoldReason : uint8_t {
-            None = 0,
-            TargetGap,
-            SessionGap,
-            UnknownGap,
-        };
-        double last_nonzero_req_kw{0.0};
-        std::chrono::steady_clock::time_point last_nonzero_req_at{};
-        std::chrono::steady_clock::time_point hold_started_at{};
-        std::chrono::steady_clock::time_point last_hold_log_at{};
-        std::chrono::steady_clock::time_point last_release_log_at{};
-        HoldReason hold_reason{HoldReason::None};
-        bool hold_active{false};
-    };
-    std::map<int, PowerRequestContinuityState> power_request_continuity_;
     std::map<int, std::chrono::steady_clock::time_point> last_hlc_power_phase_seen_;
     std::map<int, std::chrono::steady_clock::time_point> session_ready_hold_until_;
     std::map<int, std::chrono::steady_clock::time_point> session_absent_since_;
@@ -360,9 +343,7 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> gc_open_timeout_exceeded_since_;
     std::map<int, std::chrono::steady_clock::time_point> gc_close_request_time_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_since_;
-    std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_recovery_until_;
     std::map<int, std::chrono::steady_clock::time_point> power_delivery_stall_last_log_;
-    std::map<int, uint8_t> power_delivery_stall_recovery_attempts_;
     std::map<int, std::chrono::steady_clock::time_point> power_request_lost_since_;
     std::map<int, bool> last_power_request_active_;
     std::map<int, std::chrono::steady_clock::time_point> last_cp_request_drop_;
@@ -426,7 +407,6 @@ private:
     std::map<int, uint64_t> status_event_seq_;
     std::map<int, std::string> stop_origin_hint_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_since_;
-    std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_confirmed_since_;
     std::map<int, std::chrono::steady_clock::time_point> current_underdelivery_log_;
     std::chrono::steady_clock::time_point last_autocharge_drop_log_{};
     std::chrono::steady_clock::time_point last_autocharge_block_log_{};

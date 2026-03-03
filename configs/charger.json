@@ -101,11 +101,11 @@
           "ratedPowerKW": 30,
           "ratedCurrentA": 100,
           "sendOutputCurrent": true,
-          "readbackLimits": true,
+          "readbackLimits": false,
           "type": "maxwell-mxr",
           "inputMode": 3,
-          "pollMs": 100,
-          "cmdIntervalMs": 200,
+          "pollMs": 200,
+          "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
       ]
@@ -126,11 +126,11 @@
           "ratedPowerKW": 30,
           "ratedCurrentA": 100,
           "sendOutputCurrent": true,
-          "readbackLimits": true,
+          "readbackLimits": false,
           "type": "maxwell-mxr",
           "inputMode": 3,
-          "pollMs": 100,
-          "cmdIntervalMs": 200,
+          "pollMs": 200,
+          "cmdIntervalMs": 500,
           "telemetryStaleMs": 3000
         }
       ]
@@ -139,10 +139,18 @@
   "sqlMigrationsPath": "../libocpp/config/v16/core_migrations",
   "timeouts": {
     "powerRequestSeconds": 600,
-    "suspendedNoOutputStopSeconds": 600,
+    "suspendedNoOutputStopSeconds": 30,
     "authorizationDeniedHoldSeconds": 5,
     "hlcAuthorizationSeconds": 150,
-    "pncBlockSeconds": 1200
+    "pncBlockSeconds": 1200,
+    "hlcTargetHoldMs": 12000,
+    "requestLossDebounceMs": 12000,
+    "targetFreshHoldMs": 12000,
+    "deliveryLossDetectMs": 2500,
+    "deliveryLossRecoveryMs": 6000,
+    "deliveryLossEscalationMs": 45000,
+    "activeCurrentHoldMs": 800,
+    "measurementSourcePolicy": "allowEstimated"
   },
   "canTraffic": {
     "maxTotalKbpsPerInterface": 20.0,

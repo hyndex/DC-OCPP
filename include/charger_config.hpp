@@ -48,14 +48,14 @@ struct ModuleConfig {
     int silent_mode{-1};        // optional silent mode (UUGreen: 0-2)
     double rated_power_kw{0.0}; // optional per-module power rating
     double rated_current_a{0.0}; // optional per-module current rating
-    int poll_interval_ms{200};
-    int cmd_interval_ms{200};
+    int poll_interval_ms{500};
+    int cmd_interval_ms{500};
     int poll_budget_fps{0};      // 0 disables budget; otherwise caps low-priority poll reads per CAN interface
     int telemetry_stale_ms{0};   // override stale telemetry threshold (0 = auto)
     bool broadcast{false};
     bool probe_on_startup{true};
-    bool readback_limits{true};
-    bool send_output_current{false}; // send 0x001B output current command
+    bool readback_limits{false};
+    bool send_output_current{true}; // send 0x001B output current command (default mode)
     bool send_output_power{false};   // send 0x0020 output power command
 };
 
@@ -181,14 +181,14 @@ struct ChargerConfig {
     int telemetry_timeout_ms{2000};
     int plc_present_warn_ms{1000};
     int plc_limits_warn_ms{1500};
-    int hlc_target_hold_ms{300};
-    int request_loss_debounce_ms{300};
-    int target_fresh_hold_ms{300};
-    int delivery_loss_detect_ms{300};
-    int delivery_loss_recovery_ms{500};
-    int delivery_loss_escalation_ms{1800};
-    int active_current_hold_ms{250};
-    std::string measurement_source_policy{"strictMeasured"};
+    int hlc_target_hold_ms{12000};
+    int request_loss_debounce_ms{12000};
+    int target_fresh_hold_ms{12000};
+    int delivery_loss_detect_ms{2500};
+    int delivery_loss_recovery_ms{6000};
+    int delivery_loss_escalation_ms{45000};
+    int active_current_hold_ms{800};
+    std::string measurement_source_policy{"allowEstimated"};
     int minimum_status_duration_s{0};
     int meter_keepalive_s{300};
     bool free_mode{false};

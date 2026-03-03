@@ -129,6 +129,8 @@ CAN traffic policy (`canTraffic`)
 Constraints and defaults
 - If `slots` is omitted, a ring is auto-generated from `connectors` order with two modules per slot.
 - Each slot supports at most 2 modules in the current implementation.
+- Module current control defaults to absolute-current mode (`sendOutputCurrent=true`, register `0x001B`).
+- `sendOutputPower` is accepted in config for compatibility but ignored by runtime module control.
 - `plc.relayMode` must be `ties`, `plc.moduleRelaysEnabled` must be true, and `plc.gunRelayOwnedByPlc` must be false.
 - `allowCrossSlotIslands` requires hardware support (`PlcCanHardware` supports this).
 - `databaseDir` also stores pending auth tokens at `pending_tokens.json`.

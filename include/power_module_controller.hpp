@@ -33,7 +33,7 @@ struct ModuleSpec {
     bool broadcast{false}; // send via broadcast DST (0xFE or extended)
     bool probe_on_startup{true};
     bool readback_limits{false};
-    bool send_output_current{false};
+    bool send_output_current{true};
     bool send_output_power{false};
 };
 
